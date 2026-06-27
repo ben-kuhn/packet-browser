@@ -2,40 +2,77 @@
 
 [![Build and Publish](https://github.com/ben-kuhn/docker-packet-browser/actions/workflows/build.yml/badge.svg)](https://github.com/ben-kuhn/docker-packet-browser/actions/workflows/build.yml)
 
-A client/server web browser for packet radio. The server (behind BPQ) fetches and sanitizes web pages using headless Chromium, compresses them with brotli, and sends them over AX.25. The client connects via AGWPE and provides a local web proxy that users browse with their regular browser.
+A client/server web browser for packet radio. The **server** (behind BPQ) fetches and sanitizes web pages using headless Chromium, compresses them with brotli, and sends them over AX.25. The **client** connects via AGWPE and provides a local web proxy that users browse with their regular browser.
 
-## Overview
+## Architecture
 
-This project modernizes the original PE1RRR packet radio browser (browse.sh) into a client/server architecture. The server uses headless Chromium to render modern web pages, strips JavaScript and heavy resources, inlines CSS, and brotli-compresses the result. The client connects via AGWPE and provides a local web proxy that rewrites URLs so users can browse with their regular browser.
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Your Local Machine                            │
+│                                                                       │
+│  ┌──────────────┐    ┌──────────────────┐    ┌──────────────────┐  │
+│  │   Browser     │───▶│  Client (proxy)   │───▶│  AGWPE / TNC     │  │
+│  │ localhost:8080│    │  Web UI + Proxy   │    │  (Direwolf, etc) │  │
+│  └──────────────┘    └──────────────────┘    └──────────────────┘  │
+│                                                                       │
+└─────────────────────────────────────────────────────────────────────┘
+                            │
+                            │ AX.25 over radio
+                            ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Remote BBS / Node                             │
+│                                                                       │
+│  ┌──────────────┐    ┌──────────────────┐    ┌──────────────────┐  │
+│  │  LinBPQ       │───▶│  Server           │───▶│  Headless        │  │
+│  │  (node)       │    │  TCP:63004        │    │  Chromium        │  │
+│  └──────────────┘    └──────────────────┘    └──────────────────┘  │
+│                                                                       │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-**Original Work:** Red Tuby PE1RRR (SK) - browse.sh
-**License:** GNU General Public License v3
+### How It Works
 
-### Key Features
+1. **Client** connects to AGWPE (your local TNC like Direwolf)
+2. **Client** establishes AX.25 connection to a remote BPQ node
+3. **Client** sends BPQ APPLICATION command (e.g., `WEB`) to trigger the browser application
+4. **BPQ** connects to the **server** via TCP (port 63004)
+5. **Server** prompts for callsign, client sends it
+6. **Server** shows logging disclaimer, client sends `AGREE`
+7. User opens browser to client's web UI (default `http://localhost:8080`)
+8. User enters a URL or clicks links
+9. **Client** sends request over AX.25 to **server**
+10. **Server** fetches page with headless Chromium, sanitizes HTML, compresses with brotli
+11. **Server** sends compressed response back over AX.25
+12. **Client** decompresses, rewrites URLs to route through local proxy, displays in browser
 
-- Client/server architecture over AX.25 packet radio
-- Server fetches pages via headless Chromium, strips JS/images, inlines CSS
-- Brotli compression (quality 11) for minimal bandwidth usage
-- Client provides local web proxy with dark-themed UI
-- URL rewriting so links route through the radio link
-- SSE-based live debug log in web UI
-- JSON structured logging with callsign tracking
-- Multi-layer content filtering (DNS + hosts-based blocklist)
-- SSRF prevention for network security
-- Read-only container filesystem with capability dropping
+### BPQ Handshake
 
-## Quick Start
+After AX.25 connection is established, the client performs an automated handshake:
 
-### Using Pre-built Image
+1. Client sends the BPQ APPLICATION command (e.g., `WEB\n`)
+2. BPQ recognizes the command and connects to the server via TCP
+3. Server sends callsign prompt, client sends configured callsign
+4. Server sends logging disclaimer with "AGREE" prompt, client sends `AGREE\n`
+5. Server sends portal page, handshake complete
 
-Pull from GitHub Container Registry and run with Docker Compose:
+This is fully automated - no user interaction required.
+
+---
+
+## Server
+
+The server runs behind a BPQ node and handles web page fetching, sanitization, and compression.
+
+### Running with Docker
+
+#### Quick Start
 
 ```bash
 # Create directory and required files
 mkdir -p packet-browser/logs
 touch packet-browser/hosts
 
-# Create docker-compose.yml (see Configuration section below)
+# Create docker-compose.yml (see below)
 nano docker-compose.yml
 
 # Pull and start
@@ -43,30 +80,7 @@ docker compose pull
 docker compose up -d
 ```
 
-### Building from Source
-
-Prerequisites: Nix with flakes enabled
-
-```bash
-# Clone repository
-git clone https://github.com/ben-kuhn/docker-packet-browser.git
-cd docker-packet-browser
-
-# Build Docker image with Nix
-nix build .#docker-image
-
-# Load into Docker
-docker load < result
-
-# Start with Docker Compose
-docker compose up -d
-```
-
-## Configuration
-
-### Docker Compose
-
-Create `docker-compose.yml`:
+#### Docker Compose Configuration
 
 ```yaml
 services:
@@ -81,8 +95,6 @@ services:
       # Logs - accessible from host
       - ./logs:/var/log/packet-browser
       # Hosts file for blocklist management
-      # Note: ./hosts must exist as a file (not directory) before starting
-      # Create it with: touch hosts
       - ./hosts:/etc/hosts
 
     environment:
@@ -93,7 +105,6 @@ services:
       - BROTLI_QUALITY=11
 
       # SSRF prevention - blocked IP ranges
-      # Remove ranges to allow access to local services
       - BLOCKED_RANGES=127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16
 
       # Blocklist settings
@@ -105,25 +116,20 @@ services:
       - LOG_ROTATE_ENABLED=true
       - LOG_RETAIN_DAYS=30
       - SYSLOG_ENABLED=false
-      # - SYSLOG_HOST=syslog.example.com
-      # - SYSLOG_PORT=514
 
     # Security hardening
     read_only: true
     tmpfs:
       - /tmp:size=128M,mode=1777
       - /dev/shm:size=64M,mode=1777
-
     cap_drop:
       - ALL
 
-    # DNS filtering - uses OpenDNS Family Shield by default
-    # These servers filter adult content, malware, and phishing sites
+    # DNS filtering - OpenDNS Family Shield
     dns:
       - 208.67.222.123
       - 208.67.220.123
 
-    # Health check (uses binary's built-in --healthcheck flag)
     healthcheck:
       test: ["CMD", "/bin/packet-browser-server", "--healthcheck"]
       interval: 30s
@@ -134,7 +140,7 @@ services:
     restart: unless-stopped
 ```
 
-### Environment Variables
+#### Server Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -145,14 +151,12 @@ services:
 | `BLOCKED_RANGES` | `127.0.0.0/8,10.0.0.0/8,...` | CIDR ranges blocked for SSRF prevention |
 | `BLOCKLIST_ENABLED` | `true` | Enable/disable local hosts-based blocklist |
 | `BLOCKLIST_REFRESH_HOURS` | `24` | How often to refresh blocklists from URLs |
-| `BLOCKLIST_URLS` | *(empty)* | Comma-separated URLs of hosts-format blocklists (`0.0.0.0 domain.com`) |
+| `BLOCKLIST_URLS` | *(empty)* | Comma-separated URLs of hosts-format blocklists |
 | `LOG_ROTATE_ENABLED` | `true` | Enable automatic log rotation |
 | `LOG_RETAIN_DAYS` | `30` | Number of days to retain rotated logs |
 | `SYSLOG_ENABLED` | `false` | Forward logs to external syslog server |
 | `SYSLOG_HOST` | *(empty)* | Syslog server hostname or IP |
 | `SYSLOG_PORT` | `514` | Syslog server port |
-
-## BPQ Integration
 
 ### BPQ Configuration
 
@@ -178,115 +182,344 @@ APPLICATION 4,WEB,C 10 HOST 3 S
   - `HOST 3` - Connect to CMDPORT position 3 (port 63004)
   - `S` - Return user to node menu on disconnect (Stay)
 
-### Port Binding
+### Server Security Features
 
-By default, the container binds to `127.0.0.1:63004` (loopback only) for security.
+- **Content Filtering**: DNS filtering (OpenDNS Family Shield) + hosts-based blocklist
+- **SSRF Prevention**: Blocks private IP ranges by default
+- **Protocol Filtering**: Only HTTP/HTTPS allowed (no file://, ftp://, etc.)
+- **Container Hardening**: Read-only filesystem, no shell, capability dropping, non-root user
+- **Session Security**: Idle timeout, callsign validation, logging acknowledgment
 
-**If BPQ is on the same host:**
-```yaml
-ports:
-  - "127.0.0.1:63004:63004"  # Works for local BPQ
-```
-
-**If BPQ is on another host:**
-```yaml
-ports:
-  - "0.0.0.0:63004:63004"  # WARNING: Accessible from network
-```
-
-**If BPQ is in the same Docker Compose:**
-```yaml
-# No port mapping needed - use internal DNS
-services:
-  bpq:
-    # ... BPQ container config
-    # Can connect to packet-browser:63004 directly
-
-  packet-browser:
-    # No ports: section needed
-```
-
-### Connection Flow
-
-1. User starts the client on their local machine
-2. Client connects to AGWPE (TNC) over TCP
-3. Client establishes AX.25 connection to the BPQ node
-4. User opens browser to client's web interface (default `http://localhost:8080`)
-5. User configures AGWPE settings and callsigns via web UI
-6. User enters a URL or clicks links in the web interface
-7. Client sends request over AX.25 to the server
-8. Server fetches page with headless Chromium, sanitizes HTML, compresses with brotli
-9. Server sends compressed response back over AX.25
-10. Client decompresses, rewrites URLs to route through local proxy, displays in browser
-
-## Web Interface
-
-The client provides a web-based interface for configuration and browsing:
-
-- **Connect page** (`/connect`) - AGWPE connection status, callsign configuration, port selection, and live debug log
-- **Configuration page** (`/configuration`) - AGWPE host/port settings
-- **Browse page** (`/browse?url=...`) - Displays fetched pages with rewritten links
-
-All links and forms in fetched pages are rewritten to route through the local proxy, so clicking links continues to fetch pages over the radio link.
-
-## Testing
-
-To test the server without BPQ, connect directly via telnet:
-
-```bash
-telnet localhost 63004
-```
-
-You will be prompted to enter a callsign, then type `AGREE` to acknowledge logging.
+---
 
 ## Client
 
-The client runs locally and provides a web proxy interface. It connects to AGWPE for the radio link and serves pages to your browser.
+The client runs on your local machine and provides a web proxy interface. It connects to AGWPE (your TNC) for the radio link and serves pages to your browser.
+
+### Installation
+
+#### Pre-built Binaries
+
+Download from [GitHub Releases](https://github.com/ben-kuhn/docker-packet-browser/releases):
+
+| Platform | File |
+|----------|------|
+| Linux x86_64 | `packet-browser-x86_64-unknown-linux-gnu.tar.gz` |
+| Linux aarch64 | `packet-browser-aarch64-unknown-linux-gnu.tar.gz` |
+| macOS x86_64 | `packet-browser-x86_64-apple-darwin.tar.gz` |
+| macOS aarch64 | `packet-browser-aarch64-apple-darwin.tar.gz` |
+| Windows x86_64 | `packet-browser-x86_64-pc-windows-msvc.zip` |
+| Debian/Ubuntu | `packet-browser-client_0.2.0_amd64.deb` |
+| Fedora/RHEL | `packet-browser-client-0.2.0-1.x86_64.rpm` |
+
+#### Linux (Debian/Ubuntu)
 
 ```bash
-# Build the client
-cargo build -p packet-browser-client
+# Download and install
+wget https://github.com/ben-kuhn/docker-packet-browser/releases/latest/download/packet-browser-client_0.2.0_amd64.deb
+sudo dpkg -i packet-browser-client_0.2.0_amd64.deb
 
-# Run the client
-./target/debug/packet-browser-client --listen-addr 127.0.0.1:8080
+# Copy and edit config
+sudo cp /etc/packet-browser/config.ini.example /etc/packet-browser/config.ini
+sudo nano /etc/packet-browser/config.ini
+
+# Enable and start service
+sudo systemctl enable --now packet-browser-client
 ```
 
-Open your browser to `http://localhost:8080` to configure AGWPE settings and browse pages.
+#### Linux (Fedora/RHEL)
+
+```bash
+# Download and install
+wget https://github.com/ben-kuhn/docker-packet-browser/releases/latest/download/packet-browser-client-0.2.0-1.x86_64.rpm
+sudo rpm -i packet-browser-client-0.2.0-1.x86_64.rpm
+
+# Copy and edit config
+sudo cp /etc/packet-browser/config.ini.example /etc/packet-browser/config.ini
+sudo nano /etc/packet-browser/config.ini
+
+# Enable and start service
+sudo systemctl enable --now packet-browser-client
+```
+
+#### Arch Linux
+
+```bash
+# Using the PKGBUILD from packaging/arch/
+cd packaging/arch
+makepkg -si
+
+# Copy and edit config
+sudo cp /etc/packet-browser/config.ini.example /etc/packet-browser/config.ini
+sudo nano /etc/packet-browser/config.ini
+
+# Enable and start service
+sudo systemctl enable --now packet-browser-client
+```
+
+#### Gentoo
+
+```bash
+# Using the ebuild from packaging/gentoo/
+sudo cp packaging/gentoo/packet-browser-client-0.2.0.ebuild /var/db/repos/local/net-misc/packet-browser-client/
+sudo ebuild /var/db/repos/local/net-misc/packet-browser-client/packet-browser-client-0.2.0.ebuild merge
+
+# Copy and edit config
+sudo cp /etc/packet-browser/config.ini.example /etc/packet-browser/config.ini
+sudo nano /etc/packet-browser/config.ini
+
+# Enable and start service
+sudo rc-update add packet-browser-client default
+sudo rc-service packet-browser-client start
+```
+
+#### NixOS
+
+```nix
+# In your configuration.nix
+{ pkgs, ... }:
+{
+  services.packet-browser-client = {
+    enable = true;
+    config = {
+      agwpe_host = "127.0.0.1";
+      agwpe_port = 8000;
+      my_callsign = "N0CALL";
+      target_callsign = "NODE1";
+      bpq_command = "WEB";
+    };
+  };
+}
+```
+
+Or using the package directly:
+
+```bash
+nix-env -iA nixos.packet-browser-client
+```
+
+#### macOS
+
+```bash
+# Download and extract
+curl -L https://github.com/ben-kuhn/docker-packet-browser/releases/latest/download/packet-browser-aarch64-apple-darwin.tar.gz | tar xz
+
+# Create config directory
+mkdir -p ~/.config/packet-browser
+cp config.example.ini ~/.config/packet-browser/config.ini
+nano ~/.config/packet-browser/config.ini
+
+# Run
+./packet-browser-client
+```
+
+#### Windows
+
+```powershell
+# Download and extract the zip file
+# Create config directory
+mkdir %APPDATA%\packet-browser
+copy config.example.ini %APPDATA%\packet-browser\config.ini
+notepad %APPDATA%\packet-browser\config.ini
+
+# Run
+packet-browser-client.exe
+```
+
+### Client Configuration
+
+The client uses an INI configuration file. Location (in order of priority):
+
+1. `--config` command-line argument
+2. `~/.config/packet-browser/config.ini` (Linux/macOS)
+3. `%APPDATA%\packet-browser\config.ini` (Windows)
+4. `/etc/packet-browser/config.ini` (system-wide)
+
+#### Configuration File
+
+```ini
+[server]
+# AGWPE TNC server address and port
+agwpe_host = 127.0.0.1
+agwpe_port = 8000
+
+[session]
+# Your amateur radio callsign
+my_callsign = N0CALL
+
+# Target node callsign to connect to
+target_callsign = NODE1
+
+# BPQ command to send after connection (must match BPQ APPLICATION command)
+bpq_command = WEB
+```
+
+#### Configuration Options
+
+| Section | Option | Default | Description |
+|---------|--------|---------|-------------|
+| `[server]` | `agwpe_host` | `127.0.0.1` | AGWPE TNC server hostname or IP |
+| `[server]` | `agwpe_port` | `8000` | AGWPE TNC server port |
+| `[session]` | `my_callsign` | *(empty)* | Your amateur radio callsign |
+| `[session]` | `target_callsign` | *(empty)* | Target BPQ node callsign |
+| `[session]` | `bpq_command` | `WEB` | BPQ APPLICATION command to send |
+
+#### Command-Line Options
+
+```
+packet-browser-client [OPTIONS]
+
+Options:
+  -c, --config <PATH>        Configuration file (INI format)
+      --agwpe-host <HOST>    AGWPE host (overrides config file)
+      --agwpe-port <PORT>    AGWPE port (overrides config file)
+      --listen-addr <ADDR>   Web proxy listen address [default: 127.0.0.1:8080]
+      --bpq-command <CMD>    BPQ APPLICATION command [default: WEB]
+  -v, --verbose...           Increase verbosity (-v, -vv, -vvv)
+  -h, --help                 Print help
+```
+
+### Using the Client
+
+#### Starting the Client
+
+```bash
+# Using config file
+packet-browser-client
+
+# Using command-line options
+packet-browser-client --agwpe-host 192.168.1.100 --agwpe-port 8000 --listen-addr 0.0.0.0:8080
+
+# Using custom config file
+packet-browser-client --config /path/to/config.ini
+```
+
+#### Web Interface
+
+Open your browser to `http://localhost:8080` (or your configured listen address).
+
+**Connect Page** (`/connect`):
+- AGWPE connection status
+- Callsign configuration
+- Port selection (queries AGWPE for available ports)
+- AX.25 connect/disconnect buttons
+- Live debug log with SSE updates
+
+**Configuration Page** (`/configuration`):
+- AGWPE host/port settings
+- Save configuration to file
+
+**Browse Page** (`/browse?url=...`):
+- Displays fetched pages with rewritten links
+- All links route through the local proxy
+- Dark-themed UI optimized for readability
+
+#### Typical Workflow
+
+1. Start the client: `packet-browser-client`
+2. Open browser to `http://localhost:8080`
+3. On the Connect page, click "Connect to AGWPE"
+4. Select your AGWPE port from the dropdown
+5. Enter your callsign and target node callsign
+6. Click "AX.25 Connect"
+7. The client automatically performs the BPQ handshake
+8. Enter a URL in the address bar or click links
+9. Pages are fetched over the radio link and displayed
+
+### Running as a Service
+
+#### systemd (Linux)
+
+```bash
+# Enable and start
+sudo systemctl enable --now packet-browser-client
+
+# Check status
+sudo systemctl status packet-browser-client
+
+# View logs
+sudo journalctl -u packet-browser-client -f
+```
+
+#### OpenRC (Gentoo)
+
+```bash
+# Add to default runlevel
+sudo rc-update add packet-browser-client default
+
+# Start now
+sudo rc-service packet-browser-client start
+
+# Check status
+sudo rc-service packet-browser-client status
+```
+
+#### launchd (macOS)
+
+Create `~/Library/LaunchAgents/com.packet-browser.client.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.packet-browser.client</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/packet-browser-client</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>
+```
+
+```bash
+# Load and start
+launchctl load ~/Library/LaunchAgents/com.packet-browser.client.plist
+```
+
+#### Windows Service
+
+Use [NSSM](https://nssm.cc/) to install as a Windows service:
+
+```powershell
+nssm install PacketBrowserClient "C:\path\to\packet-browser-client.exe"
+nssm set PacketBrowserClient AppDirectory "C:\path\to"
+nssm start PacketBrowserClient
+```
+
+---
 
 ## Building from Source
 
 ### Prerequisites
 
-- Nix package manager with flakes enabled
-- Docker or Podman
+- Rust toolchain (rustc, cargo)
+- Nix package manager with flakes enabled (for Docker image)
+- Docker or Podman (for container deployment)
 
 ### Build Process
 
 ```bash
-# Enable Nix flakes (if not already enabled)
-mkdir -p ~/.config/nix
-echo "experimental-features = nix-command flakes" >> ~/.config/nix/nix.conf
-
 # Clone repository
 git clone https://github.com/ben-kuhn/docker-packet-browser.git
 cd docker-packet-browser
 
-# Build the Docker image
-nix build .#docker-image
+# Build with Nix (includes all dependencies)
+nix build
 
-# Load image into Docker
-docker load < result
-
-# Verify image is loaded
-docker images | grep packet-browser
-
-# Start with Docker Compose
-docker compose up -d
+# Binaries are in ./result/bin/
+./result/bin/packet-browser-server
+./result/bin/packet-browser-client
 ```
 
 ### Development
 
-Enter the Nix development shell to work on the Rust code:
+Enter the Nix development shell:
 
 ```bash
 nix develop
@@ -294,25 +527,40 @@ nix develop
 # Now you have Rust toolchain, Chromium, and dependencies
 cargo build
 cargo test
-cargo run
+cargo run --bin packet-browser-server
+cargo run --bin packet-browser-client
 ```
 
-### Building Binary Only
+### Building Docker Image
 
 ```bash
-# Build the workspace (server + client)
-nix build
+# Build with Nix
+nix build .#docker-image
 
-# Server binary is at ./result/bin/packet-browser-server
-./result/bin/packet-browser-server
+# Load into Docker
+docker load < result
 
-# Client binary is at ./result/bin/packet-browser-client
-./result/bin/packet-browser-client
+# Verify
+docker images | grep packet-browser
 ```
+
+### Running Tests
+
+```bash
+# Rust unit tests
+nix develop -c cargo test --all-features -- --test-threads=1
+
+# Python e2e tests (requires Direwolf, PipeWire, LinBPQ)
+cd e2e
+pip install -r requirements-test.txt
+pytest -v
+```
+
+---
 
 ## Logging
 
-### Access Logs
+### Server Logs
 
 All user activity is logged in JSON format to `/var/log/packet-browser/access.log`:
 
@@ -328,101 +576,48 @@ All user activity is logged in JSON format to `/var/log/packet-browser/access.lo
 - `status` - Result: `ok`, `blocked`, `error`
 - `reason` - Block/error reason (if applicable)
 
-### Log Access
+### Client Logs
 
-Logs are mounted to `./logs` on the host:
+Client logs are available via:
+- systemd journal: `journalctl -u packet-browser-client -f`
+- Web UI: Live debug log on the Connect page (SSE-based)
+- stdout/stderr when running manually
 
-```bash
-# View live logs
-tail -f logs/access.log
-
-# Parse with jq
-cat logs/access.log | jq 'select(.call=="W1ABC")'
-
-# Search for blocked requests
-grep '"status":"blocked"' logs/access.log | jq .
-```
-
-### Log Rotation
-
-Log rotation is enabled by default and runs daily:
-- Logs rotated at midnight
-- Compressed with gzip
-- Retained for 30 days (configurable)
-- Rotation controlled by `LOG_ROTATE_ENABLED` and `LOG_RETAIN_DAYS`
-
-### Syslog Integration
-
-Forward logs to external syslog server:
-
-```yaml
-environment:
-  - SYSLOG_ENABLED=true
-  - SYSLOG_HOST=syslog.example.com
-  - SYSLOG_PORT=514
-```
-
-Logs are sent to both local file and syslog when enabled.
+---
 
 ## Security
 
 ### Content Filtering
 
 **Layer 1: DNS Filtering**
-- Uses OpenDNS Family Shield by default (208.67.222.123, 208.67.220.123)
+- Uses OpenDNS Family Shield by default
 - Blocks adult content, phishing, malware sites
-- Configurable via `DNS_SERVERS` environment variable
-- Alternative: Cloudflare Family (1.1.1.3), Quad9 Family (9.9.9.11)
+- Configurable via DNS settings in Docker
 
 **Layer 2: Hosts-based Blocklist**
-- Container fetches hosts-format blocklists from URLs on startup
-- Blocklist URLs must use the hosts file format: `0.0.0.0 domain.com`
+- Fetches hosts-format blocklists from URLs on startup
 - Writes blocked domains to `/etc/hosts` (resolves to 0.0.0.0)
 - Refreshes every 24 hours (configurable)
-- Admin can manually add custom blocks via the hosts volume
 
 ### SSRF Prevention
 
-By default, the following IP ranges are blocked to prevent Server-Side Request Forgery:
+By default, the following IP ranges are blocked:
 - `127.0.0.0/8` - Loopback
 - `10.0.0.0/8` - Private network
 - `172.16.0.0/12` - Private network
 - `192.168.0.0/16` - Private network
 - `169.254.0.0/16` - Link-local
 
-To allow access to specific local services, remove ranges from `BLOCKED_RANGES`:
-
-```yaml
-environment:
-  # Allow access to 192.168.x.x network
-  - BLOCKED_RANGES=127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,169.254.0.0/16
-```
-
-### Protocol Filtering
-
-The following protocols are always blocked (hardcoded):
-- `file://` - Local file access
-- `ftp://` - FTP protocol
-- `gopher://` - Gopher protocol
-- `mailto://` - Email links
-
-Only `http://` and `https://` are permitted.
-
 ### Container Hardening
 
-- **Read-only root filesystem** - Prevents persistent modifications
-- **No shell binaries** - No escape path for users
-- **Capability dropping** - All capabilities dropped except NET_RAW (for DNS)
-- **Non-root user** - Runs as UID 1000
-- **tmpfs for /tmp** - Size-limited RAM disk (64MB, mode=1777 for non-root write access)
-- **Network isolation** - Loopback binding by default
+- Read-only root filesystem
+- No shell binaries
+- All capabilities dropped except NET_RAW (for DNS)
+- Non-root user (UID 1000)
+- tmpfs for /tmp (size-limited)
+- Network isolation (loopback binding by default)
 
-### Session Security
-
-- **Idle timeout** - Default 10 minutes (configurable)
-- **Callsign validation** - Amateur radio callsign format required
-- **Logging acknowledgment** - Users must agree to logging before access
-- **Clean disconnect** - Returns user to BPQ node menu on exit
+---
 
 ## Managing Blocklists
 
@@ -438,7 +633,7 @@ Edit the hosts file volume to add custom blocks:
 # Edit hosts file
 nano hosts
 
-# Add custom blocks using hosts format (will be preserved on refresh)
+# Add custom blocks using hosts format
 0.0.0.0 unwanted-site.com
 0.0.0.0 another-blocked.com
 
@@ -455,22 +650,22 @@ environment:
   - BLOCKLIST_ENABLED=false
 ```
 
+---
+
 ## License
 
 GNU General Public License v3 or later
 
-Original browse.sh: Copyright 2019-2023 Red Tuby PE1RRR
+Original browse.sh: Copyright 2019-2023 Red Tuby PE1RRR (SK)
 Docker implementation: Copyright 2026 KU0HN
 
 This program is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
 
 This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
-You should have received a copy of the GNU General Public License along with this program. If not, see <http://www.gnu.org/licenses/>.
-
 ## Credits
 
-- **Red Tuby PE1RRR** - Original browse.sh implementation (2019-2023)
+- **Red Tuby PE1RRR** (SK) - Original browse.sh implementation (2019-2023)
 - **KU0HN** - Docker containerization and Rust port (2026)
 
 ## Support
