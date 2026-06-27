@@ -1,10 +1,15 @@
 NIX = nix --extra-experimental-features "nix-command flakes"
 
-.PHONY: test build smoke-test all install-hooks
+.PHONY: test build smoke-test e2e all install-hooks
 
 ## Run cargo unit tests
 test:
 	$(NIX) develop -c cargo test --all-features -- --test-threads=1
+
+## Run e2e integration tests (requires Direwolf, PipeWire, LinBPQ)
+e2e:
+	@echo "=== Running e2e integration tests ==="
+	@cd e2e && pip install -q -r requirements-test.txt && pytest -v
 
 ## Build the Docker image via Nix
 build:
@@ -25,7 +30,6 @@ smoke-test:
 	  -v /tmp/smoke-logs:/var/log/packet-browser \
 	  -v /tmp/smoke-hosts:/etc/hosts \
 	  --cap-drop ALL \
-	  -e DEBUG_MODE=true \
 	  -e BLOCKLIST_ENABLED=false \
 	  -e PORTAL_URL=https://example.com \
 	  docker-packet-browser:latest

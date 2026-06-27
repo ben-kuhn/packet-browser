@@ -1,4 +1,4 @@
-use packet_browser::logger::{LogEntry, LogStatus};
+use packet_browser_server::logger::{LogEntry, LogStatus};
 
 #[test]
 fn test_log_entry_serialization() {

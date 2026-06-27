@@ -1,4 +1,4 @@
-use packet_browser::session::{validate_callsign, Session};
+use packet_browser_server::session::{validate_callsign, Session};
 
 #[test]
 fn test_valid_callsigns() {

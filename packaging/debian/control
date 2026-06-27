@@ -1,0 +1,20 @@
+Source: debian/control
+Format: 3.0 (quilt)
+Source: packet-browser-client
+Section: net
+Priority: optional
+Maintainer: Your Name <your.email@example.com>
+Build-Depends: debhelper (>= 12),
+               cargo:native,
+               rustc:native,
+               libssl-dev,
+               pkg-config
+Standards-Version: 4.5.0
+Homepage: https://github.com/yourusername/docker-packet-browser
+
+Package: packet-browser-client
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Client component for Packet Browser - Web browser over AX.25 packet radio
+ Packet Browser Client provides a web-based interface for browsing web pages
+ over AX.25 packet radio connections via AGWPE.

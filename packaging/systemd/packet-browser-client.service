@@ -1,0 +1,21 @@
+[Unit]
+Description=Packet Browser Client - Web browser over AX.25 packet radio
+After=network.target
+
+[Service]
+Type=simple
+User=packet-browser
+Group=packet-browser
+ExecStart=/usr/bin/packet-browser-client --config /etc/packet-browser/config.ini
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/log/packet-browser
+
+[Install]
+WantedBy=multi-user.target

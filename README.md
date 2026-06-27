@@ -2,25 +2,27 @@
 
 [![Build and Publish](https://github.com/ben-kuhn/docker-packet-browser/actions/workflows/build.yml/badge.svg)](https://github.com/ben-kuhn/docker-packet-browser/actions/workflows/build.yml)
 
-A secure web browser for packet radio users connecting through BPQ. This containerized implementation provides text-based web browsing with comprehensive logging, content filtering, and security hardening suitable for amateur radio networks.
+A client/server web browser for packet radio. The server (behind BPQ) fetches and sanitizes web pages using headless Chromium, compresses them with brotli, and sends them over AX.25. The client connects via AGWPE and provides a local web proxy that users browse with their regular browser.
 
 ## Overview
 
-This project modernizes the original PE1RRR packet radio browser (browse.sh) into a secure, containerized deployment. The browser uses headless Chromium to render modern web pages and presents them as paginated text suitable for low-bandwidth packet radio connections.
+This project modernizes the original PE1RRR packet radio browser (browse.sh) into a client/server architecture. The server uses headless Chromium to render modern web pages, strips JavaScript and heavy resources, inlines CSS, and brotli-compresses the result. The client connects via AGWPE and provides a local web proxy that rewrites URLs so users can browse with their regular browser.
 
 **Original Work:** Red Tuby PE1RRR (SK) - browse.sh
 **License:** GNU General Public License v3
 
 ### Key Features
 
-- Full JavaScript support via headless Chromium
+- Client/server architecture over AX.25 packet radio
+- Server fetches pages via headless Chromium, strips JS/images, inlines CSS
+- Brotli compression (quality 11) for minimal bandwidth usage
+- Client provides local web proxy with dark-themed UI
+- URL rewriting so links route through the radio link
+- SSE-based live debug log in web UI
 - JSON structured logging with callsign tracking
 - Multi-layer content filtering (DNS + hosts-based blocklist)
 - SSRF prevention for network security
-- Session timeout and idle disconnect
-- Read-only container filesystem
-- Capability-dropping security model
-- Docker Compose deployment
+- Read-only container filesystem with capability dropping
 
 ## Quick Start
 
@@ -88,7 +90,7 @@ services:
       - LISTEN_PORT=63004
       - PORTAL_URL=https://www.zeroretries.radio
       - IDLE_TIMEOUT_MINUTES=10
-      - LINES_PER_PAGE=22
+      - BROTLI_QUALITY=11
 
       # SSRF prevention - blocked IP ranges
       # Remove ranges to allow access to local services
@@ -105,9 +107,6 @@ services:
       - SYSLOG_ENABLED=false
       # - SYSLOG_HOST=syslog.example.com
       # - SYSLOG_PORT=514
-
-      # Debug mode - for testing without BPQ
-      - DEBUG_MODE=false
 
     # Security hardening
     read_only: true
@@ -126,7 +125,7 @@ services:
 
     # Health check (uses binary's built-in --healthcheck flag)
     healthcheck:
-      test: ["CMD", "/bin/packet-browser", "--healthcheck"]
+      test: ["CMD", "/bin/packet-browser-server", "--healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -142,7 +141,7 @@ services:
 | `LISTEN_PORT` | `63004` | TCP port the service listens on |
 | `PORTAL_URL` | `https://www.zeroretries.radio` | Default home page shown on connect |
 | `IDLE_TIMEOUT_MINUTES` | `10` | Session timeout for idle connections |
-| `LINES_PER_PAGE` | `22` | Lines per page (VT52: 25 rows - footer) |
+| `BROTLI_QUALITY` | `11` | Brotli compression level (0-11) |
 | `BLOCKED_RANGES` | `127.0.0.0/8,10.0.0.0/8,...` | CIDR ranges blocked for SSRF prevention |
 | `BLOCKLIST_ENABLED` | `true` | Enable/disable local hosts-based blocklist |
 | `BLOCKLIST_REFRESH_HOURS` | `24` | How often to refresh blocklists from URLs |
@@ -152,7 +151,6 @@ services:
 | `SYSLOG_ENABLED` | `false` | Forward logs to external syslog server |
 | `SYSLOG_HOST` | *(empty)* | Syslog server hostname or IP |
 | `SYSLOG_PORT` | `514` | Syslog server port |
-| `DEBUG_MODE` | `false` | Enable debug mode for testing without BPQ |
 
 ## BPQ Integration
 
@@ -210,71 +208,50 @@ services:
 
 ### Connection Flow
 
-1. User connects to BPQ node via radio or telnet
-2. User types `WEB` (or configured command)
-3. BPQ opens TCP connection to container on port 63004
-4. Container receives callsign from BPQ, shows welcome banner
-5. User must type `AGREE` to acknowledge logging
-6. User browses web via numbered link navigation
-7. On exit or timeout, user returns to BPQ node menu
+1. User starts the client on their local machine
+2. Client connects to AGWPE (TNC) over TCP
+3. Client establishes AX.25 connection to the BPQ node
+4. User opens browser to client's web interface (default `http://localhost:8080`)
+5. User configures AGWPE settings and callsigns via web UI
+6. User enters a URL or clicks links in the web interface
+7. Client sends request over AX.25 to the server
+8. Server fetches page with headless Chromium, sanitizes HTML, compresses with brotli
+9. Server sends compressed response back over AX.25
+10. Client decompresses, rewrites URLs to route through local proxy, displays in browser
 
-## User Commands
+## Web Interface
 
-Once connected and agreed to logging, the browser loads the portal page and shows a `Command:` prompt. Type `H` at any time for in-session help.
+The client provides a web-based interface for configuration and browsing:
 
-| Command | Description |
-|---------|-------------|
-| `N <url>` | Open a URL (e.g. `N https://example.com`) — must include `https://` or `http://` |
-| `S <text>` | Search Wikipedia for text |
-| `<number>` | Follow a numbered link from the current page |
-| `I <n> [value]` | Interact with input field n. Value depends on type: text/search = type text; select/radio = pick option by number (e.g. `I 2 3` for option 3); checkbox = no value needed (toggles) |
-| `L` | List all links on the current page with their numbers |
-| `P` | Go back to the previous page |
-| `M` | Return to the portal menu page |
-| `R` | Redisplay the current page |
-| `F` | Toggle between paged and full-page display |
-| `OP <n>` | Set lines per page (1-99); `OP` alone shows current setting |
-| `H` or `?` | Show help |
-| `Q` or `B` | Quit / disconnect |
+- **Connect page** (`/connect`) - AGWPE connection status, callsign configuration, port selection, and live debug log
+- **Configuration page** (`/configuration`) - AGWPE host/port settings
+- **Browse page** (`/browse?url=...`) - Displays fetched pages with rewritten links
 
-> **Note:** URLs must include the full scheme (`https://` or `http://`). Typing just `google.com` will not work — use `N https://google.com`.
+All links and forms in fetched pages are rewritten to route through the local proxy, so clicking links continues to fetch pages over the radio link.
 
-Each page displays an inputs section (if any fields exist) followed by a command footer. Example inputs section:
-```
---- Inputs ---
-[I1] Search (text)
-[I2] Size (select) 1=Small 2=Medium 3=Large
-[I3] Newsletter (checkbox) OFF
-[I4] Color (radio) 1=Red 2=Blue 3=Green
---- H=Help N=URL S=Search I<n>=Input P=Back M=Menu Q=Quit ---
-```
+## Testing
 
-## Debug Mode / Testing
-
-To test the browser without BPQ, enable debug mode:
-
-```yaml
-environment:
-  - DEBUG_MODE=true
-```
-
-Then connect via telnet:
+To test the server without BPQ, connect directly via telnet:
 
 ```bash
 telnet localhost 63004
 ```
 
-In debug mode:
-- You will be prompted to enter a callsign
-- Callsign validation still applies (must match amateur radio format)
-- All other functionality works identically
-- Logging still occurs with the callsign you provide
+You will be prompted to enter a callsign, then type `AGREE` to acknowledge logging.
 
-This is useful for:
-- Testing configuration changes
-- Verifying blocklists
-- Debugging connection issues
-- Development and troubleshooting
+## Client
+
+The client runs locally and provides a web proxy interface. It connects to AGWPE for the radio link and serves pages to your browser.
+
+```bash
+# Build the client
+cargo build -p packet-browser-client
+
+# Run the client
+./target/debug/packet-browser-client --listen-addr 127.0.0.1:8080
+```
+
+Open your browser to `http://localhost:8080` to configure AGWPE settings and browse pages.
 
 ## Building from Source
 
@@ -323,11 +300,14 @@ cargo run
 ### Building Binary Only
 
 ```bash
-# Build just the Rust binary (no container)
+# Build the workspace (server + client)
 nix build
 
-# Binary is at ./result/bin/packet-browser
-./result/bin/packet-browser
+# Server binary is at ./result/bin/packet-browser-server
+./result/bin/packet-browser-server
+
+# Client binary is at ./result/bin/packet-browser-client
+./result/bin/packet-browser-client
 ```
 
 ## Logging

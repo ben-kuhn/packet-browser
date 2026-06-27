@@ -1,12 +1,12 @@
-use packet_browser::config::Config;
+use packet_browser_server::config::Config;
 
 #[test]
 fn test_config_defaults() {
-    // Clear relevant env vars to ensure defaults are used
     let env_vars = vec![
         "LISTEN_PORT",
         "PORTAL_URL",
         "IDLE_TIMEOUT_MINUTES",
+        "BROTLI_QUALITY",
         "BLOCKED_RANGES",
         "BLOCKLIST_URLS",
         "BLOCKLIST_REFRESH_HOURS",
@@ -16,8 +16,6 @@ fn test_config_defaults() {
         "SYSLOG_ENABLED",
         "SYSLOG_HOST",
         "SYSLOG_PORT",
-        "LINES_PER_PAGE",
-        "DEBUG_MODE",
     ];
 
     for var in &env_vars {
@@ -26,10 +24,10 @@ fn test_config_defaults() {
 
     let config = Config::from_env();
 
-    // Verify all defaults
     assert_eq!(config.listen_port, 63004);
-    assert_eq!(config.portal_url, "http://matrix.ehvairport.com/~bpq/");
+    assert_eq!(config.portal_url, "https://www.zeroretries.radio");
     assert_eq!(config.idle_timeout_minutes, 10);
+    assert_eq!(config.brotli_quality, 11);
     assert_eq!(
         config.blocked_ranges,
         vec![
@@ -48,17 +46,15 @@ fn test_config_defaults() {
     assert!(!config.syslog_enabled);
     assert_eq!(config.syslog_host, None);
     assert_eq!(config.syslog_port, 514);
-    assert_eq!(config.lines_per_page, 22); // VT52: 25 rows - footer
-    assert!(!config.debug_mode);
 }
 
 #[test]
 fn test_config_env_override() {
-    // Clear env vars first
     let env_vars = vec![
         "LISTEN_PORT",
         "PORTAL_URL",
         "IDLE_TIMEOUT_MINUTES",
+        "BROTLI_QUALITY",
         "BLOCKED_RANGES",
         "BLOCKLIST_URLS",
         "BLOCKLIST_REFRESH_HOURS",
@@ -68,18 +64,16 @@ fn test_config_env_override() {
         "SYSLOG_ENABLED",
         "SYSLOG_HOST",
         "SYSLOG_PORT",
-        "LINES_PER_PAGE",
-        "DEBUG_MODE",
     ];
 
     for var in &env_vars {
         std::env::remove_var(var);
     }
 
-    // Set env vars with custom values
     std::env::set_var("LISTEN_PORT", "8080");
     std::env::set_var("PORTAL_URL", "http://custom.example.com/");
     std::env::set_var("IDLE_TIMEOUT_MINUTES", "30");
+    std::env::set_var("BROTLI_QUALITY", "6");
     std::env::set_var("BLOCKED_RANGES", "192.168.1.0/24, 10.0.0.0/8");
     std::env::set_var("BLOCKLIST_URLS", "http://example.com/list1, http://example.com/list2");
     std::env::set_var("BLOCKLIST_REFRESH_HOURS", "48");
@@ -89,15 +83,13 @@ fn test_config_env_override() {
     std::env::set_var("SYSLOG_ENABLED", "true");
     std::env::set_var("SYSLOG_HOST", "localhost");
     std::env::set_var("SYSLOG_PORT", "1514");
-    std::env::set_var("LINES_PER_PAGE", "25");
-    std::env::set_var("DEBUG_MODE", "true");
 
     let config = Config::from_env();
 
-    // Verify all overrides
     assert_eq!(config.listen_port, 8080);
     assert_eq!(config.portal_url, "http://custom.example.com/");
     assert_eq!(config.idle_timeout_minutes, 30);
+    assert_eq!(config.brotli_quality, 6);
     assert_eq!(
         config.blocked_ranges,
         vec!["192.168.1.0/24", "10.0.0.0/8"]
@@ -113,10 +105,7 @@ fn test_config_env_override() {
     assert!(config.syslog_enabled);
     assert_eq!(config.syslog_host, Some("localhost".to_string()));
     assert_eq!(config.syslog_port, 1514);
-    assert_eq!(config.lines_per_page, 25);
-    assert!(config.debug_mode);
 
-    // Clean up env vars
     for var in &env_vars {
         std::env::remove_var(var);
     }
@@ -124,68 +113,64 @@ fn test_config_env_override() {
 
 #[test]
 fn test_config_bool_parsing() {
-    // Clear env vars
-    std::env::remove_var("DEBUG_MODE");
+    std::env::remove_var("BLOCKLIST_ENABLED");
 
-    // Test various true values
-    std::env::set_var("DEBUG_MODE", "true");
+    std::env::set_var("BLOCKLIST_ENABLED", "true");
     let config = Config::from_env();
-    assert!(config.debug_mode);
+    assert!(config.blocklist_enabled);
 
-    std::env::set_var("DEBUG_MODE", "1");
+    std::env::set_var("BLOCKLIST_ENABLED", "1");
     let config = Config::from_env();
-    assert!(config.debug_mode);
+    assert!(config.blocklist_enabled);
 
-    std::env::set_var("DEBUG_MODE", "yes");
+    std::env::set_var("BLOCKLIST_ENABLED", "yes");
     let config = Config::from_env();
-    assert!(config.debug_mode);
+    assert!(config.blocklist_enabled);
 
-    std::env::set_var("DEBUG_MODE", "on");
+    std::env::set_var("BLOCKLIST_ENABLED", "on");
     let config = Config::from_env();
-    assert!(config.debug_mode);
+    assert!(config.blocklist_enabled);
 
-    // Test various false values
-    std::env::set_var("DEBUG_MODE", "false");
+    std::env::set_var("BLOCKLIST_ENABLED", "false");
     let config = Config::from_env();
-    assert!(!config.debug_mode);
+    assert!(!config.blocklist_enabled);
 
-    std::env::set_var("DEBUG_MODE", "0");
+    std::env::set_var("BLOCKLIST_ENABLED", "0");
     let config = Config::from_env();
-    assert!(!config.debug_mode);
+    assert!(!config.blocklist_enabled);
 
-    std::env::set_var("DEBUG_MODE", "no");
+    std::env::set_var("BLOCKLIST_ENABLED", "no");
     let config = Config::from_env();
-    assert!(!config.debug_mode);
+    assert!(!config.blocklist_enabled);
 
-    std::env::set_var("DEBUG_MODE", "off");
+    std::env::set_var("BLOCKLIST_ENABLED", "off");
     let config = Config::from_env();
-    assert!(!config.debug_mode);
+    assert!(!config.blocklist_enabled);
 
-    // Clean up
-    std::env::remove_var("DEBUG_MODE");
+    std::env::remove_var("BLOCKLIST_ENABLED");
 }
 
 #[test]
 fn test_config_invalid_env_values_use_defaults() {
-    // Clear env vars
     std::env::remove_var("LISTEN_PORT");
     std::env::remove_var("IDLE_TIMEOUT_MINUTES");
     std::env::remove_var("SYSLOG_PORT");
+    std::env::remove_var("BROTLI_QUALITY");
 
-    // Set invalid values
     std::env::set_var("LISTEN_PORT", "not_a_number");
     std::env::set_var("IDLE_TIMEOUT_MINUTES", "invalid");
     std::env::set_var("SYSLOG_PORT", "not_a_port");
+    std::env::set_var("BROTLI_QUALITY", "not_a_number");
 
     let config = Config::from_env();
 
-    // Should use defaults when parsing fails
     assert_eq!(config.listen_port, 63004);
     assert_eq!(config.idle_timeout_minutes, 10);
     assert_eq!(config.syslog_port, 514);
+    assert_eq!(config.brotli_quality, 11);
 
-    // Clean up
     std::env::remove_var("LISTEN_PORT");
     std::env::remove_var("IDLE_TIMEOUT_MINUTES");
     std::env::remove_var("SYSLOG_PORT");
+    std::env::remove_var("BROTLI_QUALITY");
 }

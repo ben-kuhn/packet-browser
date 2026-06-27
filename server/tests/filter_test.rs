@@ -1,4 +1,4 @@
-use packet_browser::filter::{validate_url, UrlError};
+use packet_browser_server::filter::{validate_url, UrlError};
 
 #[test]
 fn test_blocked_protocols() {

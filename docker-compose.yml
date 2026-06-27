@@ -17,7 +17,7 @@ services:
       - LISTEN_PORT=63004
       - PORTAL_URL=https://www.zeroretries.radio
       - IDLE_TIMEOUT_MINUTES=10
-      - LINES_PER_PAGE=22
+      - BROTLI_QUALITY=11
 
       # SSRF prevention - blocked IP ranges
       # Remove ranges to allow access to local services
@@ -34,9 +34,6 @@ services:
       - SYSLOG_ENABLED=false
       # - SYSLOG_HOST=syslog.example.com
       # - SYSLOG_PORT=514
-
-      # Debug mode - for testing without BPQ
-      - DEBUG_MODE=false
 
     # Security hardening
     read_only: true
@@ -55,7 +52,7 @@ services:
 
     # Health check uses the binary itself (no shell or netcat in the image).
     healthcheck:
-      test: ["CMD", "/bin/packet-browser", "--healthcheck"]
+      test: ["CMD", "/bin/packet-browser-server", "--healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 3

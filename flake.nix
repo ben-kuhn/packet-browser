@@ -17,18 +17,16 @@
 
         packet-browser = pkgs.rustPlatform.buildRustPackage {
           pname = "packet-browser";
-          version = "0.1.0";
+          version = "0.2.0";
           src = ./.;
           cargoLock.lockFile = ./Cargo.lock;
 
           nativeBuildInputs = [
             pkgs.pkg-config
-            pkgs.rustfmt  # Required by headless_chrome build
+            pkgs.rustfmt
           ];
           buildInputs = [ pkgs.openssl ];
 
-          # Skip tests in Nix build - they require single-threaded execution
-          # due to env var manipulation. Tests are run separately in CI.
           doCheck = false;
         };
 
@@ -44,20 +42,18 @@
               pkgs.dumb-init
               pkgs.logrotate
               pkgs.cacert
-              pkgs.fontconfig       # Runtime font configuration (fontconfig.conf, fc-cache)
-              pkgs.liberation_ttf   # Core font set (replaces Arial/Times/Courier)
-              pkgs.noto-fonts       # Wide Unicode coverage for packet radio text pages
+              pkgs.fontconfig
+              pkgs.liberation_ttf
+              pkgs.noto-fonts
             ];
             pathsToLink = [ "/bin" "/etc" "/share" ];
           };
 
           config = {
-            Cmd = [ "/bin/dumb-init" "/bin/packet-browser" ];
+            Cmd = [ "/bin/dumb-init" "/bin/packet-browser-server" ];
             ExposedPorts = { "63004/tcp" = {}; };
             Env = [
               "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
-              # buildEnv does not create /etc/fonts at the root level; point fontconfig
-              # directly at the store path so Chrome's font manager initialises correctly.
               "FONTCONFIG_FILE=${pkgs.fontconfig.out}/etc/fonts/fonts.conf"
             ];
             User = "1000:1000";
@@ -73,6 +69,8 @@
       {
         packages = {
           default = packet-browser;
+          server = packet-browser;
+          client = packet-browser;
           docker-image = dockerImage;
         };
 
@@ -82,6 +80,12 @@
             pkgs.pkg-config
             pkgs.openssl
             pkgs.chromium
+            pkgs.direwolf
+            pkgs.pipewire
+            pkgs.python3
+            pkgs.python3Packages.pytest
+            pkgs.python3Packages.pytest-asyncio
+            pkgs.python3Packages.requests
           ];
         };
       }

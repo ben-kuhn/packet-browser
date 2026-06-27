@@ -1,0 +1,33 @@
+# Maintainer: Your Name <your.email@example.com>
+pkgname=packet-browser-client
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="Client component for Packet Browser - Web browser over AX.25 packet radio"
+arch=('x86_64' 'aarch64')
+url="https://github.com/yourusername/docker-packet-browser"
+license=('MIT')
+depends=('openssl' 'gcc-libs')
+makedepends=('cargo' 'git')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/yourusername/docker-packet-browser/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+    cd "$srcdir/docker-packet-browser-$pkgver"
+    cargo fetch --locked
+}
+
+build() {
+    cd "$srcdir/docker-packet-browser-$pkgver"
+    cargo build --release --bin packet-browser-client
+}
+
+package() {
+    cd "$srcdir/docker-packet-browser-$pkgver"
+    install -Dm755 target/release/packet-browser-client "$pkgdir/usr/bin/packet-browser-client"
+    
+    # Install example config
+    install -Dm644 client/config.example.ini "$pkgdir/etc/packet-browser/config.ini.example"
+    
+    # Install systemd service
+    install -Dm644 packaging/systemd/packet-browser-client.service "$pkgdir/usr/lib/systemd/system/packet-browser-client.service"
+}

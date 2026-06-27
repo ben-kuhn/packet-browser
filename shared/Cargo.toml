@@ -1,0 +1,10 @@
+[package]
+name = "packet-browser-shared"
+version = "0.1.0"
+edition = "2021"
+description = "Shared protocol types and compression helpers for packet browser"
+license = "GPL-3.0"
+
+[dependencies]
+brotli = "3"
+thiserror = "1"

@@ -1,0 +1,27 @@
+[package]
+name = "packet-browser-client"
+version = "0.1.0"
+edition = "2021"
+description = "Packet radio web browser client - AGWPE interface and local web proxy"
+license = "GPL-3.0"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+axum = "0.7"
+lol_html = "1"
+url = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+configparser = "3"
+dirs = "5"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+async-stream = "0.3"
+packet-browser-shared = { path = "../shared" }
+
+[dev-dependencies]
+tempfile = "3"

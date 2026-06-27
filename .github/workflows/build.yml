@@ -2,7 +2,7 @@ name: Build and Publish
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'feature/*']
     tags: ['v*']
   pull_request:
     branches: [main]
@@ -11,6 +11,7 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  CARGO_TERM_COLOR: always
 
 jobs:
   test:
@@ -28,7 +29,190 @@ jobs:
       - name: Run tests
         run: nix develop -c cargo test --all-features -- --test-threads=1
 
-  build:
+  build-linux:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Build client binary
+        run: cargo build --release --bin packet-browser-client --target ${{ matrix.target }}
+
+      - name: Build server binary
+        run: cargo build --release --bin packet-browser-server --target ${{ matrix.target }}
+
+      - name: Create release archive
+        run: |
+          mkdir -p release
+          cp target/${{ matrix.target }}/release/packet-browser-client release/
+          cp target/${{ matrix.target }}/release/packet-browser-server release/
+          cp client/config.example.ini release/
+          cp packaging/systemd/packet-browser-client.service release/
+          tar -czf packet-browser-${{ matrix.target }}.tar.gz -C release .
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: packet-browser-${{ matrix.target }}
+          path: packet-browser-${{ matrix.target }}.tar.gz
+
+  build-windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install OpenSSL
+        run: |
+          vcpkg install openssl:x64-windows-static
+          echo "OPENSSL_DIR=C:\vcpkg\installed\x64-windows-static" >> $env:GITHUB_ENV
+          echo "OPENSSL_STATIC=1" >> $env:GITHUB_ENV
+
+      - name: Build client binary
+        run: cargo build --release --bin packet-browser-client --target x86_64-pc-windows-msvc
+
+      - name: Build server binary
+        run: cargo build --release --bin packet-browser-server --target x86_64-pc-windows-msvc
+
+      - name: Create release archive
+        run: |
+          mkdir release
+          Copy-Item target\x86_64-pc-windows-msvc\release\packet-browser-client.exe release\
+          Copy-Item target\x86_64-pc-windows-msvc\release\packet-browser-server.exe release\
+          Copy-Item client\config.example.ini release\
+          Compress-Archive -Path release\* -DestinationPath packet-browser-x86_64-pc-windows-msvc.zip
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: packet-browser-x86_64-pc-windows-msvc
+          path: packet-browser-x86_64-pc-windows-msvc.zip
+
+  build-macos:
+    needs: test
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target: [x86_64-apple-darwin, aarch64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install dependencies
+        run: brew install openssl@3 pkg-config
+
+      - name: Build client binary
+        run: cargo build --release --bin packet-browser-client --target ${{ matrix.target }}
+
+      - name: Build server binary
+        run: cargo build --release --bin packet-browser-server --target ${{ matrix.target }}
+
+      - name: Create release archive
+        run: |
+          mkdir -p release
+          cp target/${{ matrix.target }}/release/packet-browser-client release/
+          cp target/${{ matrix.target }}/release/packet-browser-server release/
+          cp client/config.example.ini release/
+          tar -czf packet-browser-${{ matrix.target }}.tar.gz -C release .
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: packet-browser-${{ matrix.target }}
+          path: packet-browser-${{ matrix.target }}.tar.gz
+
+  build-packages:
+    needs: [build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Linux x86_64 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: packet-browser-x86_64-unknown-linux-gnu
+          path: artifacts/
+
+      - name: Extract artifacts
+        run: |
+          mkdir -p extracted
+          tar -xzf artifacts/packet-browser-x86_64-unknown-linux-gnu.tar.gz -C extracted/
+
+      - name: Build Debian package
+        run: |
+          mkdir -p deb-build/DEBIAN
+          mkdir -p deb-build/usr/bin
+          mkdir -p deb-build/etc/packet-browser
+          mkdir -p deb-build/lib/systemd/system
+          
+          cp extracted/packet-browser-client deb-build/usr/bin/
+          cp extracted/config.example.ini deb-build/etc/packet-browser/
+          cp extracted/packet-browser-client.service deb-build/lib/systemd/system/
+          
+          cat > deb-build/DEBIAN/control << 'EOF'
+          Package: packet-browser-client
+          Version: 0.2.0
+          Architecture: amd64
+          Maintainer: Your Name <your.email@example.com>
+          Description: Client component for Packet Browser
+           Web browser over AX.25 packet radio
+          Depends: libc6, libssl3
+          EOF
+          
+          dpkg-deb --build deb-build packet-browser-client_0.2.0_amd64.deb
+
+      - name: Build RPM package
+        run: |
+          mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          cp artifacts/packet-browser-x86_64-unknown-linux-gnu.tar.gz rpmbuild/SOURCES/
+          cp packaging/rpm/packet-browser-client.spec rpmbuild/SPECS/
+          
+          rpmbuild --define "_topdir $(pwd)/rpmbuild" -bb rpmbuild/SPECS/packet-browser-client.spec
+          
+          cp rpmbuild/RPMS/x86_64/*.rpm .
+
+      - name: Upload Debian package
+        uses: actions/upload-artifact@v4
+        with:
+          name: packet-browser-client-deb
+          path: packet-browser-client_0.2.0_amd64.deb
+
+      - name: Upload RPM package
+        uses: actions/upload-artifact@v4
+        with:
+          name: packet-browser-client-rpm
+          path: rpmbuild/RPMS/x86_64/*.rpm
+
+  build-docker:
     needs: test
     runs-on: ubuntu-latest
     permissions:
@@ -50,73 +234,6 @@ jobs:
 
       - name: Load image
         run: docker load < result
-
-      - name: Smoke test - verify Chromium starts and can load a page
-        run: |
-          mkdir -p /tmp/smoke-logs
-          touch /tmp/smoke-hosts
-
-          docker run -d --name smoke-test \
-            --read-only \
-            --tmpfs /tmp:size=128M,mode=1777 \
-            --tmpfs /dev/shm:size=64M,mode=1777 \
-            -p 127.0.0.1:63004:63004 \
-            -v /tmp/smoke-logs:/var/log/packet-browser \
-            -v /tmp/smoke-hosts:/etc/hosts \
-            --cap-drop ALL \
-            -e DEBUG_MODE=true \
-            -e BLOCKLIST_ENABLED=false \
-            -e PORTAL_URL=https://example.com \
-            docker-packet-browser:latest
-
-          echo "Waiting for docker-packet-browser to start listening..."
-          timeout 30 bash -c 'until nc -z 127.0.0.1 63004 2>/dev/null; do sleep 1; done'
-          echo "Service is up"
-
-          # Simulate a user login to trigger browser initialization.
-          { sleep 1; echo "W1TEST"; sleep 1; echo "AGREE"; sleep 180; } \
-            | nc 127.0.0.1 63004 >/dev/null 2>&1 &
-          NC_PID=$!
-
-          echo "Step 1/2: Waiting for Chrome DevTools connection (up to 60s)..."
-          CONNECTED=0
-          for i in $(seq 1 60); do
-            if docker logs smoke-test 2>&1 | grep -q '\[BROWSER\] Connected to Chrome DevTools'; then
-              echo "  Chrome connected after ${i}s"
-              CONNECTED=1
-              break
-            fi
-            sleep 1
-          done
-
-          if [ $CONNECTED -eq 0 ]; then
-            echo "--- Container logs ---"
-            docker logs smoke-test 2>&1
-            kill $NC_PID 2>/dev/null || true
-            docker stop smoke-test 2>/dev/null || true
-            docker rm smoke-test 2>/dev/null || true
-            echo "FAIL: Chrome did not connect"
-            exit 1
-          fi
-
-          echo "Step 2/2: Waiting for page load (up to 60s)..."
-          RESULT=1
-          for i in $(seq 1 60); do
-            if docker logs smoke-test 2>&1 | grep -q '\[BROWSER\] Page loaded:'; then
-              echo "PASS: Page loaded after ${i}s"
-              RESULT=0
-              break
-            fi
-            sleep 1
-          done
-
-          echo "--- Container logs ---"
-          docker logs smoke-test 2>&1
-
-          kill $NC_PID 2>/dev/null || true
-          docker stop smoke-test 2>/dev/null || true
-          docker rm smoke-test 2>/dev/null || true
-          exit $RESULT
 
       - name: Log in to Container Registry
         if: github.event_name != 'pull_request'
@@ -145,3 +262,31 @@ jobs:
             docker tag docker-packet-browser:latest "$tag"
             docker push "$tag"
           done
+
+  release:
+    needs: [build-linux, build-windows, build-macos, build-packages, build-docker]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/packet-browser-x86_64-unknown-linux-gnu/packet-browser-x86_64-unknown-linux-gnu.tar.gz
+            artifacts/packet-browser-aarch64-unknown-linux-gnu/packet-browser-aarch64-unknown-linux-gnu.tar.gz
+            artifacts/packet-browser-x86_64-pc-windows-msvc/packet-browser-x86_64-pc-windows-msvc.zip
+            artifacts/packet-browser-x86_64-apple-darwin/packet-browser-x86_64-apple-darwin.tar.gz
+            artifacts/packet-browser-aarch64-apple-darwin/packet-browser-aarch64-apple-darwin.tar.gz
+            artifacts/packet-browser-client-deb/packet-browser-client_0.2.0_amd64.deb
+            artifacts/packet-browser-client-rpm/*.rpm
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
