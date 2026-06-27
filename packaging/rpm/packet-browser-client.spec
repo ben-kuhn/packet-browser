@@ -9,6 +9,9 @@ Source0: packet-browser-x86_64-unknown-linux-gnu.tar.gz
 # No build dependencies needed - packaging pre-built binaries
 AutoReqProv: no
 
+# Define systemd unit directory if not already defined
+%{!?_unitdir: %global _unitdir /usr/lib/systemd/system}
+
 %description
 Packet Browser Client provides a web-based interface for browsing web pages
 over AX.25 packet radio connections via AGWPE.
