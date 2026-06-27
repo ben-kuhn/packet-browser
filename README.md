@@ -190,6 +190,28 @@ APPLICATION 4,WEB,C 10 HOST 3 S
 - **Container Hardening**: Read-only filesystem, no shell, capability dropping, non-root user
 - **Session Security**: Idle timeout, callsign validation, logging acknowledgment
 
+### Running with Nix (without Docker)
+
+Install from [nix-ham-packages](https://github.com/ben-kuhn/nix-ham-packages) overlay:
+
+```bash
+# Install the package
+nix-env -iA nixos.packet-browser-server
+
+# Or build directly from the overlay
+nix build ham-packages#packet-browser-server
+./result/bin/packet-browser-server
+```
+
+The server requires Chromium at runtime. Set `CHROMIUM_PATH` to point to your Chromium binary:
+
+```bash
+export CHROMIUM_PATH=$(which chromium)
+packet-browser-server
+```
+
+Or use the NixOS module (see Client section below for module import instructions).
+
 ---
 
 ## Client
@@ -275,27 +297,79 @@ sudo rc-service packet-browser-client start
 
 #### NixOS
 
+Using the overlay from [nix-ham-packages](https://github.com/ben-kuhn/nix-ham-packages):
+
 ```nix
-# In your configuration.nix
-{ pkgs, ... }:
+# In your flake.nix inputs
 {
-  services.packet-browser-client = {
-    enable = true;
-    config = {
-      agwpe_host = "127.0.0.1";
-      agwpe_port = 8000;
-      my_callsign = "N0CALL";
-      target_callsign = "NODE1";
-      bpq_command = "WEB";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
+    ham-packages.url = "github:ben-kuhn/nix-ham-packages";
+  };
+
+  outputs = { self, nixpkgs, ham-packages }: {
+    nixosConfigurations.your-hostname = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        {
+          nixpkgs.overlays = [ ham-packages.overlays.default ];
+        }
+        ./configuration.nix
+      ];
     };
   };
 }
 ```
 
-Or using the package directly:
+**Client NixOS Module:**
+
+```nix
+# In configuration.nix
+{
+  imports = [ "${ham-packages}/packet-browser-client/module.nix" ];
+
+  services.packet-browser-client = {
+    enable = true;
+    myCallsign = "N0CALL";
+    targetCallsign = "NODE1";
+    agwpeHost = "127.0.0.1";
+    agwpePort = 8000;
+    bpqCommand = "WEB";
+    listenAddr = "127.0.0.1:8080";
+  };
+}
+```
+
+**Server NixOS Module:**
+
+```nix
+# In configuration.nix
+{
+  imports = [ "${ham-packages}/packet-browser-server/module.nix" ];
+
+  services.packet-browser-server = {
+    enable = true;
+    listenPort = 63004;
+    portalUrl = "https://www.zeroretries.radio";
+    idleTimeoutMinutes = 10;
+    brotliQuality = 11;
+    blocklistEnabled = true;
+    blocklistUrls = [
+      "https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/hosts/ultimate.txt"
+    ];
+    openFirewall = false;
+  };
+}
+```
+
+**Installing packages directly:**
 
 ```bash
+# Install client
 nix-env -iA nixos.packet-browser-client
+
+# Install server
+nix-env -iA nixos.packet-browser-server
 ```
 
 #### macOS
@@ -324,6 +398,30 @@ notepad %APPDATA%\packet-browser\config.ini
 
 # Run
 packet-browser-client.exe
+```
+
+### Running with Nix (without Docker)
+
+Install from [nix-ham-packages](https://github.com/ben-kuhn/nix-ham-packages) overlay:
+
+```bash
+# Install the package
+nix-env -iA nixos.packet-browser-client
+
+# Or build directly from the overlay
+nix build ham-packages#packet-browser-client
+./result/bin/packet-browser-client
+```
+
+Create a config file and run:
+
+```bash
+mkdir -p ~/.config/packet-browser
+cp $(nix-build ham-packages#packet-browser-client)/share/packet-browser/config.ini.example \
+   ~/.config/packet-browser/config.ini
+nano ~/.config/packet-browser/config.ini
+
+packet-browser-client
 ```
 
 ### Client Configuration
@@ -516,6 +614,22 @@ nix build
 ./result/bin/packet-browser-server
 ./result/bin/packet-browser-client
 ```
+
+### Nix Packages (nix-ham-packages)
+
+For NixOS system installation, use the [nix-ham-packages](https://github.com/ben-kuhn/nix-ham-packages) overlay instead:
+
+```bash
+# Install packages via the overlay
+nix-env -iA nixos.packet-browser-server
+nix-env -iA nixos.packet-browser-client
+
+# Or build directly
+nix build github:ben-kuhn/nix-ham-packages#packet-browser-server
+nix build github:ben-kuhn/nix-ham-packages#packet-browser-client
+```
+
+See the NixOS section above for systemd service module configuration.
 
 ### Development
 
