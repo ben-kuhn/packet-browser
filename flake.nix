@@ -24,6 +24,7 @@
           nativeBuildInputs = [
             pkgs.pkg-config
             pkgs.rustfmt
+            pkgs.perl
           ];
           buildInputs = [ pkgs.openssl ];
 
