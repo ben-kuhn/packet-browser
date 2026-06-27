@@ -24,15 +24,21 @@ mkdir -p %{buildroot}%{_bindir}
 mkdir -p %{buildroot}%{_sysconfdir}/packet-browser
 mkdir -p %{buildroot}%{_unitdir}
 
-# Install pre-built binaries from the tarball
-tar -xzf %{SOURCE0} -C %{buildroot}%{_bindir} packet-browser-client
+# Extract all files from the tarball to a temporary directory
+mkdir -p /tmp/packet-browser-extract
+tar -xzf %{SOURCE0} -C /tmp/packet-browser-extract
+
+# Install pre-built binaries
+install -m 0755 /tmp/packet-browser-extract/packet-browser-client %{buildroot}%{_bindir}/packet-browser-client
 
 # Install config example
-tar -xzf %{SOURCE0} -C %{buildroot}%{_sysconfdir}/packet-browser config.example.ini
-mv %{buildroot}%{_sysconfdir}/packet-browser/config.example.ini %{buildroot}%{_sysconfdir}/packet-browser/config.ini.example
+install -m 0644 /tmp/packet-browser-extract/config.example.ini %{buildroot}%{_sysconfdir}/packet-browser/config.ini.example
 
 # Install systemd service
-tar -xzf %{SOURCE0} -C %{buildroot}%{_unitdir} packet-browser-client.service
+install -m 0644 /tmp/packet-browser-extract/packet-browser-client.service %{buildroot}%{_unitdir}/packet-browser-client.service
+
+# Clean up
+rm -rf /tmp/packet-browser-extract
 
 %files
 %{_bindir}/packet-browser-client
