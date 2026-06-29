@@ -45,6 +45,26 @@ async fn main() -> Result<(), ClientError> {
 
     let agwpe_manager = agwpe::AgwpeManager::new(shared_state.clone(), log_tx.clone());
 
+    // Auto-connect to AGWPE on startup
+    if !config.my_callsign.is_empty() {
+        tracing::info!("Attempting auto-connect to AGWPE at {}:{}", config.agwpe_host, config.agwpe_port);
+        match agwpe_manager.connect_to_agwpe(config.agwpe_host.clone(), config.agwpe_port, config.my_callsign.clone()).await {
+            Ok(_) => {
+                tracing::info!("Successfully connected to AGWPE");
+                // Query ports after successful connection
+                if let Err(e) = agwpe_manager.query_ports().await {
+                    tracing::warn!("Connected to AGWPE but failed to query ports: {}", e);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to auto-connect to AGWPE: {}", e);
+                tracing::warn!("Please start your AGWPE modem/server and verify the configuration");
+            }
+        }
+    } else {
+        tracing::info!("No callsign configured, skipping auto-connect");
+    }
+
     let ctx = Arc::new(AppContext {
         state: shared_state,
         agwpe: agwpe_manager,

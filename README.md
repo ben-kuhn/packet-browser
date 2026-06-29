@@ -92,6 +92,23 @@ The script will:
 - **Live logs**: All component logs in a temporary directory
 - **Clean shutdown**: Ctrl+C stops everything and cleans up
 
+### Configuration
+
+The demo script supports the following environment variables:
+
+- **`BPQ_APP_NAME`** (default: `WEB`): The BPQ application command to send. Different sysops may use different application names.
+- **`TARGET_CALLSIGN`** (default: `N0CALL-7`): The target callsign to connect to. Can be a node SSID or regular callsign.
+- **`SKIP_BPQ_APP`** (default: `false`): Set to `true` to skip sending the BPQ application command. Useful when connecting directly to a node SSID that doesn't require an application command.
+
+Example:
+```bash
+# Use a custom BPQ application name
+BPQ_APP_NAME=BROWSE ./demo.sh
+
+# Connect directly to a node SSID without sending an application command
+SKIP_BPQ_APP=true TARGET_CALLSIGN=NODE-7 ./demo.sh
+```
+
 ### Demo Mode Architecture
 
 ```
@@ -108,11 +125,14 @@ The script will:
 
 ### Testing in Demo Mode
 
-1. Open the client web UI in your browser
-2. Click "Connect to AGWPE" to connect to the virtual TNC
-3. Enter a target callsign (e.g., `N0CALL-7`)
-4. Click "AX.25 Connect"
-5. Browse to any URL - it will be fetched through the virtual radio link!
+1. Open the client web UI in your browser (URL shown in demo output)
+2. The client automatically connects to AGWPE on startup
+3. Click "AX.25 Connect" to establish connection to the BPQ node
+4. Browse to any URL - it will be fetched through the virtual radio link!
+
+If the auto-connect fails, check that:
+- Your AGWPE modem/server is running
+- The configuration in the Configuration tab is correct
 
 ### Troubleshooting
 

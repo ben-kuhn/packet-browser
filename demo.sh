@@ -8,6 +8,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEMO_DIR=$(mktemp -d)
 trap 'cleanup' EXIT
 
+# Configuration (can be overridden via environment variables)
+BPQ_APP_NAME="${BPQ_APP_NAME:-WEB}"
+TARGET_CALLSIGN="${TARGET_CALLSIGN:-N0CALL-7}"
+SKIP_BPQ_APP="${SKIP_BPQ_APP:-false}"  # Set to "true" to skip sending BPQ app command
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -228,8 +233,12 @@ start_linbpq() {
     local work_dir="$DEMO_DIR/linbpq"
     local config_file="$work_dir/bpq32.cfg"
     local agwpe_port="$1"
+    local log_file="$DEMO_DIR/linbpq.log"
 
     mkdir -p "$work_dir"
+    
+    # Clear the log file to avoid matching old entries
+    > "$log_file"
 
     cat > "$config_file" <<EOF
 SIMPLE
@@ -262,19 +271,51 @@ APPLICATION 1,WEB,C 1 HOST 0 S
 EOF
 
     log "Starting LinBPQ in $work_dir"
-    (cd "$work_dir" && linbpq > "$DEMO_DIR/linbpq.log" 2>&1) &
+    (cd "$work_dir" && linbpq >> "$log_file" 2>&1) &
     local pid=$!
     save_pid "$pid"
 
-    sleep 3
-
-    if ! kill -0 "$pid" 2>/dev/null; then
-        error "LinBPQ failed to start"
-        cat "$DEMO_DIR/linbpq.log"
-        exit 1
-    fi
-
-    success "LinBPQ started (PID: $pid)"
+    # Wait for LinBPQ to start and connect to Direwolf
+    local waited=0
+    local max_wait=30
+    while [[ $waited -lt $max_wait ]]; do
+        sleep 1
+        waited=$((waited + 1))
+        
+        if ! kill -0 "$pid" 2>/dev/null; then
+            error "LinBPQ failed to start"
+            cat "$log_file"
+            exit 1
+        fi
+        
+        # Check if connection failed
+        if grep -q "Connect Failed for UZ7HO socket" "$log_file" 2>/dev/null; then
+            warn "LinBPQ waiting for Direwolf-B to be ready (attempt $waited/$max_wait)..."
+            # Kill and restart LinBPQ
+            kill "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+            sleep 2
+            # Clear log and restart
+            > "$log_file"
+            (cd "$work_dir" && linbpq >> "$log_file" 2>&1) &
+            pid=$!
+            # Update the PID in the pids file
+            sed -i "/^${pid}$/d" "$DEMO_DIR/pids" 2>/dev/null || true
+            save_pid "$pid"
+            continue
+        fi
+        
+        # Check if LinBPQ has initialized the port successfully
+        # If we see "Initialising Port 01" but no "Connect Failed", we're good
+        if grep -q "Initialising Port 01" "$log_file" 2>/dev/null && [[ $waited -ge 3 ]]; then
+            success "LinBPQ started and connected to Direwolf (PID: $pid)"
+            return 0
+        fi
+    done
+    
+    error "LinBPQ failed to connect to Direwolf-B after ${max_wait}s"
+    error "Check $log_file for details"
+    exit 1
 }
 
 start_server() {
@@ -314,6 +355,15 @@ start_client() {
     local web_port="$2"
     local config_file="$DEMO_DIR/client.ini"
 
+    # Configure BPQ command based on SKIP_BPQ_APP setting
+    local bpq_cmd="$BPQ_APP_NAME"
+    if [[ "$SKIP_BPQ_APP" == "true" ]]; then
+        bpq_cmd=""
+        log "Configuring client to connect directly to $TARGET_CALLSIGN (no BPQ app command)"
+    else
+        log "Configuring client to use BPQ application: $BPQ_APP_NAME"
+    fi
+
     cat > "$config_file" <<EOF
 [server]
 agwpe_host = 127.0.0.1
@@ -321,8 +371,8 @@ agwpe_port = $agwpe_port
 
 [session]
 my_callsign = W1TEST
-target_callsign = N0CALL-7
-bpq_command = WEB
+target_callsign = $TARGET_CALLSIGN
+bpq_command = $bpq_cmd
 EOF
 
     log "Starting packet-browser client on port $web_port"
@@ -355,6 +405,14 @@ show_status() {
     echo "  Packet Browser Demo Mode Active"
     echo "=========================================="
     echo ""
+    echo "Configuration:"
+    echo "  Target callsign: $TARGET_CALLSIGN"
+    if [[ "$SKIP_BPQ_APP" == "true" ]]; then
+        echo "  BPQ app command: (none - direct connection)"
+    else
+        echo "  BPQ app command: $BPQ_APP_NAME"
+    fi
+    echo ""
     echo "Components:"
     echo "  Direwolf-A (W1TEST-1)  - Client-side TNC"
     echo "  Direwolf-B (N0CALL-2)  - Server-side TNC"
@@ -379,6 +437,16 @@ main() {
     echo "  Packet Browser Demo Mode"
     echo "  Off-Air Testing Environment"
     echo "=========================================="
+    echo ""
+
+    # Display configuration
+    log "Configuration:"
+    log "  Target callsign: $TARGET_CALLSIGN"
+    if [[ "$SKIP_BPQ_APP" == "true" ]]; then
+        log "  BPQ app command: (none - direct connection)"
+    else
+        log "  BPQ app command: $BPQ_APP_NAME"
+    fi
     echo ""
 
     # Aggressive cleanup of any existing Direwolf processes
