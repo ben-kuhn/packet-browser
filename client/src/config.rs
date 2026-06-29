@@ -20,6 +20,7 @@ pub struct FileConfig {
     pub my_callsign: String,
     pub target_callsign: String,
     pub bpq_command: String,
+    pub skip_bpq_app: bool,
 }
 
 impl Default for FileConfig {
@@ -30,6 +31,7 @@ impl Default for FileConfig {
             my_callsign: String::new(),
             target_callsign: String::new(),
             bpq_command: "WEB".to_string(),
+            skip_bpq_app: false,
         }
     }
 }
@@ -69,12 +71,18 @@ impl FileConfig {
             .get("session", "bpq_command")
             .unwrap_or_else(|| "WEB".to_string());
 
+        let skip_bpq_app = ini
+            .get("session", "skip_bpq_app")
+            .map(|v| v.to_lowercase() == "true")
+            .unwrap_or(false);
+
         Ok(Self {
             agwpe_host,
             agwpe_port,
             my_callsign,
             target_callsign,
             bpq_command,
+            skip_bpq_app,
         })
     }
 
@@ -90,6 +98,7 @@ impl FileConfig {
         ini.set("session", "my_callsign", Some(self.my_callsign.clone()));
         ini.set("session", "target_callsign", Some(self.target_callsign.clone()));
         ini.set("session", "bpq_command", Some(self.bpq_command.clone()));
+        ini.set("session", "skip_bpq_app", Some(self.skip_bpq_app.to_string()));
 
         ini.write(path).map_err(|e| ConfigError::Parse(e.to_string()))?;
         Ok(())

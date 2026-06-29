@@ -656,43 +656,55 @@ async fn perform_bpq_handshake(
     state: &SharedState,
     log_tx: &broadcast::Sender<DebugLogEntry>,
 ) -> Result<(), AgwpeError> {
-    let bpq_command = {
+    let (bpq_command, skip_bpq_app) = {
         let s = state.lock().unwrap();
-        s.config.bpq_command.clone()
+        (s.config.bpq_command.clone(), s.config.skip_bpq_app)
     };
 
     let callsign = bg.local_callsign.clone();
 
-    BackgroundState::push_log(
-        state,
-        log_tx,
-        DebugLogEntry::new(
-            LogLevel::Info,
-            "BPQ",
-            &format!("Starting BPQ handshake with command: {}", bpq_command),
-        ),
-    );
+    if skip_bpq_app {
+        BackgroundState::push_log(
+            state,
+            log_tx,
+            DebugLogEntry::new(
+                LogLevel::Info,
+                "BPQ",
+                "Skipping BPQ application command (direct connection mode)",
+            ),
+        );
+    } else {
+        BackgroundState::push_log(
+            state,
+            log_tx,
+            DebugLogEntry::new(
+                LogLevel::Info,
+                "BPQ",
+                &format!("Starting BPQ handshake with command: {}", bpq_command),
+            ),
+        );
 
-    // Send BPQ command immediately (e.g., "WEB\n")
-    let cmd_data = format!("{}\n", bpq_command);
+        // Send BPQ command immediately (e.g., "WEB\n")
+        let cmd_data = format!("{}\n", bpq_command);
 
-    BackgroundState::push_log(
-        state,
-        log_tx,
-        DebugLogEntry::new(LogLevel::Debug, "BPQ", &format!("Sending BPQ command: {:?}", cmd_data))
-            .with_direction(Direction::Tx),
-    );
+        BackgroundState::push_log(
+            state,
+            log_tx,
+            DebugLogEntry::new(LogLevel::Debug, "BPQ", &format!("Sending BPQ command: {:?}", cmd_data))
+                .with_direction(Direction::Tx),
+        );
 
-    let cmd_frame = AgwpeFrame::new(
-        bg.agwpe_port,
-        FrameType::SendData,
-        &bg.local_callsign,
-        &bg.remote_callsign,
-        cmd_data.into_bytes(),
-    );
+        let cmd_frame = AgwpeFrame::new(
+            bg.agwpe_port,
+            FrameType::SendData,
+            &bg.local_callsign,
+            &bg.remote_callsign,
+            cmd_data.into_bytes(),
+        );
 
-    BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &cmd_frame).await?;
-    eprintln!("[BPQ] Sent BPQ command frame");
+        BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &cmd_frame).await?;
+        eprintln!("[BPQ] Sent BPQ command frame");
+    }
 
     // Wait for callsign prompt
     let mut received_text = String::new();

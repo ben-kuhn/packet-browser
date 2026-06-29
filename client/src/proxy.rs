@@ -79,9 +79,20 @@ async fn configuration_page_handler(
     let state = ctx.state.lock().unwrap();
     let agwpe_host = state.config.agwpe_host.clone();
     let agwpe_port = state.config.agwpe_port;
+    let my_callsign = state.config.my_callsign.clone();
+    let target_callsign = state.config.target_callsign.clone();
+    let bpq_command = state.config.bpq_command.clone();
+    let skip_bpq_app = state.config.skip_bpq_app;
     drop(state);
 
-    Html(ui::configuration_page(&agwpe_host, agwpe_port))
+    Html(ui::configuration_page(
+        &agwpe_host,
+        agwpe_port,
+        &my_callsign,
+        &target_callsign,
+        &bpq_command,
+        skip_bpq_app,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -388,6 +399,7 @@ struct ConfigResponse {
     my_callsign: String,
     target_callsign: String,
     bpq_command: String,
+    skip_bpq_app: bool,
 }
 
 async fn api_config_get(
@@ -400,6 +412,7 @@ async fn api_config_get(
         my_callsign: state.config.my_callsign.clone(),
         target_callsign: state.config.target_callsign.clone(),
         bpq_command: state.config.bpq_command.clone(),
+        skip_bpq_app: state.config.skip_bpq_app,
     })
 }
 
@@ -408,7 +421,9 @@ struct ConfigUpdate {
     agwpe_host: Option<String>,
     agwpe_port: Option<u16>,
     my_callsign: Option<String>,
+    target_callsign: Option<String>,
     bpq_command: Option<String>,
+    skip_bpq_app: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -445,8 +460,14 @@ async fn api_config_post(
     if let Some(callsign) = update.my_callsign {
         config.my_callsign = callsign;
     }
+    if let Some(target) = update.target_callsign {
+        config.target_callsign = target;
+    }
     if let Some(cmd) = update.bpq_command {
         config.bpq_command = cmd;
+    }
+    if let Some(skip) = update.skip_bpq_app {
+        config.skip_bpq_app = skip;
     }
 
     match config.save(&path) {

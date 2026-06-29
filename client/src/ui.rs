@@ -373,7 +373,14 @@ pub fn connect_page(
     )
 }
 
-pub fn configuration_page(agwpe_host: &str, agwpe_port: u16) -> String {
+pub fn configuration_page(
+    agwpe_host: &str,
+    agwpe_port: u16,
+    my_callsign: &str,
+    target_callsign: &str,
+    bpq_command: &str,
+    skip_bpq_app: bool,
+) -> String {
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -405,10 +412,40 @@ pub fn configuration_page(agwpe_host: &str, agwpe_port: u16) -> String {
             <label for="agwpe-port">AGWPE Port</label>
             <input type="number" id="agwpe-port" value="{port}" placeholder="8000">
         </div>
+    </div>
+
+    <div class="card">
+        <h2>Session Settings</h2>
+
+        <div class="form-group">
+            <label for="my-callsign">My Callsign</label>
+            <input type="text" id="my-callsign" value="{my_callsign}" placeholder="N0CALL">
+            <small>Your amateur radio callsign</small>
+        </div>
+
+        <div class="form-group">
+            <label for="target-callsign">Target Callsign</label>
+            <input type="text" id="target-callsign" value="{target_callsign}" placeholder="NODE1">
+            <small>The BPQ node or station to connect to</small>
+        </div>
+
+        <div class="form-group">
+            <label for="bpq-command">BPQ Application Command</label>
+            <input type="text" id="bpq-command" value="{bpq_command}" placeholder="WEB">
+            <small>The application command sent after connecting (e.g., WEB, BBS)</small>
+        </div>
+
+        <div class="form-group">
+            <label>
+                <input type="checkbox" id="skip-bpq-app" {skip_checked}>
+                Skip BPQ Application Command
+            </label>
+            <small>Enable if connecting directly to a node SSID that doesn't require an application command</small>
+        </div>
 
         <div class="btn-row">
-            <button class="primary" onclick="saveConfig()">Save</button>
-            <button onclick="testConnection()">Test Connection</button>
+            <button class="primary" onclick="saveConfig()">Save Configuration</button>
+            <button onclick="testConnection()">Test AGWPE Connection</button>
         </div>
     </div>
 
@@ -425,6 +462,10 @@ pub fn configuration_page(agwpe_host: &str, agwpe_port: u16) -> String {
                 const data = await resp.json();
                 document.getElementById('agwpe-host').value = data.agwpe_host || '127.0.0.1';
                 document.getElementById('agwpe-port').value = data.agwpe_port || 8000;
+                document.getElementById('my-callsign').value = data.my_callsign || '';
+                document.getElementById('target-callsign').value = data.target_callsign || '';
+                document.getElementById('bpq-command').value = data.bpq_command || 'WEB';
+                document.getElementById('skip-bpq-app').checked = data.skip_bpq_app || false;
             }} catch (e) {{
                 showMsg('Failed to load config: ' + e.message, true);
             }}
@@ -433,18 +474,31 @@ pub fn configuration_page(agwpe_host: &str, agwpe_port: u16) -> String {
         async function saveConfig() {{
             const host = document.getElementById('agwpe-host').value.trim();
             const port = parseInt(document.getElementById('agwpe-port').value);
-            if (!host) {{ showMsg('Host is required', true); return; }}
-            if (!port || port < 1 || port > 65535) {{ showMsg('Invalid port', true); return; }}
+            const myCallsign = document.getElementById('my-callsign').value.trim();
+            const targetCallsign = document.getElementById('target-callsign').value.trim();
+            const bpqCommand = document.getElementById('bpq-command').value.trim();
+            const skipBpqApp = document.getElementById('skip-bpq-app').checked;
+
+            if (!host) {{ showMsg('AGWPE Host is required', true); return; }}
+            if (!port || port < 1 || port > 65535) {{ showMsg('Invalid AGWPE port', true); return; }}
+            if (!myCallsign) {{ showMsg('My Callsign is required', true); return; }}
 
             try {{
                 const resp = await fetch('/api/config', {{
                     method: 'POST',
                     headers: {{ 'Content-Type': 'application/json' }},
-                    body: JSON.stringify({{ agwpe_host: host, agwpe_port: port }})
+                    body: JSON.stringify({{
+                        agwpe_host: host,
+                        agwpe_port: port,
+                        my_callsign: myCallsign,
+                        target_callsign: targetCallsign,
+                        bpq_command: bpqCommand,
+                        skip_bpq_app: skipBpqApp
+                    }})
                 }});
                 const data = await resp.json();
                 if (data.ok) {{
-                    showMsg('Configuration saved');
+                    showMsg('Configuration saved successfully');
                 }} else {{
                     showMsg(data.error || 'Failed to save', true);
                 }}
@@ -474,6 +528,10 @@ pub fn configuration_page(agwpe_host: &str, agwpe_port: u16) -> String {
         css = CSS,
         host = agwpe_host,
         port = agwpe_port,
+        my_callsign = my_callsign,
+        target_callsign = target_callsign,
+        bpq_command = bpq_command,
+        skip_checked = if skip_bpq_app { "checked" } else { "" },
     )
 }
 
