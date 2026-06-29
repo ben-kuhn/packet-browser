@@ -59,6 +59,70 @@ This is fully automated - no user interaction required.
 
 ---
 
+## Demo Mode (Off-Air Testing)
+
+Demo mode sets up a complete virtual radio environment for testing without actual radio hardware. It uses Direwolf TNC emulators connected via PipeWire virtual audio to simulate the full AX.25 communication path.
+
+### Prerequisites
+
+- Direwolf (TNC emulator)
+- PipeWire (audio routing)
+- LinBPQ (BPQ node software)
+- Built binaries (`cargo build` or `nix build`)
+
+### Running Demo Mode
+
+```bash
+# From the project root
+./demo.sh
+```
+
+The script will:
+1. Start two Direwolf instances (client-side and server-side)
+2. Cross-link their audio via PipeWire
+3. Start LinBPQ configured to bridge between Direwolf and the server
+4. Start packet-browser-server on a random port
+5. Start packet-browser-client on a random port
+6. Display access URLs and log locations
+
+### What You Get
+
+- **Client web UI**: Accessible at `http://127.0.0.1:<port>` (shown in output)
+- **Full AX.25 path**: Client → Direwolf-A → (audio) → Direwolf-B → LinBPQ → Server
+- **Live logs**: All component logs in a temporary directory
+- **Clean shutdown**: Ctrl+C stops everything and cleans up
+
+### Demo Mode Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Your Machine (Demo Mode)                                    │
+│                                                               │
+│  Browser ──▶ Client:8080 ──▶ Direwolf-A ──┐                 │
+│                                              │ (audio)       │
+│  Server:63004 ◀── LinBPQ ◀── Direwolf-B ───┘                 │
+│       │                                                       │
+│       └──▶ Chromium (fetches real web pages)                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Testing in Demo Mode
+
+1. Open the client web UI in your browser
+2. Click "Connect to AGWPE" to connect to the virtual TNC
+3. Enter a target callsign (e.g., `N0CALL-7`)
+4. Click "AX.25 Connect"
+5. Browse to any URL - it will be fetched through the virtual radio link!
+
+### Troubleshooting
+
+- **Audio issues**: Ensure PipeWire is running (`systemctl --user status pipewire`)
+- **Port conflicts**: The script uses random free ports, but check if components fail to start
+- **LinBPQ errors**: Check `linbpq.log` in the demo directory
+- **Permission denied**: Make sure the script is executable (`chmod +x demo.sh`)
+
+---
+
 ## Server
 
 The server runs behind a BPQ node and handles web page fetching, sanitization, and compression.
@@ -669,6 +733,68 @@ cd e2e
 pip install -r requirements-test.txt
 pytest -v
 ```
+
+### Demo Mode (Off-Air Testing)
+
+Demo mode sets up a complete virtual radio environment for testing without actual radio hardware. It uses Direwolf TNC emulators connected via PipeWire virtual audio to simulate the full AX.25 communication path.
+
+#### Prerequisites
+
+- Direwolf (TNC emulator)
+- PipeWire (audio routing)
+- LinBPQ (BPQ node software)
+- Built binaries (`cargo build` or `nix build`)
+
+#### Running Demo Mode
+
+```bash
+# From the project root
+./demo.sh
+```
+
+The script will:
+1. Start two Direwolf instances (client-side and server-side)
+2. Cross-link their audio via PipeWire
+3. Start LinBPQ configured to bridge between Direwolf and the server
+4. Start packet-browser-server on a random port
+5. Start packet-browser-client on a random port
+6. Display access URLs and log locations
+
+#### What You Get
+
+- **Client web UI**: Accessible at `http://127.0.0.1:<port>` (shown in output)
+- **Full AX.25 path**: Client → Direwolf-A → (audio) → Direwolf-B → LinBPQ → Server
+- **Live logs**: All component logs in a temporary directory
+- **Clean shutdown**: Ctrl+C stops everything and cleans up
+
+#### Demo Mode Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Your Machine (Demo Mode)                                    │
+│                                                               │
+│  Browser ──▶ Client:8080 ──▶ Direwolf-A ──┐                 │
+│                                              │ (audio)       │
+│  Server:63004 ◀── LinBPQ ◀── Direwolf-B ───┘                 │
+│       │                                                       │
+│       └──▶ Chromium (fetches real web pages)                  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### Testing in Demo Mode
+
+1. Open the client web UI in your browser
+2. Click "Connect to AGWPE" to connect to the virtual TNC
+3. Enter a target callsign (e.g., `N0CALL-7`)
+4. Click "AX.25 Connect"
+5. Browse to any URL - it will be fetched through the virtual radio link!
+
+#### Troubleshooting
+
+- **Audio issues**: Ensure PipeWire is running (`systemctl --user status pipewire`)
+- **Port conflicts**: The script uses random free ports, but check if components fail to start
+- **LinBPQ errors**: Check `linbpq.log` in the demo directory
+- **Permission denied**: Make sure the script is executable (`chmod +x demo.sh`)
 
 ---
 
