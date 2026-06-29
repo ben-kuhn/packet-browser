@@ -1,5 +1,5 @@
 use thiserror::Error;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 
 #[derive(Error, Debug)]
 pub enum UrlError {
@@ -43,6 +43,16 @@ pub fn validate_url(url: &str, blocked_ranges: &[String]) -> Result<(), UrlError
     if let Ok(ip) = host.parse::<IpAddr>() {
         if is_ip_in_blocked_ranges(&ip, blocked_ranges) {
             return Err(UrlError::BlockedHost(host));
+        }
+    } else {
+        // Host is a hostname - resolve it and check all IPs
+        let socket_addrs = format!("{}:80", host).to_socket_addrs()
+            .map_err(|_| UrlError::InvalidUrl)?;
+        
+        for addr in socket_addrs {
+            if is_ip_in_blocked_ranges(&addr.ip(), blocked_ranges) {
+                return Err(UrlError::BlockedHost(format!("{} (resolves to {})", host, addr.ip())));
+            }
         }
     }
 

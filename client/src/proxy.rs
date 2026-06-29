@@ -319,6 +319,27 @@ async fn api_connect_handler(
     Extension(ctx): Extension<Arc<AppContext>>,
     Json(req): Json<ConnectRequest>,
 ) -> Json<ConnectResponse> {
+    // Validate target callsign format
+    let callsign = req.target_callsign.split('-').next().unwrap_or(&req.target_callsign);
+    let re = match regex::Regex::new(r"^[a-zA-Z0-9]{1,3}[0-9][a-zA-Z0-9]{0,3}[a-zA-Z]$") {
+        Ok(r) => r,
+        Err(_) => {
+            return Json(ConnectResponse {
+                ok: false,
+                state: None,
+                error: Some("Internal validation error".to_string()),
+            });
+        }
+    };
+    
+    if !re.is_match(callsign) {
+        return Json(ConnectResponse {
+            ok: false,
+            state: None,
+            error: Some("Invalid target callsign format".to_string()),
+        });
+    }
+
     match ctx
         .agwpe
         .ax25_connect(req.target_callsign, req.port_num)

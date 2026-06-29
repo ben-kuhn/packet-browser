@@ -1454,6 +1454,7 @@ dependencies = [
  "dirs",
  "lol_html",
  "packet-browser-shared",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

@@ -506,6 +506,13 @@ pub fn error_page(message: &str) -> String {
 }
 
 pub fn browse_page(html_content: &str, url: &str) -> String {
+    let escaped_url = url
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;");
+    
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -549,7 +556,7 @@ pub fn browse_page(html_content: &str, url: &str) -> String {
 </body>
 </html>"#,
         css = CSS,
-        url = url,
+        url = escaped_url,
         content = html_content,
     )
 }

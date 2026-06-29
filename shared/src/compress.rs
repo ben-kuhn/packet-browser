@@ -1,12 +1,16 @@
 use std::io::{Read, Write};
 use thiserror::Error;
 
+const MAX_DECOMPRESSED_SIZE: usize = 10 * 1024 * 1024;
+
 #[derive(Error, Debug)]
 pub enum CompressionError {
     #[error("Compression failed: {0}")]
     CompressFailed(String),
     #[error("Decompression failed: {0}")]
     DecompressFailed(String),
+    #[error("Decompressed data too large")]
+    TooLarge,
 }
 
 pub fn brotli_compress(data: &[u8], quality: u32) -> Result<Vec<u8>, CompressionError> {
@@ -30,9 +34,13 @@ pub fn brotli_decompress(data: &[u8]) -> Result<Vec<u8>, CompressionError> {
     let mut output = Vec::new();
     let mut decompressor = brotli::Decompressor::new(data, 4096);
 
-    decompressor
+    let bytes_read = decompressor
         .read_to_end(&mut output)
         .map_err(|e| CompressionError::DecompressFailed(e.to_string()))?;
+
+    if bytes_read > MAX_DECOMPRESSED_SIZE {
+        return Err(CompressionError::TooLarge);
+    }
 
     Ok(output)
 }

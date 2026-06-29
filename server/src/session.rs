@@ -1,6 +1,11 @@
 use regex::Regex;
 use thiserror::Error;
+use std::sync::LazyLock;
 use std::time::Instant;
+
+static CALLSIGN_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^[a-zA-Z0-9]{1,3}[0-9][a-zA-Z0-9]{0,3}[a-zA-Z]$").unwrap()
+});
 
 #[derive(Error, Debug)]
 pub enum SessionError {
@@ -42,9 +47,7 @@ impl Session {
 pub fn validate_callsign(callsign: &str) -> Result<String, SessionError> {
     let call = callsign.split('-').next().unwrap_or(callsign);
 
-    let re = Regex::new(r"^[a-zA-Z0-9]{1,3}[0-9][a-zA-Z0-9]{0,3}[a-zA-Z]$").unwrap();
-
-    if re.is_match(call) {
+    if CALLSIGN_REGEX.is_match(call) {
         Ok(call.to_uppercase())
     } else {
         Err(SessionError::InvalidCallsign)

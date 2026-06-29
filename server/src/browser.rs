@@ -50,8 +50,20 @@ impl BrowserInstance {
             .collect();
         let session_dir = format!("/tmp/chrome-{}", safe_id);
 
-        if let Err(e) = std::fs::create_dir_all(&session_dir) {
-            eprintln!("[BROWSER] Warning: could not pre-create session dir: {}", e);
+        // Create session directory with secure permissions (0o700)
+        if !std::path::Path::new(&session_dir).exists() {
+            if let Err(e) = std::fs::create_dir(&session_dir) {
+                if e.kind() != std::io::ErrorKind::AlreadyExists {
+                    eprintln!("[BROWSER] Warning: could not create session dir: {}", e);
+                }
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(e) = std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o700)) {
+                    eprintln!("[BROWSER] Warning: could not set session dir permissions: {}", e);
+                }
+            }
         }
 
         let chromium_path = std::env::var("CHROMIUM_PATH")

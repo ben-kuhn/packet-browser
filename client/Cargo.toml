@@ -21,6 +21,7 @@ dirs = "5"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 async-stream = "0.3"
+regex = "1"
 packet-browser-shared = { path = "../shared" }
 
 [dev-dependencies]

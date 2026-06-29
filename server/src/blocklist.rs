@@ -81,5 +81,8 @@ fn write_hosts_file(domains: &[String]) -> io::Result<()> {
     content.push_str(BLOCKLIST_END);
     content.push('\n');
 
-    fs::write(HOSTS_PATH, content)
+    // Atomic write: write to temp file, then rename
+    let temp_path = format!("{}.tmp", HOSTS_PATH);
+    fs::write(&temp_path, content)?;
+    fs::rename(&temp_path, HOSTS_PATH)
 }

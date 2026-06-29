@@ -10,10 +10,15 @@ use packet_browser_shared::compress::brotli_compress;
 use packet_browser_shared::protocol::{Request, Response, Status};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
 const VERSION: &str = "0.2.0";
+const MAX_CONNECTIONS: usize = 50;
+const MAX_LINE_LENGTH: usize = 1024;
+const MAX_BODY_SIZE: usize = 1024 * 1024;
+const REQUEST_TIMEOUT_SECS: u64 = 300;
 
 fn main() {
     if std::env::args().any(|a| a == "--healthcheck") {
@@ -28,6 +33,7 @@ fn main() {
     }
 
     let config = Arc::new(Config::from_env());
+    let connection_count = Arc::new(AtomicUsize::new(0));
 
     println!("Starting packet-browser-server v{}", VERSION);
     println!("Listening on port {}", config.listen_port);
@@ -42,13 +48,29 @@ fn main() {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
+                if connection_count.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
+                    eprintln!("[LIMIT] Max connections reached, rejecting");
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    continue;
+                }
+
                 let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string());
                 eprintln!("[CONNECT] New connection from {}", peer);
+
+                if let Err(e) = stream.set_read_timeout(Some(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))) {
+                    eprintln!("[ERROR] Failed to set read timeout: {}", e);
+                    continue;
+                }
+
                 let config = Arc::clone(&config);
+                let count = Arc::clone(&connection_count);
+                count.fetch_add(1, Ordering::SeqCst);
+
                 thread::spawn(move || {
                     if let Err(e) = handle_connection(stream, config) {
                         eprintln!("[ERROR] Connection error from {}: {}", peer, e);
                     }
+                    count.fetch_sub(1, Ordering::SeqCst);
                 });
             }
             Err(e) => {
@@ -63,7 +85,14 @@ fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::io::Res
 
     let callsign = {
         let mut input = String::new();
-        reader.read_line(&mut input)?;
+        let bytes_read = reader.read_line(&mut input)?;
+        if bytes_read == 0 {
+            return Ok(());
+        }
+        if bytes_read > MAX_LINE_LENGTH {
+            eprintln!("[AUTH] Callsign too long");
+            return Ok(());
+        }
         input.trim().to_string()
     };
 
@@ -71,7 +100,7 @@ fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::io::Res
         Ok(call) => call,
         Err(_) => {
             eprintln!("[AUTH] Invalid callsign: {:?}", callsign);
-            send_error_response(&mut stream, "Invalid callsign format.", &config)?;
+            send_error_response(&mut stream, "Invalid callsign format.")?;
             return Ok(());
         }
     };
@@ -83,7 +112,10 @@ fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::io::Res
     stream.flush()?;
 
     let mut input = String::new();
-    reader.read_line(&mut input)?;
+    let bytes_read = reader.read_line(&mut input)?;
+    if bytes_read == 0 || bytes_read > MAX_LINE_LENGTH {
+        return Ok(());
+    }
 
     if input.trim().to_uppercase() != "AGREE" {
         writeln!(stream, "Acknowledgment required. Goodbye.")?;
@@ -109,7 +141,7 @@ fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::io::Res
         Ok(b) => { eprintln!("[BROWSER] Ready for {}", callsign); Some(b) }
         Err(e) => {
             eprintln!("[BROWSER] Failed to initialize: {}", e);
-            send_error_response(&mut stream, &format!("Failed to initialize browser: {}", e), &config)?;
+            send_error_response(&mut stream, "Browser initialization failed")?;
             return Ok(());
         }
     };
@@ -165,6 +197,9 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option<Req
     if bytes_read == 0 {
         return Ok(None);
     }
+    if bytes_read > MAX_LINE_LENGTH {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "URL too long"));
+    }
 
     let trimmed = header_line.trim();
 
@@ -183,6 +218,13 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option<Req
         let mut len_buf = [0u8; 4];
         reader.read_exact(&mut len_buf)?;
         let body_len = u32::from_be_bytes(len_buf) as usize;
+
+        if body_len > MAX_BODY_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Body too large: {} bytes (max {})", body_len, MAX_BODY_SIZE),
+            ));
+        }
 
         let mut body = vec![0u8; body_len];
         reader.read_exact(&mut body)?;
@@ -212,7 +254,7 @@ fn handle_request(
             Some(e.to_string()),
         );
         let _ = logger.log(&log_entry);
-        send_error_response(stream, &format!("URL blocked: {}", e), config)?;
+        send_error_response(stream, "URL blocked")?;
         return Ok(());
     }
 
@@ -225,7 +267,7 @@ fn handle_request(
                 eprintln!("[BROWSER] No browser instance, creating for {}", callsign);
                 *browser = BrowserInstance::new(callsign).ok();
                 if browser.is_none() {
-                    send_error_response(stream, "Failed to start browser", config)?;
+                    send_error_response(stream, "Browser unavailable")?;
                     return Ok(());
                 }
                 continue;
@@ -240,7 +282,7 @@ fn handle_request(
                     eprintln!("[BROWSER] Chrome crashed, restarting for {}", callsign);
                     *browser = BrowserInstance::new(callsign).ok();
                     if browser.is_none() {
-                        send_error_response(stream, "Failed to restart browser", config)?;
+                        send_error_response(stream, "Browser unavailable")?;
                         return Ok(());
                     }
                     continue;
@@ -253,7 +295,7 @@ fn handle_request(
                     Some(e.to_string()),
                 );
                 let _ = logger.log(&log_entry);
-                send_error_response(stream, &format!("Failed to load page: {}", e), config)?;
+                send_error_response(stream, "Failed to load page")?;
                 return Ok(());
             }
         }
@@ -273,7 +315,7 @@ fn handle_request(
         Ok(data) => data,
         Err(e) => {
             eprintln!("[COMPRESS] Error compressing for {}: {}", callsign, e);
-            send_error_response(stream, &format!("Compression error: {}", e), config)?;
+            send_error_response(stream, "Compression error")?;
             return Ok(());
         }
     };
@@ -291,8 +333,8 @@ fn handle_request(
     Ok(())
 }
 
-fn send_error_response(stream: &mut TcpStream, message: &str, config: &Config) -> std::io::Result<()> {
-    let compressed = brotli_compress(message.as_bytes(), config.brotli_quality)
+fn send_error_response(stream: &mut TcpStream, message: &str) -> std::io::Result<()> {
+    let compressed = brotli_compress(message.as_bytes(), 11)
         .unwrap_or_else(|_| message.as_bytes().to_vec());
 
     let response = Response {
