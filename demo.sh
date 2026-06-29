@@ -52,6 +52,8 @@ check_dependencies() {
 }
 
 find_free_port() {
+    # Use ports in 10000-20000 range to avoid Direwolf port validation issues
+    python3 -c 'import socket, random; port = random.randint(10000, 20000); s=socket.socket(); s.bind(("", port)); print(port); s.close()' 2>/dev/null || \
     python3 -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()'
 }
 
@@ -154,7 +156,14 @@ EOF
         waited=$((waited + 1))
         if [[ $waited -ge 20 ]]; then
             error "Direwolf $name AGWPE port $agwpe_port not ready after 10s"
-            cat "$log_file"
+            error "Process PID $pid status:"
+            if kill -0 "$pid" 2>/dev/null; then
+                error "  Process is still running"
+            else
+                error "  Process has exited"
+            fi
+            error "Log output:"
+            cat "$log_file" >&2
             exit 1
         fi
     done
@@ -372,10 +381,22 @@ main() {
     echo "=========================================="
     echo ""
 
-    # Clean up any existing Direwolf processes to avoid port conflicts
+    # Aggressive cleanup of any existing Direwolf processes
     log "Cleaning up existing Direwolf processes..."
     pkill -9 direwolf 2>/dev/null || true
-    sleep 1
+    pkill -9 linbpq 2>/dev/null || true
+    pkill -9 packet-browser-server 2>/dev/null || true
+    pkill -9 packet-browser-client 2>/dev/null || true
+    
+    # Wait for processes to die and ports to be released
+    sleep 3
+    
+    # Double-check cleanup
+    if pgrep -f direwolf >/dev/null 2>&1; then
+        warn "Some Direwolf processes still running, force killing..."
+        pkill -KILL direwolf 2>/dev/null || true
+        sleep 2
+    fi
 
     check_dependencies
 
@@ -392,6 +413,10 @@ main() {
     echo ""
 
     PID_A=$(start_direwolf "a" "W1TEST-1" "$AGWPE_PORT_A")
+    
+    # Small delay to avoid race conditions
+    sleep 1
+    
     PID_B=$(start_direwolf "b" "N0CALL-2" "$AGWPE_PORT_B")
 
     crosslink_audio "$PID_A" "$PID_B"
