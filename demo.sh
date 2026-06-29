@@ -8,79 +8,46 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEMO_DIR=$(mktemp -d)
 trap 'cleanup' EXIT
 
-# Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-log() {
-    echo -e "${BLUE}[DEMO]${NC} $1"
-}
-
-success() {
-    echo -e "${GREEN}[✓]${NC} $1"
-}
-
-warn() {
-    echo -e "${YELLOW}[!]${NC} $1"
-}
-
-error() {
-    echo -e "${RED}[✗]${NC} $1"
-}
+log()     { echo -e "${BLUE}[DEMO]${NC} $1" >&2; }
+success() { echo -e "${GREEN}[✓]${NC} $1" >&2; }
+warn()    { echo -e "${YELLOW}[!]${NC} $1" >&2; }
+error()   { echo -e "${RED}[✗]${NC} $1" >&2; }
 
 cleanup() {
     log "Cleaning up..."
-    
-    # Kill all demo processes
     if [[ -f "$DEMO_DIR/pids" ]]; then
         while read -r pid; do
-            if kill -0 "$pid" 2>/dev/null; then
-                kill "$pid" 2>/dev/null || true
-                wait "$pid" 2>/dev/null || true
-            fi
+            kill "$pid" 2>/dev/null || true
         done < "$DEMO_DIR/pids"
     fi
-    
-    # Remove demo directory
     rm -rf "$DEMO_DIR"
-    
     success "Cleanup complete"
 }
 
-save_pid() {
-    echo "$1" >> "$DEMO_DIR/pids"
-}
+save_pid() { echo "$1" >> "$DEMO_DIR/pids"; }
 
 check_dependencies() {
     log "Checking dependencies..."
-    
     local missing=()
-    
-    # Check for required commands
     for cmd in direwolf linbpq pw-link pw-dump python3; do
-        if ! command -v "$cmd" &> /dev/null; then
-            missing+=("$cmd")
-        fi
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
-    
-    # Check for packet-browser binaries
     if [[ ! -f "$SCRIPT_DIR/target/debug/packet-browser-server" ]]; then
-        missing+=("packet-browser-server")
+        missing+=("packet-browser-server (run: cargo build)")
     fi
-    
     if [[ ! -f "$SCRIPT_DIR/target/debug/packet-browser-client" ]]; then
-        missing+=("packet-browser-client")
+        missing+=("packet-browser-client (run: cargo build)")
     fi
-    
     if [[ ${#missing[@]} -gt 0 ]]; then
         error "Missing dependencies: ${missing[*]}"
-        error "Please ensure all dependencies are installed"
         exit 1
     fi
-    
     success "All dependencies found"
 }
 
@@ -88,46 +55,69 @@ find_free_port() {
     python3 -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()'
 }
 
-get_pw_ports() {
-    local pid=$1
-    local script_file="$DEMO_DIR/get_ports.py"
-    
-    cat > "$script_file" << 'PYTHON'
-import json
-import subprocess
-import sys
+# Find PipeWire port IDs for a specific process PID.
+# Uses the same approach as tncd e2e helpers:
+#   1. Find Client objects by application.process.id == PID
+#   2. Find Node objects by client.id in those client IDs
+#   3. Find Port objects by node.id in those node IDs
+#   4. Classify ports as playback (output) or capture (input) by port.name
+# Returns numeric port IDs for use with pw-link
+get_pw_ports_for_pid() {
+    local target_pid=$1
+    python3 - "$target_pid" << 'PYTHON'
+import json, subprocess, sys
 
-try:
-    result = subprocess.run(['pw-dump'], capture_output=True, text=True, timeout=5)
-    data = json.loads(result.stdout)
-    
-    # Direwolf creates nodes with names like "alsa_capture.direwolf" and "alsa_playback.direwolf"
-    # We need to find ports belonging to these nodes
-    ports = []
-    for obj in data:
-        if obj.get('type') != 'PipeWire:Interface:Port':
-            continue
-        props = obj.get('info', {}).get('props', {})
-        node_id = props.get('node.id')
-        
-        # Find the parent node
-        for node_obj in data:
-            if node_obj.get('type') == 'PipeWire:Interface:Node' and node_obj.get('id') == node_id:
-                node_props = node_obj.get('info', {}).get('props', {})
-                node_name = node_props.get('node.name', '')
-                # Match Direwolf nodes
-                if 'direwolf' in node_name.lower():
-                    ports.append(obj['id'])
-                break
-    
-    # Return unique ports
-    for port in sorted(set(ports)):
-        print(port)
-except Exception as e:
-    pass
+pid = int(sys.argv[1])
+result = subprocess.run(['pw-dump'], capture_output=True, text=True, timeout=5)
+data = json.loads(result.stdout)
+
+# Step 1: Find Client objects for this PID
+client_ids = set()
+for obj in data:
+    if obj.get('type') != 'PipeWire:Interface:Client':
+        continue
+    props = obj.get('info', {}).get('props', {})
+    if props.get('application.process.id') == pid:
+        client_ids.add(obj['id'])
+
+if not client_ids:
+    sys.exit(0)
+
+# Step 2: Find Node objects belonging to those clients
+node_ids = set()
+for obj in data:
+    if obj.get('type') != 'PipeWire:Interface:Node':
+        continue
+    props = obj.get('info', {}).get('props', {})
+    if props.get('client.id') in client_ids:
+        node_ids.add(obj['id'])
+
+if not node_ids:
+    sys.exit(0)
+
+# Step 3: Find Port objects belonging to those nodes
+# Classify as playback or capture based on port.name
+playback_ports = []
+capture_ports = []
+for obj in data:
+    if obj.get('type') != 'PipeWire:Interface:Port':
+        continue
+    props = obj.get('info', {}).get('props', {})
+    if props.get('node.id') not in node_ids:
+        continue
+    port_name = props.get('port.name', '')
+    port_id = obj['id']
+    if 'output' in port_name.lower() or 'FL' in port_name or 'playback' in port_name.lower():
+        playback_ports.append(port_id)
+    elif 'input' in port_name.lower() or 'MONO' in port_name or 'capture' in port_name.lower():
+        capture_ports.append(port_id)
+
+# Output: PLAYBACK:id CAPTURE:id (use first of each)
+if playback_ports:
+    print(f'PLAYBACK:{playback_ports[0]}')
+if capture_ports:
+    print(f'CAPTURE:{capture_ports[0]}')
 PYTHON
-    
-    python3 "$script_file" "$pid"
 }
 
 start_direwolf() {
@@ -136,9 +126,8 @@ start_direwolf() {
     local agwpe_port="$3"
     local config_file="$DEMO_DIR/direwolf-$name.conf"
     local log_file="$DEMO_DIR/direwolf-$name.log"
-    
+
     cat > "$config_file" <<EOF
-# Use PipeWire for audio
 ADEVICE default default
 ACHANNELS 1
 ARATE 44100
@@ -152,98 +141,87 @@ TXTAIL 5
 SLOTTIME 10
 PERSIST 63
 EOF
-    
+
     log "Starting Direwolf $name ($callsign) on AGWPE port $agwpe_port"
     direwolf -c "$config_file" -t 0 > "$log_file" 2>&1 &
     local pid=$!
     save_pid "$pid"
-    
+
     # Wait for AGWPE port to be ready
-    sleep 3
-    
-    if ! kill -0 "$pid" 2>/dev/null; then
-        error "Direwolf $name failed to start"
-        cat "$log_file"
-        exit 1
-    fi
-    
-    success "Direwolf $name started (PID: $pid)"
+    local waited=0
+    while ! python3 -c "import socket; s=socket.create_connection(('127.0.0.1', $agwpe_port), timeout=0.5); s.close()" 2>/dev/null; do
+        sleep 0.5
+        waited=$((waited + 1))
+        if [[ $waited -ge 20 ]]; then
+            error "Direwolf $name AGWPE port $agwpe_port not ready after 10s"
+            cat "$log_file"
+            exit 1
+        fi
+    done
+
+    success "Direwolf $name started (PID: $pid, AGWPE: $agwpe_port)"
     echo "$pid"
 }
 
 crosslink_audio() {
     local pid_a="$1"
     local pid_b="$2"
-    
+
     log "Cross-linking audio between Direwolf instances"
-    
-    # Wait for PipeWire to register the ports
-    log "Waiting for PipeWire ports to register..."
-    sleep 5
-    
-    # Get PipeWire port IDs with retry
-    local max_attempts=10
+
+    local max_attempts=15
     local attempt=0
-    local ports_a=""
-    local ports_b=""
-    
+    local result_a=""
+    local result_b=""
+
     while [[ $attempt -lt $max_attempts ]]; do
-        ports_a=$(get_pw_ports "$pid_a")
-        ports_b=$(get_pw_ports "$pid_b")
-        
-        # We expect at least 2 ports per instance (input and output)
-        local count_a=$(echo "$ports_a" | wc -l)
-        local count_b=$(echo "$ports_b" | wc -l)
-        
-        if [[ $count_a -ge 2 && $count_b -ge 2 ]]; then
+        result_a=$(get_pw_ports_for_pid "$pid_a")
+        result_b=$(get_pw_ports_for_pid "$pid_b")
+
+        local has_playback_a=$(echo "$result_a" | grep -c '^PLAYBACK:' || true)
+        local has_capture_a=$(echo "$result_a" | grep -c '^CAPTURE:' || true)
+        local has_playback_b=$(echo "$result_b" | grep -c '^PLAYBACK:' || true)
+        local has_capture_b=$(echo "$result_b" | grep -c '^CAPTURE:' || true)
+
+        if [[ $has_playback_a -gt 0 && $has_capture_a -gt 0 && \
+              $has_playback_b -gt 0 && $has_capture_b -gt 0 ]]; then
             break
         fi
-        
+
         attempt=$((attempt + 1))
-        log "Attempt $attempt/$max_attempts: Found $count_a ports for A, $count_b ports for B"
+        log "Attempt $attempt/$max_attempts: waiting for PipeWire ports (A: $has_playback_a/$has_capture_a, B: $has_playback_b/$has_capture_b)"
         sleep 2
     done
-    
-    if [[ -z "$ports_a" || -z "$ports_b" ]]; then
-        warn "Failed to find PipeWire ports after $max_attempts attempts"
-        warn "Audio cross-linking skipped - demo may not work correctly"
-        warn "Check that PipeWire is running: systemctl --user status pipewire"
-        return 0
+
+    if [[ -z "$result_a" || -z "$result_b" ]]; then
+        error "Failed to find PipeWire ports for Direwolf instances"
+        error "Is PipeWire running? Check: systemctl --user status pipewire"
+        exit 1
     fi
-    
-    log "Found ports for A: $(echo $ports_a | tr '\n' ' ')"
-    log "Found ports for B: $(echo $ports_b | tr '\n' ' ')"
-    
-    # For each Direwolf instance, we have capture and playback ports
-    # We need to link:
-    #   A's playback -> B's capture
-    #   B's playback -> A's capture
-    
-    # Simple approach: use first two ports from each
-    local ports_a_array=($ports_a)
-    local ports_b_array=($ports_b)
-    
-    if [[ ${#ports_a_array[@]} -lt 2 || ${#ports_b_array[@]} -lt 2 ]]; then
-        warn "Not enough ports found for cross-linking"
-        return 0
-    fi
-    
-    # Link A's first port to B's second port, and vice versa
-    # (This is a heuristic - in production you'd parse port names to be sure)
-    pw-link "${ports_a_array[0]}" "${ports_b_array[1]}" 2>/dev/null || warn "Failed to link A[0]->B[1]"
-    pw-link "${ports_b_array[0]}" "${ports_a_array[1]}" 2>/dev/null || warn "Failed to link B[0]->A[1]"
-    
-    success "Audio cross-linked"
+
+    # Parse port IDs (format: TYPE:id)
+    local pb_a_id=$(echo "$result_a" | grep '^PLAYBACK:' | cut -d: -f2)
+    local cap_a_id=$(echo "$result_a" | grep '^CAPTURE:' | cut -d: -f2)
+    local pb_b_id=$(echo "$result_b" | grep '^PLAYBACK:' | cut -d: -f2)
+    local cap_b_id=$(echo "$result_b" | grep '^CAPTURE:' | cut -d: -f2)
+
+    log "A: playback=$pb_a_id capture=$cap_a_id"
+    log "B: playback=$pb_b_id capture=$cap_b_id"
+
+    # Cross-link: A's output -> B's input, B's output -> A's input
+    pw-link "$pb_a_id" "$cap_b_id" 2>/dev/null || { error "Failed to link A->B"; exit 1; }
+    pw-link "$pb_b_id" "$cap_a_id" 2>/dev/null || { error "Failed to link B->A"; exit 1; }
+
+    success "Audio cross-linked: A($pb_a_id)->B($cap_b_id), B($pb_b_id)->A($cap_a_id)"
 }
 
 start_linbpq() {
     local work_dir="$DEMO_DIR/linbpq"
     local config_file="$work_dir/bpq32.cfg"
     local agwpe_port="$1"
-    local server_port="$2"
-    
+
     mkdir -p "$work_dir"
-    
+
     cat > "$config_file" <<EOF
 SIMPLE
 NODECALL=N0CALL-7
@@ -271,75 +249,62 @@ PORT
   ADDR 127.0.0.1 $agwpe_port
 ENDPORT
 
-PORT
- PORTNUM=2
- ID=Telnet Server
- DRIVER=TELNET
- CONFIG
-  LOGGING=1
-  LOCALNET=127.0.0.1/32
-  HTTPPORT=0
-  TCPPORT=0
-  FBBPORT=0
-  CMDPORT=0
-  MAXSESSIONS=2
-  CloseOnDisconnect=1
-ENDPORT
-
-APPLICATION 1,WEB,C 2 HOST 0 S
+APPLICATION 1,WEB,C 1 HOST 0 S
 EOF
-    
-    log "Starting LinBPQ"
-    cd "$work_dir"
-    linbpq > "$DEMO_DIR/linbpq.log" 2>&1 &
+
+    log "Starting LinBPQ in $work_dir"
+    (cd "$work_dir" && linbpq > "$DEMO_DIR/linbpq.log" 2>&1) &
     local pid=$!
     save_pid "$pid"
-    cd "$SCRIPT_DIR"
-    
+
     sleep 3
-    
+
     if ! kill -0 "$pid" 2>/dev/null; then
         error "LinBPQ failed to start"
         cat "$DEMO_DIR/linbpq.log"
         exit 1
     fi
-    
+
     success "LinBPQ started (PID: $pid)"
 }
 
 start_server() {
     local port="$1"
     local portal_url="$2"
-    
+
     log "Starting packet-browser server on port $port"
-    
+
     export LISTEN_PORT="$port"
     export PORTAL_URL="$portal_url"
     export IDLE_TIMEOUT_MINUTES=10
     export BROTLI_QUALITY=11
     export BLOCKLIST_ENABLED=false
     export CHROMIUM_PATH=$(which chromium 2>/dev/null || echo "/usr/bin/chromium")
-    
+
     "$SCRIPT_DIR/target/debug/packet-browser-server" > "$DEMO_DIR/server.log" 2>&1 &
     local pid=$!
     save_pid "$pid"
-    
-    sleep 2
-    
-    if ! kill -0 "$pid" 2>/dev/null; then
-        error "Server failed to start"
-        cat "$DEMO_DIR/server.log"
-        exit 1
-    fi
-    
-    success "Server started (PID: $pid)"
+
+    # Wait for server to be ready
+    local waited=0
+    while ! python3 -c "import socket; s=socket.create_connection(('127.0.0.1', $port), timeout=0.5); s.close()" 2>/dev/null; do
+        sleep 0.5
+        waited=$((waited + 1))
+        if [[ $waited -ge 20 ]]; then
+            error "Server not ready after 10s"
+            cat "$DEMO_DIR/server.log"
+            exit 1
+        fi
+    done
+
+    success "Server started (PID: $pid, port: $port)"
 }
 
 start_client() {
     local agwpe_port="$1"
     local web_port="$2"
     local config_file="$DEMO_DIR/client.ini"
-    
+
     cat > "$config_file" <<EOF
 [server]
 agwpe_host = 127.0.0.1
@@ -350,25 +315,29 @@ my_callsign = W1TEST
 target_callsign = N0CALL-7
 bpq_command = WEB
 EOF
-    
+
     log "Starting packet-browser client on port $web_port"
-    
+
     "$SCRIPT_DIR/target/debug/packet-browser-client" \
         --config "$config_file" \
         --listen-addr "127.0.0.1:$web_port" \
         > "$DEMO_DIR/client.log" 2>&1 &
     local pid=$!
     save_pid "$pid"
-    
-    sleep 2
-    
-    if ! kill -0 "$pid" 2>/dev/null; then
-        error "Client failed to start"
-        cat "$DEMO_DIR/client.log"
-        exit 1
-    fi
-    
-    success "Client started (PID: $pid)"
+
+    # Wait for client web UI to be ready
+    local waited=0
+    while ! python3 -c "import socket; s=socket.create_connection(('127.0.0.1', $web_port), timeout=0.5); s.close()" 2>/dev/null; do
+        sleep 0.5
+        waited=$((waited + 1))
+        if [[ $waited -ge 20 ]]; then
+            error "Client not ready after 10s"
+            cat "$DEMO_DIR/client.log"
+            exit 1
+        fi
+    done
+
+    success "Client started (PID: $pid, web UI: http://127.0.0.1:$web_port)"
 }
 
 show_status() {
@@ -378,24 +347,19 @@ show_status() {
     echo "=========================================="
     echo ""
     echo "Components:"
-    echo "  • Direwolf-A (W1TEST-1) - Client side"
-    echo "  • Direwolf-B (N0CALL-2) - Server side"
-    echo "  • LinBPQ (N0CALL-7) - BPQ node"
-    echo "  • packet-browser-server - Web fetcher"
-    echo "  • packet-browser-client - Web proxy"
+    echo "  Direwolf-A (W1TEST-1)  - Client-side TNC"
+    echo "  Direwolf-B (N0CALL-2)  - Server-side TNC"
+    echo "  LinBPQ (N0CALL-7)      - BPQ node"
+    echo "  packet-browser-server  - Web fetcher (TCP $SERVER_PORT)"
+    echo "  packet-browser-client  - Web proxy (HTTP $WEB_PORT)"
     echo ""
-    echo "Access URLs:"
-    echo "  • Client web UI: http://127.0.0.1:$WEB_PORT"
-    echo "  • Server status: http://127.0.0.1:$SERVER_PORT"
+    echo "  Open in browser: http://127.0.0.1:$WEB_PORT"
     echo ""
-    echo "Log files in: $DEMO_DIR"
-    echo "  • direwolf-a.log"
-    echo "  • direwolf-b.log"
-    echo "  • linbpq.log"
-    echo "  • server.log"
-    echo "  • client.log"
+    echo "Log files: $DEMO_DIR/"
+    echo "  direwolf-a.log  direwolf-b.log"
+    echo "  linbpq.log  server.log  client.log"
     echo ""
-    echo "Press Ctrl+C to stop demo mode"
+    echo "Press Ctrl+C to stop"
     echo "=========================================="
     echo ""
 }
@@ -407,39 +371,37 @@ main() {
     echo "  Off-Air Testing Environment"
     echo "=========================================="
     echo ""
-    
-    # Clean up any existing Direwolf processes
+
+    # Clean up any existing Direwolf processes to avoid port conflicts
     log "Cleaning up existing Direwolf processes..."
     pkill -9 direwolf 2>/dev/null || true
     sleep 1
-    
+
     check_dependencies
-    
-    # Find free ports
+
     AGWPE_PORT_A=$(find_free_port)
     AGWPE_PORT_B=$(find_free_port)
     SERVER_PORT=$(find_free_port)
     WEB_PORT=$(find_free_port)
-    
+
     log "Using ports:"
     log "  Direwolf-A AGWPE: $AGWPE_PORT_A"
     log "  Direwolf-B AGWPE: $AGWPE_PORT_B"
-    log "  Server: $SERVER_PORT"
+    log "  Server TCP: $SERVER_PORT"
     log "  Client web UI: $WEB_PORT"
     echo ""
-    
-    # Start components
+
     PID_A=$(start_direwolf "a" "W1TEST-1" "$AGWPE_PORT_A")
     PID_B=$(start_direwolf "b" "N0CALL-2" "$AGWPE_PORT_B")
-    
+
     crosslink_audio "$PID_A" "$PID_B"
-    
-    start_linbpq "$AGWPE_PORT_B" "$SERVER_PORT"
+
     start_server "$SERVER_PORT" "https://www.zeroretries.radio"
+    start_linbpq "$AGWPE_PORT_B"
     start_client "$AGWPE_PORT_A" "$WEB_PORT"
-    
+
     show_status
-    
+
     # Wait for Ctrl+C
     while true; do
         sleep 1
