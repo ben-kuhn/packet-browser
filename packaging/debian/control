@@ -10,7 +10,7 @@ Build-Depends: debhelper (>= 12),
                libssl-dev,
                pkg-config
 Standards-Version: 4.5.0
-Homepage: https://github.com/yourusername/docker-packet-browser
+Homepage: https://github.com/yourusername/packet-browser
 
 Package: packet-browser-client
 Architecture: any

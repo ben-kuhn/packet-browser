@@ -5,7 +5,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::sync::broadcast;
 
 use crate::state::{
-    ConnectionState, DebugLogEntry, Direction, LogLevel, PortInfo, SharedState,
+    ConnectionState, DebugLogEntry, Direction, LockExt, LogLevel, PortInfo, SharedState,
 };
 
 #[derive(Error, Debug)]
@@ -25,6 +25,11 @@ pub enum AgwpeError {
     #[error("Background task stopped")]
     TaskStopped,
 }
+
+// Defensive caps against a hostile or buggy AGWPE peer sending oversized lengths.
+const MAX_FRAME_DATA_SIZE: usize = 64 * 1024;
+const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
+const MAX_HANDSHAKE_TEXT: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameType {
@@ -149,6 +154,13 @@ impl AgwpeFrame {
         let data_len = u32::from_le_bytes([data[28], data[29], data[30], data[31]]);
         // offset 32-35: user_data (4 bytes, little-endian)
         let user_data = u32::from_le_bytes([data[32], data[33], data[34], data[35]]);
+
+        if data_len as usize > MAX_FRAME_DATA_SIZE {
+            return Err(AgwpeError::InvalidFrame(format!(
+                "Frame data_len {} exceeds maximum {}",
+                data_len, MAX_FRAME_DATA_SIZE
+            )));
+        }
 
         if data.len() < Self::HEADER_SIZE + data_len as usize {
             return Err(AgwpeError::InvalidFrame("Frame data truncated".to_string()));
@@ -315,7 +327,7 @@ impl BackgroundState {
 
     fn push_log(state: &SharedState, log_tx: &broadcast::Sender<DebugLogEntry>, entry: DebugLogEntry) {
         {
-            let mut s = state.lock().unwrap();
+            let mut s = state.lock_or_poisoned();
             s.add_log(entry.clone());
         }
         let _ = log_tx.send(entry);
@@ -323,7 +335,7 @@ impl BackgroundState {
 
     fn set_state(state: &SharedState, _log_tx: &broadcast::Sender<DebugLogEntry>, cs: ConnectionState) {
         {
-            let mut s = state.lock().unwrap();
+            let mut s = state.lock_or_poisoned();
             s.set_connection_state(cs);
         }
     }
@@ -343,15 +355,21 @@ impl BackgroundState {
                     self.read_buf[30],
                     self.read_buf[31],
                 ]) as usize;
+                if data_len > MAX_FRAME_DATA_SIZE {
+                    return Err(AgwpeError::InvalidFrame(format!(
+                        "Peer announced frame data_len {} exceeds maximum {}",
+                        data_len, MAX_FRAME_DATA_SIZE
+                    )));
+                }
                 let total = AgwpeFrame::HEADER_SIZE + data_len;
                 if self.read_buf.len() >= total {
                     // Debug: print raw bytes
-                    eprintln!("[AGWPE] Raw frame bytes (first 36): {:?}", &self.read_buf[..36.min(self.read_buf.len())]);
-                    eprintln!("[AGWPE] Frame type byte at offset 4: 0x{:02X} ('{}')", 
+                    tracing::trace!("[AGWPE] Raw frame bytes (first 36): {:?}", &self.read_buf[..36.min(self.read_buf.len())]);
+                    tracing::trace!("[AGWPE] Frame type byte at offset 4: 0x{:02X} ('{}')", 
                         self.read_buf[4], 
                         if self.read_buf[4] >= 32 && self.read_buf[4] < 127 { self.read_buf[4] as char } else { '?' });
                     if data_len > 0 {
-                        eprintln!("[AGWPE] Frame data ({} bytes): {:?}", data_len, &self.read_buf[36..36+data_len.min(self.read_buf.len()-36)]);
+                        tracing::trace!("[AGWPE] Frame data ({} bytes): {:?}", data_len, &self.read_buf[36..36+data_len.min(self.read_buf.len()-36)]);
                     }
                     let frame = AgwpeFrame::decode(&self.read_buf[..total])?;
                     self.read_buf.drain(..total);
@@ -365,7 +383,7 @@ impl BackgroundState {
             if n == 0 {
                 return Err(AgwpeError::ConnectionFailed("Connection closed".to_string()));
             }
-            eprintln!("[AGWPE] Read {} bytes from stream", n);
+            tracing::trace!("[AGWPE] Read {} bytes from stream", n);
             self.read_buf.extend_from_slice(&tmp[..n]);
         }
     }
@@ -542,7 +560,7 @@ async fn handle_disconnect_agwpe(
     bg.read_buf.clear();
 
     {
-        let mut s = state.lock().unwrap();
+        let mut s = state.lock_or_poisoned();
         s.clear_ports();
         s.set_connection_state(ConnectionState::Disconnected);
     }
@@ -644,7 +662,7 @@ async fn handle_query_ports(
     );
 
     {
-        let mut s = state.lock().unwrap();
+        let mut s = state.lock_or_poisoned();
         s.set_ports(ports);
     }
 
@@ -657,7 +675,7 @@ async fn perform_bpq_handshake(
     log_tx: &broadcast::Sender<DebugLogEntry>,
 ) -> Result<(), AgwpeError> {
     let (bpq_command, skip_bpq_app) = {
-        let s = state.lock().unwrap();
+        let s = state.lock_or_poisoned();
         (s.config.bpq_command.clone(), s.config.skip_bpq_app)
     };
 
@@ -703,7 +721,7 @@ async fn perform_bpq_handshake(
         );
 
         BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &cmd_frame).await?;
-        eprintln!("[BPQ] Sent BPQ command frame");
+        tracing::trace!("[BPQ] Sent BPQ command frame");
     }
 
     // Wait for callsign prompt
@@ -716,18 +734,23 @@ async fn perform_bpq_handshake(
         DebugLogEntry::new(LogLevel::Debug, "BPQ", "Waiting for callsign prompt...")
             .with_direction(Direction::Rx),
     );
-    eprintln!("[BPQ] Waiting for callsign prompt...");
+    tracing::trace!("[BPQ] Waiting for callsign prompt...");
 
     loop {
         let frame = bg.read_frame_with_timeout(30).await?;
 
-        eprintln!("[BPQ] Received frame type {:?} (0x{:02X}), data_len={}, data={:?}", 
+        tracing::trace!("[BPQ] Received frame type {:?} (0x{:02X}), data_len={}, data={:?}", 
             frame.frame_type, frame.frame_type as u8, frame.data_len, 
             String::from_utf8_lossy(&frame.data[..frame.data_len.min(100) as usize]));
 
         match frame.frame_type {
             FrameType::DataReceived => {
                 let text = String::from_utf8_lossy(&frame.data).to_string();
+                if received_text.len() + text.len() > MAX_HANDSHAKE_TEXT {
+                    return Err(AgwpeError::ConnectionFailed(
+                        "Handshake text exceeded maximum size".to_string(),
+                    ));
+                }
                 received_text.push_str(&text);
 
                 BackgroundState::push_log(
@@ -791,7 +814,7 @@ async fn perform_bpq_handshake(
     );
 
     BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &call_frame).await?;
-    eprintln!("[BPQ] Sent callsign frame");
+    tracing::trace!("[BPQ] Sent callsign frame");
 
     // Wait for AGREE prompt
     received_text.clear();
@@ -803,18 +826,23 @@ async fn perform_bpq_handshake(
         DebugLogEntry::new(LogLevel::Debug, "BPQ", "Waiting for AGREE prompt...")
             .with_direction(Direction::Rx),
     );
-    eprintln!("[BPQ] Waiting for AGREE prompt...");
+    tracing::trace!("[BPQ] Waiting for AGREE prompt...");
 
     loop {
         let frame = bg.read_frame_with_timeout(30).await?;
 
-        eprintln!("[BPQ] Received frame type {:?} (0x{:02X}), data_len={}, data={:?}", 
+        tracing::trace!("[BPQ] Received frame type {:?} (0x{:02X}), data_len={}, data={:?}", 
             frame.frame_type, frame.frame_type as u8, frame.data_len, 
             String::from_utf8_lossy(&frame.data[..frame.data_len.min(100) as usize]));
 
         match frame.frame_type {
             FrameType::DataReceived => {
                 let text = String::from_utf8_lossy(&frame.data).to_string();
+                if received_text.len() + text.len() > MAX_HANDSHAKE_TEXT {
+                    return Err(AgwpeError::ConnectionFailed(
+                        "Handshake text exceeded maximum size".to_string(),
+                    ));
+                }
                 received_text.push_str(&text);
 
                 BackgroundState::push_log(
@@ -901,7 +929,7 @@ async fn handle_ax25_connect(
     bg.agwpe_port = port_num;
 
     {
-        let mut s = state.lock().unwrap();
+        let mut s = state.lock_or_poisoned();
         s.set_connection_state(ConnectionState::Connecting);
         s.set_agwpe_port(port_num);
     }
@@ -930,7 +958,7 @@ async fn handle_ax25_connect(
     loop {
         let frame = bg.read_frame_with_timeout(30).await?;
 
-        eprintln!("[AGWPE] AX.25 connect: received frame type {:?} (0x{:02X}), data_len={}, data={:?}", 
+        tracing::trace!("[AGWPE] AX.25 connect: received frame type {:?} (0x{:02X}), data_len={}, data={:?}", 
             frame.frame_type, frame.frame_type as u8, frame.data_len, 
             String::from_utf8_lossy(&frame.data[..frame.data_len.min(50) as usize]));
 
@@ -948,7 +976,7 @@ async fn handle_ax25_connect(
                 );
 
                 {
-                    let mut s = state.lock().unwrap();
+                    let mut s = state.lock_or_poisoned();
                     s.config.update_target(target);
                 }
 
@@ -987,7 +1015,7 @@ async fn handle_ax25_connect(
                     );
 
                     {
-                        let mut s = state.lock().unwrap();
+                        let mut s = state.lock_or_poisoned();
                         s.config.update_target(target);
                     }
 
@@ -1138,6 +1166,12 @@ async fn handle_send_request(
 
         match frame.frame_type {
             FrameType::DataReceived => {
+                if response_data.len() + frame.data.len() > MAX_RESPONSE_SIZE {
+                    return Err(AgwpeError::InvalidFrame(format!(
+                        "Response exceeded maximum size of {} bytes",
+                        MAX_RESPONSE_SIZE
+                    )));
+                }
                 response_data.extend_from_slice(&frame.data);
 
                 BackgroundState::push_log(
@@ -1158,6 +1192,12 @@ async fn handle_send_request(
                         response_data[3],
                         response_data[4],
                     ]);
+                    if payload_len as usize > MAX_RESPONSE_SIZE {
+                        return Err(AgwpeError::InvalidFrame(format!(
+                            "Announced payload_len {} exceeds maximum {}",
+                            payload_len, MAX_RESPONSE_SIZE
+                        )));
+                    }
                     expected_len = Some(payload_len);
 
                     BackgroundState::push_log(
@@ -1267,6 +1307,17 @@ mod tests {
 
         assert_eq!(decoded.call_from.len(), 9);
         assert_eq!(decoded.call_to.len(), 9);
+    }
+
+    #[test]
+    fn test_decode_rejects_oversized_data_len() {
+        // Hand-build a header that claims a data_len far above MAX_FRAME_DATA_SIZE.
+        let mut buf = vec![0u8; AgwpeFrame::HEADER_SIZE];
+        buf[4] = FrameType::DataReceived as u8;
+        let huge = (MAX_FRAME_DATA_SIZE as u32 + 1).to_le_bytes();
+        buf[28..32].copy_from_slice(&huge);
+        let result = AgwpeFrame::decode(&buf);
+        assert!(matches!(result, Err(AgwpeError::InvalidFrame(_))));
     }
 
     #[test]

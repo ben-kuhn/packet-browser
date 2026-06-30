@@ -35,3 +35,42 @@ fn test_blocked_private_ranges() {
     // Public IPs should be allowed
     assert!(validate_url("http://8.8.8.8/", &blocked).is_ok());
 }
+
+#[test]
+fn test_userinfo_does_not_smuggle_host() {
+    // The host must come from URL parsing, not from naive string splitting:
+    // `example.com@127.0.0.1` is the userinfo + host, the real host is 127.0.0.1.
+    let blocked = vec!["127.0.0.0/8".to_string()];
+    let result = validate_url("http://example.com@127.0.0.1/admin", &blocked);
+    assert!(
+        matches!(result, Err(UrlError::BlockedHost(_))),
+        "userinfo bypass not closed: {:?}",
+        result
+    );
+}
+
+#[test]
+fn test_ipv6_loopback_and_mapped_blocked() {
+    let blocked = vec!["127.0.0.0/8".to_string()];
+    assert!(validate_url("http://[::1]/", &blocked).is_err());
+    // ::ffff:127.0.0.1 is the IPv4-mapped form of 127.0.0.1 and must inherit
+    // the IPv4 block.
+    assert!(validate_url("http://[::ffff:127.0.0.1]/", &blocked).is_err());
+}
+
+#[test]
+fn test_ipv6_ula_and_link_local_blocked() {
+    assert!(validate_url("http://[fc00::1]/", &[]).is_err());
+    assert!(validate_url("http://[fd12:3456:789a::1]/", &[]).is_err());
+    assert!(validate_url("http://[fe80::1]/", &[]).is_err());
+    // Public IPv6 (Cloudflare 2606:4700::1) should remain allowed.
+    assert!(validate_url("http://[2606:4700::1]/", &[]).is_ok());
+}
+
+#[test]
+fn test_zero_address_blocked_by_default_range() {
+    // `connect(0.0.0.0)` resolves to localhost on Linux, so 0.0.0.0/8 must be
+    // covered or the blocklist's 0.0.0.0 sinkhole entries become an SSRF vector.
+    let blocked = vec!["0.0.0.0/8".to_string()];
+    assert!(validate_url("http://0.0.0.0/", &blocked).is_err());
+}

@@ -119,3 +119,110 @@ Tests must be run with `--test-threads=1` due to environment variable manipulati
 ## Conclusion
 
 All critical and high-priority security vulnerabilities have been addressed. The application is now significantly more resilient to DoS attacks, SSRF, XSS, and resource exhaustion. Medium-priority issues have been fixed where practical. The codebase is in good shape for production deployment.
+
+---
+
+## 2026-06-30 follow-up audit
+
+A second pass uncovered both regressions in the original fixes and new findings.
+Most were addressed; a small number are architectural and called out below.
+
+### Regressions / gaps found in the original fixes
+- **Brotli decompression check was a no-op** (`shared/src/compress.rs`). `read_to_end`
+  was allocating the full output before the size check ever ran. Replaced with a
+  streaming read that aborts the moment the cap is exceeded.
+- **SSRF filter DNS-rebinding fix was incomplete.** The filter still resolved
+  via `to_socket_addrs` and Chromium then resolved again independently. The
+  filter was also vulnerable to a `userinfo@host` smuggling bypass and ignored
+  IPv6 ranges entirely. The URL parser was rewritten on top of the `url`
+  crate; IPv6 loopback, mapped, ULA, link-local, and 6to4-of-private blocks
+  were added; tests were added to cover each. The full DNS-rebinding TOCTOU
+  is still open (see below).
+
+### New findings, fixed
+- AGWPE frame parser accepted unbounded `data_len`, allowing a peer to claim
+  4 GiB per frame. Capped at 64 KiB; response and handshake-text accumulation
+  also capped.
+- Client served `/api/*` POSTs with no CSRF protection. Any visited page
+  could rewrite the saved config. Added an Origin/Referer guard middleware.
+- `ui.rs` interpolated `my_callsign`, `target_callsign`, error messages, and
+  the AGWPE port-info JSON directly into HTML/script contexts. Added `h()`
+  HTML-escape and `json_for_script()` JSON-escape helpers and routed every
+  user-influenced value through them. Also added a strict CSP `<meta>` to
+  the browse-page wrapper.
+- `read_line` was bounded after the read, not during. Replaced with a
+  `Take<&mut BufReader>` + `read_until` helper so an attacker cannot stream
+  multi-GB lines past the size check.
+- Global connection counter was TOCTOU and leaked on panic. Switched to a
+  fetch-add admission + RAII drop guard. Per-IP cap (5 concurrent) added so
+  one peer cannot occupy every global slot.
+- Server had no write timeout (slowloris-on-write would stall threads). Added.
+- POST silently degraded to GET on the server. Now rejected with a clear error.
+- Browser session-dir creation had a symlink TOCTOU. Replaced
+  `/tmp/chrome-{callsign}` with `tempfile::TempDir`, eliminating the race.
+- Blocklist fetch had no timeout or size cap. Added a 30 s timeout, 5-redirect
+  cap, Content-Length check, and a streaming read bounded at 16 MiB.
+- The default `BLOCKED_RANGES` did not cover `0.0.0.0/8`, so the blocklist's
+  own `0.0.0.0 evil.example` sinkhole entries routed to local services via
+  `connect(0.0.0.0)`. Added to the default list and to `docker-compose.yml`.
+- Client sanitizer only stripped `<script>` and `<link rel=stylesheet>`.
+  Added stripping for `<iframe>`, `<object>`, `<embed>`, `<frame>`,
+  `<frameset>`, `<applet>`, `<noscript>`, `<base>`, inline `<style>`,
+  `style=` attribute, `meta http-equiv=refresh`, all `on*` event handlers,
+  and `javascript:` URLs in `src`/`href`/`action`/`formaction`/`background`/`poster`.
+- `/etc/hosts` rename failed silently across Docker bind-mount boundary.
+  Added an in-place fallback when rename returns EXDEV/EBUSY.
+- `LockExt::lock_or_poisoned()` recovers from mutex poisoning instead of
+  panicking. Important because the original audit accepted poison as a panic;
+  with the new CSRF and config-write paths, a panic anywhere now bricks the
+  proxy until restart.
+- Several smaller cleanups: `LazyLock` for the connect-handler regex, demoted
+  noisy `eprintln!` frame dumps to `tracing::trace!`, propagated
+  `ConfigError` from `dirs::config_dir()` instead of `unwrap`, fixed a
+  test that wouldn't compile (`FileConfig` was missing `skip_bpq_app`),
+  removed dead `log_rotate_*` and `syslog_*` config fields that were read
+  from env but never used.
+
+### Open, architectural
+
+These need real design work and are deliberately not fixed in this pass.
+
+1. **Subresource SSRF via the headless browser.** `validate_url` only checks the
+   top-level navigation URL. Chromium then loads stylesheets, fonts, images,
+   inline `fetch()` from `JS_SCRUB_HTML`, and any other subresource via its
+   own DNS resolver, with no filter in the loop. Any visited page can cause
+   the server to issue arbitrary GETs to internal IPs the operator's box can
+   reach (cloud metadata, RFC1918, container-internal services). The proper
+   fix is to route Chromium through a local proxy we control that does the
+   filter check and pins the resolved IP to what was checked. Roughly a day
+   of work; deferred so the security pass stays bisectable.
+
+2. **DNS-rebinding TOCTOU between filter and renderer.** Same root cause as (1):
+   independent DNS lookups in `filter.rs` and the browser. Same fix.
+
+3. **Chromium runs with `--no-sandbox`.** Required because Chromium's setuid
+   sandbox cannot initialize as UID 1000 in a container without
+   CAP_SYS_ADMIN. The container's `cap_drop: ALL`, `read_only: true`, and
+   tmpfs limits compensate but do not replace a renderer sandbox. A
+   renderer compromise (one malicious page) gets the full server process's
+   ambient permissions. Documented in README. Long-term fix: switch to
+   Firefox (whose content sandbox initializes from unprivileged user
+   namespaces) or rework the container to give Chromium what its sandbox
+   needs.
+
+4. **`/etc/hosts` bind-mount in docker-compose.** The atomic-rename codepath
+   now falls back to in-place writes for this case, but the broader
+   architecture — mounting a single file from the host as the container's
+   `/etc/hosts` — couples the host's name resolution to the blocklist
+   refresher. A cleaner design is to mount a directory and have the server
+   write its own resolver file, or block at a different layer.
+
+5. **Dependency freshness.** `reqwest 0.11`, `axum 0.7`, `openssl 0.10.81`.
+   None have known advisories against the pinned versions to my knowledge,
+   but running `cargo audit` regularly and tracking the major-version bumps
+   (reqwest 0.12, axum 0.8) is a deferred task that belongs in its own PR
+   because of the API surface changes.
+
+6. **Mutex poison panic-on-panic.** Now degrades to "continue with previous
+   contents" rather than blocking the proxy. Acceptable for a single-user
+   local proxy; would not be acceptable for a multi-tenant service.

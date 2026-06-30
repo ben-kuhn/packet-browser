@@ -159,8 +159,10 @@ impl CliArgs {
     }
 
     pub fn resolve_config(&self) -> Result<FileConfig, ConfigError> {
-        let path = self.config_path.clone()
-            .unwrap_or_else(|| FileConfig::default_path().unwrap());
+        let path = match self.config_path.clone() {
+            Some(p) => p,
+            None => FileConfig::default_path()?,
+        };
 
         let mut config = FileConfig::load(&path)?;
 
@@ -206,6 +208,7 @@ mod tests {
             my_callsign: "N0CALL".to_string(),
             target_callsign: "NODE1".to_string(),
             bpq_command: "BROWSE".to_string(),
+            skip_bpq_app: false,
         };
 
         config.save(&path).unwrap();

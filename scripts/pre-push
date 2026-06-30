@@ -3,7 +3,7 @@
 # Install with: make install-hooks
 set -euo pipefail
 
-echo "=== Pre-push: running smoke test against docker-packet-browser:latest ==="
+echo "=== Pre-push: running smoke test against packet-browser:latest ==="
 echo "    (run 'make build' first if you haven't built the image yet)"
 echo ""
 

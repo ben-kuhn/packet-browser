@@ -31,15 +31,21 @@ pub fn brotli_compress(data: &[u8], quality: u32) -> Result<Vec<u8>, Compression
 }
 
 pub fn brotli_decompress(data: &[u8]) -> Result<Vec<u8>, CompressionError> {
-    let mut output = Vec::new();
     let mut decompressor = brotli::Decompressor::new(data, 4096);
+    let mut output = Vec::new();
+    let mut buf = [0u8; 8192];
 
-    let bytes_read = decompressor
-        .read_to_end(&mut output)
-        .map_err(|e| CompressionError::DecompressFailed(e.to_string()))?;
-
-    if bytes_read > MAX_DECOMPRESSED_SIZE {
-        return Err(CompressionError::TooLarge);
+    loop {
+        let n = decompressor
+            .read(&mut buf)
+            .map_err(|e| CompressionError::DecompressFailed(e.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        if output.len() + n > MAX_DECOMPRESSED_SIZE {
+            return Err(CompressionError::TooLarge);
+        }
+        output.extend_from_slice(&buf[..n]);
     }
 
     Ok(output)
@@ -80,5 +86,17 @@ mod tests {
     fn test_decompress_invalid() {
         let invalid = b"not valid brotli data";
         assert!(brotli_decompress(invalid).is_err());
+    }
+
+    #[test]
+    fn test_decompress_too_large_rejected_without_full_alloc() {
+        // Highly-compressible input that expands past MAX_DECOMPRESSED_SIZE.
+        let oversized = vec![0u8; MAX_DECOMPRESSED_SIZE + 1024];
+        let compressed = brotli_compress(&oversized, 11).unwrap();
+        assert!(compressed.len() < oversized.len());
+        match brotli_decompress(&compressed) {
+            Err(CompressionError::TooLarge) => {}
+            other => panic!("expected TooLarge, got {:?}", other),
+        }
     }
 }

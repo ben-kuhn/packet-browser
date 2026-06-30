@@ -1,8 +1,8 @@
 # Packet Browser
 
-[![Build and Publish](https://github.com/ben-kuhn/docker-packet-browser/actions/workflows/build.yml/badge.svg)](https://github.com/ben-kuhn/docker-packet-browser/actions/workflows/build.yml)
+[![Build and Publish](https://github.com/ben-kuhn/packet-browser/actions/workflows/build.yml/badge.svg)](https://github.com/ben-kuhn/packet-browser/actions/workflows/build.yml)
 
-A client/server web browser for packet radio. The **server** (behind BPQ) fetches and sanitizes web pages using headless Chromium, compresses them with brotli, and sends them over AX.25. The **client** connects via AGWPE and provides a local web proxy that users browse with their regular browser.
+A client/server web browser for packet radio. The **server** (behind BPQ) fetches and sanitizes web pages using headless Firefox, compresses them with brotli, and sends them over AX.25. The **client** connects via AGWPE and provides a local web proxy that users browse with their regular browser.
 
 ## Architecture
 
@@ -24,7 +24,7 @@ A client/server web browser for packet radio. The **server** (behind BPQ) fetche
 │                                                                       │
 │  ┌──────────────┐    ┌──────────────────┐    ┌──────────────────┐  │
 │  │  LinBPQ       │───▶│  Server           │───▶│  Headless        │  │
-│  │  (node)       │    │  TCP:63004        │    │  Chromium        │  │
+│  │  (node)       │    │  TCP:63004        │    │  Firefox        │  │
 │  └──────────────┘    └──────────────────┘    └──────────────────┘  │
 │                                                                       │
 └─────────────────────────────────────────────────────────────────────┘
@@ -41,7 +41,7 @@ A client/server web browser for packet radio. The **server** (behind BPQ) fetche
 7. User opens browser to client's web UI (default `http://localhost:8080`)
 8. User enters a URL or clicks links
 9. **Client** sends request over AX.25 to **server**
-10. **Server** fetches page with headless Chromium, sanitizes HTML, compresses with brotli
+10. **Server** fetches page with headless Firefox, sanitizes HTML, compresses with brotli
 11. **Server** sends compressed response back over AX.25
 12. **Client** decompresses, rewrites URLs to route through local proxy, displays in browser
 
@@ -119,7 +119,7 @@ SKIP_BPQ_APP=true TARGET_CALLSIGN=NODE-7 ./demo.sh
 │                                              │ (audio)       │
 │  Server:63004 ◀── LinBPQ ◀── Direwolf-B ───┘                 │
 │       │                                                       │
-│       └──▶ Chromium (fetches real web pages)                  │
+│       └──▶ Firefox (fetches real web pages)                  │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -169,7 +169,7 @@ docker compose up -d
 ```yaml
 services:
   packet-browser:
-    image: ghcr.io/ben-kuhn/docker-packet-browser:latest
+    image: ghcr.io/ben-kuhn/packet-browser:latest
 
     ports:
       # Bind to loopback only by default (security)
@@ -196,18 +196,20 @@ services:
       - BLOCKLIST_REFRESH_HOURS=24
       - BLOCKLIST_URLS=https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/hosts/ultimate.txt
 
-      # Logging
-      - LOG_ROTATE_ENABLED=true
-      - LOG_RETAIN_DAYS=30
-      - SYSLOG_ENABLED=false
-
     # Security hardening
     read_only: true
     tmpfs:
-      - /tmp:size=128M,mode=1777
-      - /dev/shm:size=64M,mode=1777
+      # Larger than for Chromium — Firefox keeps profile + caches under /tmp.
+      - /tmp:size=512M,mode=1777
+      - /dev/shm:size=128M,mode=1777
     cap_drop:
       - ALL
+    # Firefox's content-process sandbox needs unshare(CLONE_NEWUSER), which
+    # Docker's default seccomp profile denies. See the threat-model section
+    # for the trade-off.
+    security_opt:
+      - seccomp=unconfined
+      - no-new-privileges:true
 
     # DNS filtering - OpenDNS Family Shield
     dns:
@@ -236,11 +238,8 @@ services:
 | `BLOCKLIST_ENABLED` | `true` | Enable/disable local hosts-based blocklist |
 | `BLOCKLIST_REFRESH_HOURS` | `24` | How often to refresh blocklists from URLs |
 | `BLOCKLIST_URLS` | *(empty)* | Comma-separated URLs of hosts-format blocklists |
-| `LOG_ROTATE_ENABLED` | `true` | Enable automatic log rotation |
-| `LOG_RETAIN_DAYS` | `30` | Number of days to retain rotated logs |
-| `SYSLOG_ENABLED` | `false` | Forward logs to external syslog server |
-| `SYSLOG_HOST` | *(empty)* | Syslog server hostname or IP |
-| `SYSLOG_PORT` | `514` | Syslog server port |
+| `FIREFOX_PATH` | `/bin/firefox` | Path to the Firefox binary (set in container image) |
+| `GECKODRIVER_PATH` | `/bin/geckodriver` | Path to the geckodriver binary (set in container image) |
 
 ### BPQ Configuration
 
@@ -269,10 +268,38 @@ APPLICATION 4,WEB,C 10 HOST 3 S
 ### Server Security Features
 
 - **Content Filtering**: DNS filtering (OpenDNS Family Shield) + hosts-based blocklist
-- **SSRF Prevention**: Blocks private IP ranges by default
+- **SSRF Prevention**: Blocks private IP ranges by default (IPv4 + IPv6 reserved
+  ranges, including IPv4-mapped, ULA, link-local, and the `0.0.0.0/8` sinkhole)
 - **Protocol Filtering**: Only HTTP/HTTPS allowed (no file://, ftp://, etc.)
 - **Container Hardening**: Read-only filesystem, no shell, capability dropping, non-root user
 - **Session Security**: Idle timeout, callsign validation, logging acknowledgment
+
+#### Threat-model caveats
+
+These limits apply to the current deployment and are worth understanding
+before exposing the server:
+
+- **Renderer sandbox.** The headless Firefox content process runs inside
+  Firefox's own user-namespace + seccomp-bpf sandbox, which the engine
+  initializes from inside the container without requiring `CAP_SYS_ADMIN`.
+  Docker's default seccomp profile blocks `unshare(CLONE_NEWUSER)` though,
+  so the compose file applies `security_opt: seccomp=unconfined` for the
+  container as a whole. The trade-off is a wider container syscall surface
+  in exchange for an actual sandbox around the renderer — preferable to
+  the previous `--no-sandbox` Chromium configuration where the renderer
+  had the full ambient permissions of the server process.
+- **Subresource loads are not filtered.** `BLOCKED_RANGES` is enforced on the
+  top-level navigation URL only. Stylesheets, fonts, images, and any
+  `fetch()` from the sanitizer JS go through Firefox's own resolver and
+  are not checked against the SSRF policy. A malicious page can cause the
+  server to issue arbitrary GETs to addresses the operator's host can reach.
+- **DNS rebinding is not fully closed.** The filter resolves once, Firefox
+  resolves again at connect time; an attacker can flip the answer between
+  the two. The check narrows but does not eliminate the SSRF surface.
+
+Closing the latter two properly requires routing Firefox through a local
+filtering proxy that pins the resolved IP. That is planned but out of
+scope for the current deployment.
 
 ### Running with Nix (without Docker)
 
@@ -287,10 +314,12 @@ nix build ham-packages#packet-browser-server
 ./result/bin/packet-browser-server
 ```
 
-The server requires Chromium at runtime. Set `CHROMIUM_PATH` to point to your Chromium binary:
+The server requires Firefox **and** geckodriver at runtime. Point both at the
+right binaries via env vars (defaults are the in-container paths):
 
 ```bash
-export CHROMIUM_PATH=$(which chromium)
+export FIREFOX_PATH=$(which firefox)
+export GECKODRIVER_PATH=$(which geckodriver)
 packet-browser-server
 ```
 
@@ -306,7 +335,7 @@ The client runs on your local machine and provides a web proxy interface. It con
 
 #### Pre-built Binaries
 
-Download from [GitHub Releases](https://github.com/ben-kuhn/docker-packet-browser/releases):
+Download from [GitHub Releases](https://github.com/ben-kuhn/packet-browser/releases):
 
 | Platform | File |
 |----------|------|
@@ -322,7 +351,7 @@ Download from [GitHub Releases](https://github.com/ben-kuhn/docker-packet-browse
 
 ```bash
 # Download and install
-wget https://github.com/ben-kuhn/docker-packet-browser/releases/latest/download/packet-browser-client_0.2.0_amd64.deb
+wget https://github.com/ben-kuhn/packet-browser/releases/latest/download/packet-browser-client_0.2.0_amd64.deb
 sudo dpkg -i packet-browser-client_0.2.0_amd64.deb
 
 # Copy and edit config
@@ -337,7 +366,7 @@ sudo systemctl enable --now packet-browser-client
 
 ```bash
 # Download and install
-wget https://github.com/ben-kuhn/docker-packet-browser/releases/latest/download/packet-browser-client-0.2.0-1.x86_64.rpm
+wget https://github.com/ben-kuhn/packet-browser/releases/latest/download/packet-browser-client-0.2.0-1.x86_64.rpm
 sudo rpm -i packet-browser-client-0.2.0-1.x86_64.rpm
 
 # Copy and edit config
@@ -460,7 +489,7 @@ nix-env -iA nixos.packet-browser-server
 
 ```bash
 # Download and extract
-curl -L https://github.com/ben-kuhn/docker-packet-browser/releases/latest/download/packet-browser-aarch64-apple-darwin.tar.gz | tar xz
+curl -L https://github.com/ben-kuhn/packet-browser/releases/latest/download/packet-browser-aarch64-apple-darwin.tar.gz | tar xz
 
 # Create config directory
 mkdir -p ~/.config/packet-browser
@@ -688,8 +717,8 @@ nssm start PacketBrowserClient
 
 ```bash
 # Clone repository
-git clone https://github.com/ben-kuhn/docker-packet-browser.git
-cd docker-packet-browser
+git clone https://github.com/ben-kuhn/packet-browser.git
+cd packet-browser
 
 # Build with Nix (includes all dependencies)
 nix build
@@ -722,7 +751,7 @@ Enter the Nix development shell:
 ```bash
 nix develop
 
-# Now you have Rust toolchain, Chromium, and dependencies
+# Now you have Rust toolchain, Firefox, and dependencies
 cargo build
 cargo test
 cargo run --bin packet-browser-server
@@ -797,7 +826,7 @@ The script will:
 │                                              │ (audio)       │
 │  Server:63004 ◀── LinBPQ ◀── Direwolf-B ───┘                 │
 │       │                                                       │
-│       └──▶ Chromium (fetches real web pages)                  │
+│       └──▶ Firefox (fetches real web pages)                  │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -930,6 +959,6 @@ This program is distributed in the hope that it will be useful, but WITHOUT ANY 
 
 ## Support
 
-Issues and pull requests: https://github.com/ben-kuhn/docker-packet-browser
+Issues and pull requests: https://github.com/ben-kuhn/packet-browser
 
 For BPQ-specific questions, consult the BPQ32 documentation.

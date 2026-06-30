@@ -122,7 +122,7 @@ td,th{border:1px solid #ccc;padding:.3em}img{display:none}
 ## 5. Workspace Structure
 
 ```
-docker-packet-browser/
+packet-browser/
 ├── Cargo.toml                  # workspace root
 ├── shared/
 │   ├── Cargo.toml
@@ -407,7 +407,7 @@ Use `lol_html` streaming rewriter:
 ```yaml
 services:
   packet-browser-server:
-    image: ghcr.io/ben-kuhn/docker-packet-browser:latest
+    image: ghcr.io/ben-kuhn/packet-browser:latest
     ports:
       - "127.0.0.1:63004:63004"
     volumes:

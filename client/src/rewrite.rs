@@ -23,9 +23,9 @@ pub fn rewrite_html(html: &str, base_url: &str) -> Result<String, RewriteError> 
                         Some(proxy_url) => {
                             el.set_attribute("href", &proxy_url)?;
                         }
-                    None => {
-                        el.set_attribute("href", "#")?;
-                    }
+                        None => {
+                            el.set_attribute("href", "#")?;
+                        }
                     }
                     Ok(())
                 }),
@@ -44,12 +44,42 @@ pub fn rewrite_html(html: &str, base_url: &str) -> Result<String, RewriteError> 
                     }
                     Ok(())
                 }),
-                element!("link[rel=stylesheet]", |el| {
+                // Server already strips these in JS_SCRUB_HTML, but defense in depth
+                // so the client cannot be backdoored by trusting the server alone.
+                element!("script, style, link[rel=stylesheet], iframe, frame, frameset, object, embed, applet, noscript, base", |el| {
                     el.remove();
                     Ok(())
                 }),
-                element!("script", |el| {
-                    el.remove();
+                element!("meta[http-equiv]", |el| {
+                    let eq = el.get_attribute("http-equiv").unwrap_or_default();
+                    if eq.eq_ignore_ascii_case("refresh") || eq.eq_ignore_ascii_case("content-security-policy") {
+                        el.remove();
+                    }
+                    Ok(())
+                }),
+                // Drop every on*= event handler attribute and any javascript: URLs.
+                element!("*", |el| {
+                    let attr_names: Vec<String> = el
+                        .attributes()
+                        .iter()
+                        .map(|a| a.name())
+                        .collect();
+                    for name in attr_names {
+                        if name.starts_with("on") {
+                            el.remove_attribute(&name);
+                            continue;
+                        }
+                        if matches!(name.as_str(), "src" | "href" | "action" | "formaction" | "background" | "poster") {
+                            if let Some(v) = el.get_attribute(&name) {
+                                if v.trim_start().to_ascii_lowercase().starts_with("javascript:") {
+                                    el.remove_attribute(&name);
+                                }
+                            }
+                        }
+                        if name == "style" {
+                            el.remove_attribute(&name);
+                        }
+                    }
                     Ok(())
                 }),
             ],
@@ -159,5 +189,48 @@ mod tests {
         let result = rewrite_html(html, "https://example.com/dir/subdir/").unwrap();
         assert!(result.contains("/browse?url="));
         assert!(result.contains("example.com%2Fdir%2Fpage"));
+    }
+
+    #[test]
+    fn test_strip_iframe_and_object() {
+        let html = r#"<iframe src="https://evil"></iframe><object data="x"></object><p>ok</p>"#;
+        let result = rewrite_html(html, "https://example.com").unwrap();
+        assert!(!result.contains("<iframe"));
+        assert!(!result.contains("<object"));
+        assert!(result.contains("<p>ok</p>"));
+    }
+
+    #[test]
+    fn test_strip_event_handlers() {
+        let html = r#"<p onclick="alert(1)" onerror="bad()">hi</p>"#;
+        let result = rewrite_html(html, "https://example.com").unwrap();
+        assert!(!result.contains("onclick"));
+        assert!(!result.contains("onerror"));
+        assert!(result.contains("hi"));
+    }
+
+    #[test]
+    fn test_strip_inline_style_and_style_attr() {
+        let html = r#"<style>body{color:red}</style><p style="color:blue">x</p>"#;
+        let result = rewrite_html(html, "https://example.com").unwrap();
+        assert!(!result.contains("<style>"));
+        assert!(!result.contains("style=\"color:blue\""));
+        assert!(result.contains("x"));
+    }
+
+    #[test]
+    fn test_strip_meta_refresh() {
+        let html = r#"<meta http-equiv="refresh" content="0;url=https://evil"><p>x</p>"#;
+        let result = rewrite_html(html, "https://example.com").unwrap();
+        assert!(!result.to_lowercase().contains("refresh"));
+        assert!(result.contains("<p>x</p>"));
+    }
+
+    #[test]
+    fn test_strip_javascript_src() {
+        let html = r#"<img src="javascript:alert(1)" alt="x"><p>ok</p>"#;
+        let result = rewrite_html(html, "https://example.com").unwrap();
+        assert!(!result.to_lowercase().contains("javascript:"));
+        assert!(result.contains("<p>ok</p>"));
     }
 }

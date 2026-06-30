@@ -10,11 +10,6 @@ pub struct Config {
     pub blocklist_urls: Vec<String>,
     pub blocklist_refresh_hours: u64,
     pub blocklist_enabled: bool,
-    pub log_rotate_enabled: bool,
-    pub log_retain_days: u32,
-    pub syslog_enabled: bool,
-    pub syslog_host: Option<String>,
-    pub syslog_port: u16,
 }
 
 impl Config {
@@ -28,6 +23,7 @@ impl Config {
             blocked_ranges: parse_env_vec(
                 "BLOCKED_RANGES",
                 vec![
+                    "0.0.0.0/8".to_string(),
                     "127.0.0.0/8".to_string(),
                     "10.0.0.0/8".to_string(),
                     "172.16.0.0/12".to_string(),
@@ -38,11 +34,6 @@ impl Config {
             blocklist_urls: parse_env_vec("BLOCKLIST_URLS", vec![]),
             blocklist_refresh_hours: parse_env_u64("BLOCKLIST_REFRESH_HOURS", 24),
             blocklist_enabled: parse_env_bool("BLOCKLIST_ENABLED", true),
-            log_rotate_enabled: parse_env_bool("LOG_ROTATE_ENABLED", true),
-            log_retain_days: parse_env_u32("LOG_RETAIN_DAYS", 30),
-            syslog_enabled: parse_env_bool("SYSLOG_ENABLED", false),
-            syslog_host: env::var("SYSLOG_HOST").ok(),
-            syslog_port: parse_env_u16("SYSLOG_PORT", 514),
         }
     }
 }

@@ -1,6 +1,6 @@
 use packet_browser_server::{
     blocklist::start_blocklist_manager,
-    browser::BrowserInstance,
+    browser::{BrowserError, BrowserInstance},
     config::Config,
     filter::validate_url,
     logger::{LogEntry, LogStatus, Logger},
@@ -8,17 +8,21 @@ use packet_browser_server::{
 };
 use packet_browser_shared::compress::brotli_compress;
 use packet_browser_shared::protocol::{Request, Response, Status};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 const VERSION: &str = "0.2.0";
 const MAX_CONNECTIONS: usize = 50;
+const MAX_CONNECTIONS_PER_IP: usize = 5;
 const MAX_LINE_LENGTH: usize = 1024;
 const MAX_BODY_SIZE: usize = 1024 * 1024;
 const REQUEST_TIMEOUT_SECS: u64 = 300;
+
+type PeerCounts = Arc<Mutex<HashMap<IpAddr, usize>>>;
 
 fn main() {
     if std::env::args().any(|a| a == "--healthcheck") {
@@ -34,6 +38,7 @@ fn main() {
 
     let config = Arc::new(Config::from_env());
     let connection_count = Arc::new(AtomicUsize::new(0));
+    let peer_counts: PeerCounts = Arc::new(Mutex::new(HashMap::new()));
 
     println!("Starting packet-browser-server v{}", VERSION);
     println!("Listening on port {}", config.listen_port);
@@ -48,13 +53,8 @@ fn main() {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if connection_count.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
-                    eprintln!("[LIMIT] Max connections reached, rejecting");
-                    let _ = stream.shutdown(std::net::Shutdown::Both);
-                    continue;
-                }
-
-                let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "unknown".to_string());
+                let peer_addr = stream.peer_addr().ok();
+                let peer = peer_addr.map(|a| a.to_string()).unwrap_or_else(|| "unknown".to_string());
                 eprintln!("[CONNECT] New connection from {}", peer);
 
                 if let Err(e) = stream.set_read_timeout(Some(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))) {
@@ -62,15 +62,86 @@ fn main() {
                     continue;
                 }
 
+                if let Err(e) = stream.set_write_timeout(Some(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))) {
+                    eprintln!("[ERROR] Failed to set write timeout: {}", e);
+                    continue;
+                }
+
+                // Per-IP cap so a single peer cannot occupy every global slot.
+                let peer_ip = peer_addr.map(|a| a.ip());
+                if let Some(ip) = peer_ip {
+                    let mut map = match peer_counts.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    let entry = map.entry(ip).or_insert(0);
+                    if *entry >= MAX_CONNECTIONS_PER_IP {
+                        eprintln!("[LIMIT] Per-IP cap reached for {}, rejecting", ip);
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        continue;
+                    }
+                    *entry += 1;
+                }
+
                 let config = Arc::clone(&config);
                 let count = Arc::clone(&connection_count);
-                count.fetch_add(1, Ordering::SeqCst);
+                let peers = Arc::clone(&peer_counts);
+
+                // Race-free admission: claim a slot atomically, then release it
+                // if we busted the cap.
+                let prev = count.fetch_add(1, Ordering::SeqCst);
+                if prev >= MAX_CONNECTIONS {
+                    count.fetch_sub(1, Ordering::SeqCst);
+                    if let Some(ip) = peer_ip {
+                        let mut map = match peers.lock() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        if let Some(c) = map.get_mut(&ip) {
+                            *c = c.saturating_sub(1);
+                            if *c == 0 {
+                                map.remove(&ip);
+                            }
+                        }
+                    }
+                    eprintln!("[LIMIT] Max connections reached, rejecting");
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    continue;
+                }
 
                 thread::spawn(move || {
+                    // RAII guards so both global and per-IP counts are freed
+                    // even if handle_connection panics.
+                    struct ConnGuard(Arc<AtomicUsize>);
+                    impl Drop for ConnGuard {
+                        fn drop(&mut self) {
+                            self.0.fetch_sub(1, Ordering::SeqCst);
+                        }
+                    }
+                    struct PeerGuard(PeerCounts, Option<IpAddr>);
+                    impl Drop for PeerGuard {
+                        fn drop(&mut self) {
+                            if let Some(ip) = self.1 {
+                                let mut map = match self.0.lock() {
+                                    Ok(g) => g,
+                                    Err(p) => p.into_inner(),
+                                };
+                                if let Some(c) = map.get_mut(&ip) {
+                                    *c = c.saturating_sub(1);
+                                    if *c == 0 {
+                                        map.remove(&ip);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let _guard = ConnGuard(count);
+                    let _peer_guard = PeerGuard(peers, peer_ip);
+
                     if let Err(e) = handle_connection(stream, config) {
                         eprintln!("[ERROR] Connection error from {}: {}", peer, e);
                     }
-                    count.fetch_sub(1, Ordering::SeqCst);
                 });
             }
             Err(e) => {
@@ -80,20 +151,35 @@ fn main() {
     }
 }
 
+// Read up to one line, capped at MAX_LINE_LENGTH bytes including the newline.
+// Returns Ok(None) on clean EOF and an InvalidData error if no newline arrives
+// before the cap (so a slow attacker cannot stream gigabytes into the buffer).
+fn read_bounded_line(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option<String>> {
+    let mut buf = Vec::new();
+    let n = reader
+        .by_ref()
+        .take((MAX_LINE_LENGTH as u64) + 1)
+        .read_until(b'\n', &mut buf)?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.last() != Some(&b'\n') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Line exceeded maximum length",
+        ));
+    }
+    String::from_utf8(buf)
+        .map(Some)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid UTF-8 in line"))
+}
+
 fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
 
-    let callsign = {
-        let mut input = String::new();
-        let bytes_read = reader.read_line(&mut input)?;
-        if bytes_read == 0 {
-            return Ok(());
-        }
-        if bytes_read > MAX_LINE_LENGTH {
-            eprintln!("[AUTH] Callsign too long");
-            return Ok(());
-        }
-        input.trim().to_string()
+    let callsign = match read_bounded_line(&mut reader)? {
+        Some(s) => s.trim().to_string(),
+        None => return Ok(()),
     };
 
     let callsign = match validate_callsign(&callsign) {
@@ -111,11 +197,10 @@ fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::io::Res
     write!(stream, "All activity is logged including your callsign.\nType AGREE to proceed: ")?;
     stream.flush()?;
 
-    let mut input = String::new();
-    let bytes_read = reader.read_line(&mut input)?;
-    if bytes_read == 0 || bytes_read > MAX_LINE_LENGTH {
-        return Ok(());
-    }
+    let input = match read_bounded_line(&mut reader)? {
+        Some(s) => s,
+        None => return Ok(()),
+    };
 
     if input.trim().to_uppercase() != "AGREE" {
         writeln!(stream, "Acknowledgment required. Goodbye.")?;
@@ -147,7 +232,7 @@ fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::io::Res
     };
 
     eprintln!("[PORTAL] Loading {} for {}", config.portal_url, callsign);
-    if let Err(e) = handle_request(&mut session, &mut browser, &callsign, &config, &logger, &mut stream, &config.portal_url, None) {
+    if let Err(e) = handle_request(&mut session, &mut browser, &callsign, &config, &logger, &mut stream, &config.portal_url) {
         eprintln!("[PORTAL] Failed for {}: {}", callsign, e);
     }
 
@@ -174,15 +259,21 @@ fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::io::Res
         }
 
         let url = match &request {
-            Request::Get { url } | Request::Post { url, .. } => url.clone(),
+            Request::Get { url } => url.clone(),
+            Request::Post { url, .. } => {
+                // We do not have a working POST path through the headless
+                // browser yet; silently fetching the URL as a GET would
+                // misrepresent the request, so reject explicitly.
+                eprintln!("[CMD] {} POST {} rejected (POST unsupported)", callsign, url);
+                if let Err(e) = send_error_response(&mut stream, "POST requests are not supported") {
+                    eprintln!("[ERROR] Failed to send POST rejection to {}: {}", callsign, e);
+                    break;
+                }
+                continue;
+            }
         };
 
-        let body = match &request {
-            Request::Post { body, .. } => Some(body.clone()),
-            _ => None,
-        };
-
-        if let Err(e) = handle_request(&mut session, &mut browser, &callsign, &config, &logger, &mut stream, &url, body.as_deref()) {
+        if let Err(e) = handle_request(&mut session, &mut browser, &callsign, &config, &logger, &mut stream, &url) {
             eprintln!("[ERROR] Request error for {}: {}", callsign, e);
         }
     }
@@ -192,14 +283,10 @@ fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::io::Res
 }
 
 fn read_request(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option<Request>> {
-    let mut header_line = String::new();
-    let bytes_read = reader.read_line(&mut header_line)?;
-    if bytes_read == 0 {
-        return Ok(None);
-    }
-    if bytes_read > MAX_LINE_LENGTH {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "URL too long"));
-    }
+    let header_line = match read_bounded_line(reader)? {
+        Some(s) => s,
+        None => return Ok(None),
+    };
 
     let trimmed = header_line.trim();
 
@@ -243,7 +330,6 @@ fn handle_request(
     logger: &Logger,
     stream: &mut TcpStream,
     url: &str,
-    _body: Option<&[u8]>,
 ) -> std::io::Result<()> {
     if let Err(e) = validate_url(url, &config.blocked_ranges) {
         eprintln!("[FILTER] Blocked URL {} for {}: {}", url, callsign, e);
@@ -276,17 +362,16 @@ fn handle_request(
 
         match b.fetch_page(url) {
             Ok(html) => break html,
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("connection is closed") || err_str.contains("BrowserCrashed") {
-                    eprintln!("[BROWSER] Chrome crashed, restarting for {}", callsign);
-                    *browser = BrowserInstance::new(callsign).ok();
-                    if browser.is_none() {
-                        send_error_response(stream, "Browser unavailable")?;
-                        return Ok(());
-                    }
-                    continue;
+            Err(BrowserError::BrowserCrashed) => {
+                eprintln!("[BROWSER] Firefox session lost, restarting for {}", callsign);
+                *browser = BrowserInstance::new(callsign).ok();
+                if browser.is_none() {
+                    send_error_response(stream, "Browser unavailable")?;
+                    return Ok(());
                 }
+                continue;
+            }
+            Err(e) => {
                 eprintln!("[FETCH] Error loading {} for {}: {}", url, callsign, e);
                 let log_entry = LogEntry::new(
                     session.callsign.clone(),

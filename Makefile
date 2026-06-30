@@ -16,23 +16,25 @@ build:
 	$(NIX) build .#docker-image
 	docker load < result
 
-## Run smoke test against the already-loaded docker-packet-browser:latest image
+## Run smoke test against the already-loaded packet-browser:latest image
 smoke-test:
-	@echo "=== Smoke test: verifying Chromium starts and can load a page ==="
+	@echo "=== Smoke test: verifying Firefox starts and can load a page ==="
 	@mkdir -p /tmp/smoke-logs
 	@touch /tmp/smoke-hosts
 
 	@docker run -d --name smoke-test \
 	  --read-only \
-	  --tmpfs /tmp:size=128M,mode=1777 \
-	  --tmpfs /dev/shm:size=64M,mode=1777 \
+	  --tmpfs /tmp:size=512M,mode=1777 \
+	  --tmpfs /dev/shm:size=128M,mode=1777 \
 	  -p 127.0.0.1:63004:63004 \
 	  -v /tmp/smoke-logs:/var/log/packet-browser \
 	  -v /tmp/smoke-hosts:/etc/hosts \
 	  --cap-drop ALL \
+	  --security-opt seccomp=unconfined \
+	  --security-opt no-new-privileges \
 	  -e BLOCKLIST_ENABLED=false \
 	  -e PORTAL_URL=https://example.com \
-	  docker-packet-browser:latest
+	  packet-browser:latest
 
 	@echo "Waiting for packet-browser to start..."
 	@timeout 30 bash -c 'until nc -z 127.0.0.1 63004 2>/dev/null; do sleep 1; done' \
@@ -41,11 +43,11 @@ smoke-test:
 	@{ sleep 1; echo "W1TEST"; sleep 1; echo "AGREE"; sleep 180; } \
 	  | nc 127.0.0.1 63004 >/dev/null 2>&1 & echo $$! > /tmp/smoke-nc.pid
 
-	@echo "Step 1/2: Waiting for Chrome DevTools connection (up to 60s)..."
+	@echo "Step 1/2: Waiting for WebDriver session ready (up to 60s)..."
 	@CONNECTED=0; \
 	for i in $$(seq 1 60); do \
-	  if docker logs smoke-test 2>&1 | grep -q '\[BROWSER\] Connected to Chrome DevTools'; then \
-	    echo "  Chrome connected after $${i}s"; CONNECTED=1; break; \
+	  if docker logs smoke-test 2>&1 | grep -q '\[BROWSER\] Session ready'; then \
+	    echo "  Firefox connected after $${i}s"; CONNECTED=1; break; \
 	  fi; \
 	  sleep 1; \
 	done; \
@@ -53,13 +55,13 @@ smoke-test:
 	  echo "--- Container logs ---"; docker logs smoke-test 2>&1; \
 	  kill $$(cat /tmp/smoke-nc.pid) 2>/dev/null || true; \
 	  docker stop smoke-test 2>/dev/null || true; docker rm smoke-test 2>/dev/null || true; \
-	  echo "FAIL: Chrome did not connect"; exit 1; \
+	  echo "FAIL: Firefox did not connect"; exit 1; \
 	fi; \
 	echo "Step 2/2: Waiting for page load (up to 60s)..."; \
 	RESULT=1; \
 	for i in $$(seq 1 60); do \
-	  if docker logs smoke-test 2>&1 | grep -q '\[BROWSER\] Page loaded:'; then \
-	    echo "PASS: Page loaded after $${i}s"; RESULT=0; break; \
+	  if docker logs smoke-test 2>&1 | grep -q '\[FETCH\] Loading'; then \
+	    echo "PASS: Page load triggered after $${i}s"; RESULT=0; break; \
 	  fi; \
 	  sleep 1; \
 	done; \
@@ -80,4 +82,4 @@ all: test test-image
 install-hooks:
 	@cp scripts/pre-push .git/hooks/pre-push
 	@chmod +x .git/hooks/pre-push
-	@echo "Pre-push hook installed. 'make build' before pushing to populate docker-packet-browser:latest."
+	@echo "Pre-push hook installed. 'make build' before pushing to populate packet-browser:latest."

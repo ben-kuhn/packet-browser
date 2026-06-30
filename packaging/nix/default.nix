@@ -12,7 +12,7 @@ rustPlatform.buildRustPackage rec {
 
   src = fetchFromGitHub {
     owner = "yourusername";
-    repo = "docker-packet-browser";
+    repo = "packet-browser";
     rev = "v${version}";
     hash = lib.fakeHash; # Update with actual hash
   };
@@ -32,7 +32,7 @@ rustPlatform.buildRustPackage rec {
 
   meta = with lib; {
     description = "Client component for Packet Browser - Web browser over AX.25 packet radio";
-    homepage = "https://github.com/yourusername/docker-packet-browser";
+    homepage = "https://github.com/yourusername/packet-browser";
     license = licenses.mit;
     maintainers = with maintainers; [ yourusername ];
     mainProgram = "packet-browser-client";

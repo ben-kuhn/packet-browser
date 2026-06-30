@@ -1,5 +1,7 @@
 use axum::{
     extract::{Extension, Query},
+    http::{Method, Request as HttpRequest, StatusCode},
+    middleware::{self, Next},
     response::{
         sse::{Event, Sse},
         Html, IntoResponse, Redirect, Response,
@@ -9,13 +11,17 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::sync::broadcast;
+
+static CALLSIGN_REGEX: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"^[a-zA-Z0-9]{1,3}[0-9][a-zA-Z0-9]{0,3}[a-zA-Z]$").unwrap()
+});
 
 use crate::agwpe::AgwpeManager;
 use crate::config::FileConfig;
 use crate::rewrite::rewrite_html;
-use crate::state::{ConnectionState, DebugLogEntry, SharedState};
+use crate::state::{ConnectionState, DebugLogEntry, LockExt, SharedState};
 use crate::ui;
 use packet_browser_shared::compress::brotli_decompress;
 use packet_browser_shared::protocol::{Request, Response as ProtocolResponse, Status};
@@ -24,6 +30,7 @@ pub struct AppContext {
     pub state: SharedState,
     pub agwpe: AgwpeManager,
     pub log_tx: broadcast::Sender<DebugLogEntry>,
+    pub allowed_origins: Vec<String>,
 }
 
 pub fn create_router(ctx: Arc<AppContext>) -> Router {
@@ -40,7 +47,58 @@ pub fn create_router(ctx: Arc<AppContext>) -> Router {
         .route("/api/config", get(api_config_get))
         .route("/api/config", post(api_config_post))
         .route("/events", get(events_handler))
+        .layer(middleware::from_fn_with_state(
+            ctx.clone(),
+            csrf_guard,
+        ))
         .layer(Extension(ctx))
+}
+
+// Reject state-changing requests whose Origin (or Referer fallback) is not the
+// listener's own origin. Required because a page fetched via /browse is served
+// from the same origin as the API, so any visited site could otherwise script
+// /api/config and friends.
+async fn csrf_guard(
+    axum::extract::State(ctx): axum::extract::State<Arc<AppContext>>,
+    req: HttpRequest<axum::body::Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if req.method() == Method::POST {
+        let headers = req.headers();
+        let origin = headers.get("origin").and_then(|v| v.to_str().ok());
+        let referer = headers.get("referer").and_then(|v| v.to_str().ok());
+
+        let ok = match (origin, referer) {
+            (Some(o), _) => ctx.allowed_origins.iter().any(|a| a == o),
+            (None, Some(r)) => ctx
+                .allowed_origins
+                .iter()
+                .any(|a| r == a || r.starts_with(&format!("{}/", a))),
+            (None, None) => false,
+        };
+
+        if !ok {
+            tracing::warn!(
+                "CSRF guard rejected {} {} (origin={:?}, referer={:?})",
+                req.method(),
+                req.uri().path(),
+                origin,
+                referer
+            );
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+    Ok(next.run(req).await)
+}
+
+pub fn allowed_origins_for(listen_addr: &str) -> Vec<String> {
+    // Accept the literal listen address plus an http://localhost:<port> alias.
+    let port = listen_addr.rsplit(':').next().unwrap_or("");
+    let mut v = vec![format!("http://{}", listen_addr)];
+    if !port.is_empty() {
+        v.push(format!("http://localhost:{}", port));
+    }
+    v
 }
 
 async fn root_handler() -> impl IntoResponse {
@@ -50,7 +108,7 @@ async fn root_handler() -> impl IntoResponse {
 async fn connect_page_handler(
     Extension(ctx): Extension<Arc<AppContext>>,
 ) -> impl IntoResponse {
-    let state = ctx.state.lock().unwrap();
+    let state = ctx.state.lock_or_poisoned();
     let my_callsign = state.config.my_callsign.clone();
     let target_callsign = state.config.target_callsign.clone();
     let connection_state = state.connection_state.to_string();
@@ -76,7 +134,7 @@ async fn connect_page_handler(
 async fn configuration_page_handler(
     Extension(ctx): Extension<Arc<AppContext>>,
 ) -> impl IntoResponse {
-    let state = ctx.state.lock().unwrap();
+    let state = ctx.state.lock_or_poisoned();
     let agwpe_host = state.config.agwpe_host.clone();
     let agwpe_port = state.config.agwpe_port;
     let my_callsign = state.config.my_callsign.clone();
@@ -107,7 +165,7 @@ async fn browse_get_handler(
     let url = match params.url {
         Some(u) if !u.is_empty() => u,
         _ => {
-            let state = ctx.state.lock().unwrap();
+            let state = ctx.state.lock_or_poisoned();
             let portal_url = state.config.target_callsign.clone();
             drop(state);
             if portal_url.is_empty() {
@@ -144,7 +202,7 @@ async fn handle_browse(
     post_body: Option<Vec<u8>>,
 ) -> Response {
     {
-        let state = ctx.state.lock().unwrap();
+        let state = ctx.state.lock_or_poisoned();
         if state.connection_state != ConnectionState::Connected {
             return Redirect::to("/connect").into_response();
         }
@@ -229,7 +287,7 @@ struct PortInfoJson {
 async fn api_agwpe_status_get(
     Extension(ctx): Extension<Arc<AppContext>>,
 ) -> Json<AgwpeStatusResponse> {
-    let state = ctx.state.lock().unwrap();
+    let state = ctx.state.lock_or_poisoned();
     let ports = state
         .available_ports
         .iter()
@@ -253,7 +311,7 @@ async fn api_agwpe_status_post(
     Extension(ctx): Extension<Arc<AppContext>>,
 ) -> Json<AgwpeStatusResponse> {
     let (host, port, callsign) = {
-        let state = ctx.state.lock().unwrap();
+        let state = ctx.state.lock_or_poisoned();
         (
             state.config.agwpe_host.clone(),
             state.config.agwpe_port,
@@ -285,7 +343,7 @@ async fn api_agwpe_status_post(
                 });
             }
 
-            let state = ctx.state.lock().unwrap();
+            let state = ctx.state.lock_or_poisoned();
             let ports = state
                 .available_ports
                 .iter()
@@ -332,18 +390,7 @@ async fn api_connect_handler(
 ) -> Json<ConnectResponse> {
     // Validate target callsign format
     let callsign = req.target_callsign.split('-').next().unwrap_or(&req.target_callsign);
-    let re = match regex::Regex::new(r"^[a-zA-Z0-9]{1,3}[0-9][a-zA-Z0-9]{0,3}[a-zA-Z]$") {
-        Ok(r) => r,
-        Err(_) => {
-            return Json(ConnectResponse {
-                ok: false,
-                state: None,
-                error: Some("Internal validation error".to_string()),
-            });
-        }
-    };
-    
-    if !re.is_match(callsign) {
+    if !CALLSIGN_REGEX.is_match(callsign) {
         return Json(ConnectResponse {
             ok: false,
             state: None,
@@ -357,7 +404,7 @@ async fn api_connect_handler(
         .await
     {
         Ok(()) => {
-            let state = ctx.state.lock().unwrap();
+            let state = ctx.state.lock_or_poisoned();
             let state_str = state.connection_state.to_string();
             drop(state);
 
@@ -405,7 +452,7 @@ struct ConfigResponse {
 async fn api_config_get(
     Extension(ctx): Extension<Arc<AppContext>>,
 ) -> Json<ConfigResponse> {
-    let state = ctx.state.lock().unwrap();
+    let state = ctx.state.lock_or_poisoned();
     Json(ConfigResponse {
         agwpe_host: state.config.agwpe_host.clone(),
         agwpe_port: state.config.agwpe_port,
@@ -447,7 +494,7 @@ async fn api_config_post(
     };
 
     let mut config = {
-        let state = ctx.state.lock().unwrap();
+        let state = ctx.state.lock_or_poisoned();
         state.config.clone()
     };
 
@@ -473,7 +520,7 @@ async fn api_config_post(
     match config.save(&path) {
         Ok(()) => {
             {
-                let mut state = ctx.state.lock().unwrap();
+                let mut state = ctx.state.lock_or_poisoned();
                 state.config = config;
             }
             Json(ConfigSaveResponse {
@@ -492,7 +539,7 @@ async fn events_handler(
     Extension(ctx): Extension<Arc<AppContext>>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let existing_entries = {
-        let state = ctx.state.lock().unwrap();
+        let state = ctx.state.lock_or_poisoned();
         state.get_logs(None)
     };
 

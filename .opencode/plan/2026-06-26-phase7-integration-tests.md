@@ -574,7 +574,7 @@ Use generous timeouts (120s for page loads, 30s for connections).
 ## 5. File Structure
 
 ```
-docker-packet-browser/
+packet-browser/
 ├── server/
 │   └── tests/
 │       ├── config_test.rs          (existing)

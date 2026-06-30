@@ -3,7 +3,7 @@ Version: 0.2.0
 Release: 1%{?dist}
 Summary: Client component for Packet Browser - Web browser over AX.25 packet radio
 License: MIT
-URL: https://github.com/yourusername/docker-packet-browser
+URL: https://github.com/yourusername/packet-browser
 Source0: packet-browser-x86_64-unknown-linux-gnu.tar.gz
 
 # No build dependencies needed - packaging pre-built binaries

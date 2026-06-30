@@ -7,8 +7,8 @@ CRATES=""
 inherit cargo systemd
 
 DESCRIPTION="Client component for Packet Browser - Web browser over AX.25 packet radio"
-HOMEPAGE="https://github.com/yourusername/docker-packet-browser"
-SRC_URI="https://github.com/yourusername/docker-packet-browser/archive/v${PV}.tar.gz -> ${P}.tar.gz"
+HOMEPAGE="https://github.com/yourusername/packet-browser"
+SRC_URI="https://github.com/yourusername/packet-browser/archive/v${PV}.tar.gz -> ${P}.tar.gz"
 
 LICENSE="MIT"
 SLOT="0"
@@ -22,7 +22,7 @@ BDEPEND="
 	virtual/rust
 "
 
-S="${WORKDIR}/docker-packet-browser-${PV}"
+S="${WORKDIR}/packet-browser-${PV}"
 
 src_unpack() {
 	default

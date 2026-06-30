@@ -1,10 +1,8 @@
-use headless_chrome::{Browser, Tab};
-use std::time::Instant;
-use std::io::{BufRead, BufReader};
+use fantoccini::{wd::Capabilities, Client, ClientBuilder};
 use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, Arc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
+use tokio::runtime::Runtime;
 
 #[derive(Error, Debug)]
 pub enum BrowserError {
@@ -19,151 +17,198 @@ pub enum BrowserError {
 }
 
 pub struct BrowserInstance {
-    _browser: Browser,
-    tab: Arc<Tab>,
-    _chrome: Child,
+    client: Option<Client>,
+    _geckodriver: Child,
+    _session_dir: tempfile::TempDir,
+    runtime: Runtime,
 }
-
-const CHROME_ARGS: &[&str] = &[
-    "--headless",
-    "--remote-debugging-port=0",
-    "--disable-dev-shm-usage",
-    "--disable-gpu",
-    "--disable-software-rasterizer",
-    "--no-first-run",
-    "--no-default-browser-check",
-    "--disable-extensions",
-    "--disable-setuid-sandbox",
-    "--no-sandbox",
-    "--disable-crash-reporter",
-    "--disable-breakpad",
-    "--disable-features=VizDisplayCompositor,Vulkan,OnDeviceModel",
-    "--disable-vulkan",
-    "--disable-accelerated-2d-canvas",
-    "--disable-accelerated-video-decode",
-];
 
 impl BrowserInstance {
     pub fn new(callsign: &str) -> Result<Self, BrowserError> {
-        let safe_id: String = callsign.chars()
+        let safe_id: String = callsign
+            .chars()
             .filter(|c| c.is_alphanumeric())
             .collect();
-        let session_dir = format!("/tmp/chrome-{}", safe_id);
 
-        // Create session directory with secure permissions (0o700)
-        if !std::path::Path::new(&session_dir).exists() {
-            if let Err(e) = std::fs::create_dir(&session_dir) {
-                if e.kind() != std::io::ErrorKind::AlreadyExists {
-                    eprintln!("[BROWSER] Warning: could not create session dir: {}", e);
-                }
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Err(e) = std::fs::set_permissions(&session_dir, std::fs::Permissions::from_mode(0o700)) {
-                    eprintln!("[BROWSER] Warning: could not set session dir permissions: {}", e);
-                }
+        // Unguessable per-instance profile root, atomic with 0700 perms.
+        let session_tmp = tempfile::Builder::new()
+            .prefix(&format!("firefox-{}-", safe_id))
+            .tempdir_in("/tmp")
+            .map_err(|e| BrowserError::LaunchFailed(format!("Failed to create session dir: {}", e)))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = std::fs::set_permissions(
+                session_tmp.path(),
+                std::fs::Permissions::from_mode(0o700),
+            ) {
+                eprintln!("[BROWSER] Warning: could not set session dir permissions: {}", e);
             }
         }
 
-        let chromium_path = std::env::var("CHROMIUM_PATH")
-            .unwrap_or_else(|_| "/bin/chromium".to_string());
+        let runtime = Runtime::new()
+            .map_err(|e| BrowserError::LaunchFailed(format!("create tokio runtime: {}", e)))?;
 
-        eprintln!("[BROWSER] Launching Chrome at {}", chromium_path);
+        // Probe for a free port for geckodriver. Brief race window with another
+        // process binding it; acceptable inside an isolated container.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                .map_err(|e| BrowserError::LaunchFailed(format!("port probe: {}", e)))?;
+            let p = listener
+                .local_addr()
+                .map_err(|e| BrowserError::LaunchFailed(e.to_string()))?
+                .port();
+            drop(listener);
+            p
+        };
 
-        let mut child = Command::new(&chromium_path)
-            .args(CHROME_ARGS)
-            .arg(format!("--user-data-dir={}", session_dir))
-            .env("BREAKPAD_DUMP_LOCATION", &session_dir)
-            .env("HOME", "/tmp")
+        let geckodriver_path = std::env::var("GECKODRIVER_PATH")
+            .unwrap_or_else(|_| "/bin/geckodriver".to_string());
+        let firefox_path = std::env::var("FIREFOX_PATH")
+            .unwrap_or_else(|_| "/bin/firefox".to_string());
+
+        eprintln!("[BROWSER] Launching geckodriver at {} on port {}", geckodriver_path, port);
+
+        let geckodriver = Command::new(&geckodriver_path)
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--binary")
+            .arg(&firefox_path)
+            .arg("--profile-root")
+            .arg(session_tmp.path())
+            // Confine geckodriver/Firefox file accesses to the temp dir.
+            .env("HOME", session_tmp.path())
+            .env("MOZ_HEADLESS", "1")
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::inherit())
             .spawn()
-            .map_err(|e| BrowserError::LaunchFailed(format!("Failed to spawn {}: {}", chromium_path, e)))?;
+            .map_err(|e| BrowserError::LaunchFailed(format!("spawn geckodriver: {}", e)))?;
 
-        let stderr = child.stderr.take()
-            .ok_or_else(|| BrowserError::LaunchFailed("Could not capture Chrome stderr".to_string()))?;
-
-        let (tx, rx) = mpsc::channel::<String>();
-
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            let mut url_sent = false;
-            for line in reader.lines().flatten() {
-                eprintln!("[CHROME] {}", line);
-                if !url_sent {
-                    if let Some(url) = line.strip_prefix("DevTools listening on ") {
-                        let _ = tx.send(url.trim().to_string());
-                        url_sent = true;
-                    }
-                }
-            }
-            eprintln!("[CHROME] stderr closed (Chrome exited or crashed)");
-        });
-
-        let ws_url = match rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(url) => url,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                let _ = child.kill();
-                return Err(BrowserError::LaunchFailed(
-                    "Chrome did not output DevTools URL within 30 seconds".to_string()
-                ));
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(BrowserError::LaunchFailed(
-                    "Chrome exited before outputting DevTools URL".to_string()
-                ));
-            }
-        };
-
-        eprintln!("[BROWSER] Chrome ready, connecting to {}", ws_url);
-
-        let browser = Browser::connect_with_timeout(ws_url, Duration::from_secs(120))
-            .map_err(|e| BrowserError::LaunchFailed(e.to_string()))?;
-
-        eprintln!("[BROWSER] Connected to Chrome DevTools");
-
-        eprintln!("[BROWSER] Waiting for Chrome renderer to stabilize...");
-        let deadline = Instant::now() + Duration::from_secs(120);
-        let tab = loop {
-            if let Some(tab) = browser.get_tabs().lock().unwrap().first().cloned() {
-                break tab;
-            }
+        // Wait for the WebDriver port to accept connections.
+        let webdriver_url = format!("http://127.0.0.1:{}", port);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_err() {
             if Instant::now() >= deadline {
+                let mut child = geckodriver;
                 let _ = child.kill();
                 return Err(BrowserError::LaunchFailed(
-                    "Chrome renderer did not stabilize within 120 seconds".to_string()
+                    "geckodriver did not start listening within 30s".to_string(),
                 ));
             }
-            std::thread::sleep(Duration::from_millis(500));
-        };
+            std::thread::sleep(Duration::from_millis(100));
+        }
 
-        eprintln!("[BROWSER] Chrome renderer ready");
-        tab.set_default_timeout(Duration::from_secs(15));
+        eprintln!("[BROWSER] Geckodriver ready, creating session");
 
-        Ok(Self { _browser: browser, tab, _chrome: child })
+        let mut caps: Capabilities = serde_json::Map::new();
+        caps.insert(
+            "moz:firefoxOptions".to_string(),
+            serde_json::json!({
+                "binary": firefox_path,
+                "args": ["-headless"],
+                "prefs": {
+                    "browser.cache.disk.enable": false,
+                    "browser.cache.memory.enable": true,
+                    "media.autoplay.default": 5,
+                    // Block image network loads; the sanitizer drops <img> anyway.
+                    "permissions.default.image": 2,
+                    // Disable telemetry, updates, marketing pings.
+                    "datareporting.healthreport.uploadEnabled": false,
+                    "toolkit.telemetry.enabled": false,
+                    "app.update.enabled": false,
+                    "browser.shell.checkDefaultBrowser": false,
+                    "browser.startup.homepage_override.mstone": "ignore",
+                    "browser.contentblocking.category": "strict",
+                    "network.cookie.cookieBehavior": 5,
+                    // Surface stub PDF viewer rather than launching anything.
+                    "pdfjs.disabled": true
+                }
+            }),
+        );
+
+        let client = runtime
+            .block_on(async {
+                ClientBuilder::native()
+                    .capabilities(caps)
+                    .connect(&webdriver_url)
+                    .await
+            })
+            .map_err(|e| BrowserError::LaunchFailed(format!("connect WebDriver: {}", e)))?;
+
+        let timeouts = fantoccini::wd::TimeoutConfiguration::new(
+            Some(Duration::from_secs(15)),
+            Some(Duration::from_secs(15)),
+            Some(Duration::from_secs(15)),
+        );
+        runtime
+            .block_on(async { client.update_timeouts(timeouts).await })
+            .map_err(|e| BrowserError::LaunchFailed(format!("set timeouts: {}", e)))?;
+
+        eprintln!("[BROWSER] Session ready");
+
+        Ok(Self {
+            client: Some(client),
+            _geckodriver: geckodriver,
+            _session_dir: session_tmp,
+            runtime,
+        })
     }
 
     pub fn fetch_page(&self, url: &str) -> Result<String, BrowserError> {
-        eprintln!("[BROWSER] Fetching: {}", url);
+        let client = self.client.as_ref().ok_or(BrowserError::BrowserCrashed)?;
+        self.runtime.block_on(async {
+            eprintln!("[BROWSER] Fetching: {}", url);
 
-        self.tab.navigate_to(url)
-            .map_err(|e| BrowserError::NavigationFailed(e.to_string()))?;
+            client.goto(url).await.map_err(|e| {
+                let s = e.to_string();
+                if s.contains("session deleted") || s.contains("invalid session id") {
+                    BrowserError::BrowserCrashed
+                } else {
+                    BrowserError::NavigationFailed(s)
+                }
+            })?;
 
-        if let Err(e) = self.tab.wait_until_navigated() {
-            eprintln!("[BROWSER] Navigation timeout ({}), attempting extraction anyway", e);
-            std::thread::sleep(Duration::from_secs(3));
-        }
+            // JS_SCRUB_HTML is an async IIFE returning a Promise. WebDriver's
+            // synchronous execute() can't await it directly, so wrap with the
+            // async-script callback convention.
+            let wrapped = format!(
+                "const cb = arguments[arguments.length - 1]; ({}).then(cb).catch(e => cb('__SCRUB_ERROR__' + (e && e.message ? e.message : e)));",
+                JS_SCRUB_HTML
+            );
+            let value = client
+                .execute_async(&wrapped, vec![])
+                .await
+                .map_err(|e| {
+                    let s = e.to_string();
+                    if s.contains("session deleted") || s.contains("invalid session id") {
+                        BrowserError::BrowserCrashed
+                    } else {
+                        BrowserError::ExtractionFailed(s)
+                    }
+                })?;
 
-        eprintln!("[BROWSER] Page loaded: {}", url);
-        extract_html(&self.tab)
+            let html = value
+                .as_str()
+                .ok_or_else(|| BrowserError::ExtractionFailed("No HTML returned".to_string()))?;
+
+            if let Some(rest) = html.strip_prefix("__SCRUB_ERROR__") {
+                return Err(BrowserError::ExtractionFailed(rest.to_string()));
+            }
+
+            Ok(html.to_string())
+        })
     }
 }
 
 impl Drop for BrowserInstance {
     fn drop(&mut self) {
-        eprintln!("[BROWSER] Shutting down Chrome");
-        let _ = self._chrome.kill();
+        eprintln!("[BROWSER] Shutting down Firefox");
+        // Close the WebDriver session politely if we still have a Client.
+        // close() consumes the Client, so take it out of self.
+        if let Some(client) = self.client.take() {
+            let _ = self.runtime.block_on(async move { client.close().await });
+        }
+        let _ = self._geckodriver.kill();
     }
 }
 
@@ -174,7 +219,7 @@ const JS_SCRUB_HTML: &str = r#"
 
     const stylesheets = Array.from(document.querySelectorAll('link[rel="stylesheet"]'));
     const cssTexts = [];
-    
+
     for (const link of stylesheets) {
         try {
             const response = await fetch(link.href);
@@ -185,24 +230,24 @@ const JS_SCRUB_HTML: &str = r#"
         } catch (e) {
         }
     }
-    
+
     if (cssTexts.length > 0) {
         const style = document.createElement('style');
         style.textContent = cssTexts.join('\n');
         document.head.appendChild(style);
     }
-    
+
     const heavySelectors = ['script', 'iframe', 'video', 'audio', 'canvas', 'svg', 'object', 'embed', 'noscript', 'template'];
     for (const sel of heavySelectors) {
         document.querySelectorAll(sel).forEach(el => el.remove());
     }
-    
+
     document.querySelectorAll('img').forEach(img => {
         const alt = img.alt || img.src.split('/').pop() || 'image';
         const text = document.createTextNode(`[image: ${alt}]`);
         img.parentNode.replaceChild(text, img);
     });
-    
+
     document.querySelectorAll('*').forEach(el => {
         Array.from(el.attributes).forEach(attr => {
             if (attr.name.startsWith('on')) {
@@ -210,9 +255,9 @@ const JS_SCRUB_HTML: &str = r#"
             }
         });
     });
-    
+
     let html = document.documentElement.outerHTML;
-    
+
     if (html.length > MAX_SIZE) {
         document.querySelectorAll('style').forEach(el => el.remove());
         document.querySelectorAll('*').forEach(el => {
@@ -225,16 +270,7 @@ const JS_SCRUB_HTML: &str = r#"
         document.head.appendChild(style);
         html = document.documentElement.outerHTML;
     }
-    
+
     return html;
 })()
 "#;
-
-fn extract_html(tab: &Arc<Tab>) -> Result<String, BrowserError> {
-    let result = tab.evaluate(JS_SCRUB_HTML, false)
-        .map_err(|e| BrowserError::ExtractionFailed(e.to_string()))?;
-
-    result.value
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .ok_or_else(|| BrowserError::ExtractionFailed("No HTML returned".to_string()))
-}

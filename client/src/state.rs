@@ -1,9 +1,23 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::config::FileConfig;
+
+/// Convenience trait that turns mutex-poison panics into "carry on with the
+/// previous contents." For a single-user local proxy, blocking forever after
+/// any panic anywhere is a worse failure mode than continuing with possibly
+/// stale state.
+pub trait LockExt<'a, T> {
+    fn lock_or_poisoned(&'a self) -> MutexGuard<'a, T>;
+}
+
+impl<'a, T> LockExt<'a, T> for Mutex<T> {
+    fn lock_or_poisoned(&'a self) -> MutexGuard<'a, T> {
+        self.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConnectionState {

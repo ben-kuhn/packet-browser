@@ -11,11 +11,6 @@ fn test_config_defaults() {
         "BLOCKLIST_URLS",
         "BLOCKLIST_REFRESH_HOURS",
         "BLOCKLIST_ENABLED",
-        "LOG_ROTATE_ENABLED",
-        "LOG_RETAIN_DAYS",
-        "SYSLOG_ENABLED",
-        "SYSLOG_HOST",
-        "SYSLOG_PORT",
     ];
 
     for var in &env_vars {
@@ -31,6 +26,7 @@ fn test_config_defaults() {
     assert_eq!(
         config.blocked_ranges,
         vec![
+            "0.0.0.0/8",
             "127.0.0.0/8",
             "10.0.0.0/8",
             "172.16.0.0/12",
@@ -41,11 +37,6 @@ fn test_config_defaults() {
     assert!(config.blocklist_urls.is_empty());
     assert_eq!(config.blocklist_refresh_hours, 24);
     assert!(config.blocklist_enabled);
-    assert!(config.log_rotate_enabled);
-    assert_eq!(config.log_retain_days, 30);
-    assert!(!config.syslog_enabled);
-    assert_eq!(config.syslog_host, None);
-    assert_eq!(config.syslog_port, 514);
 }
 
 #[test]
@@ -59,11 +50,6 @@ fn test_config_env_override() {
         "BLOCKLIST_URLS",
         "BLOCKLIST_REFRESH_HOURS",
         "BLOCKLIST_ENABLED",
-        "LOG_ROTATE_ENABLED",
-        "LOG_RETAIN_DAYS",
-        "SYSLOG_ENABLED",
-        "SYSLOG_HOST",
-        "SYSLOG_PORT",
     ];
 
     for var in &env_vars {
@@ -78,11 +64,6 @@ fn test_config_env_override() {
     std::env::set_var("BLOCKLIST_URLS", "http://example.com/list1, http://example.com/list2");
     std::env::set_var("BLOCKLIST_REFRESH_HOURS", "48");
     std::env::set_var("BLOCKLIST_ENABLED", "false");
-    std::env::set_var("LOG_ROTATE_ENABLED", "false");
-    std::env::set_var("LOG_RETAIN_DAYS", "60");
-    std::env::set_var("SYSLOG_ENABLED", "true");
-    std::env::set_var("SYSLOG_HOST", "localhost");
-    std::env::set_var("SYSLOG_PORT", "1514");
 
     let config = Config::from_env();
 
@@ -100,11 +81,6 @@ fn test_config_env_override() {
     );
     assert_eq!(config.blocklist_refresh_hours, 48);
     assert!(!config.blocklist_enabled);
-    assert!(!config.log_rotate_enabled);
-    assert_eq!(config.log_retain_days, 60);
-    assert!(config.syslog_enabled);
-    assert_eq!(config.syslog_host, Some("localhost".to_string()));
-    assert_eq!(config.syslog_port, 1514);
 
     for var in &env_vars {
         std::env::remove_var(var);
@@ -154,23 +130,19 @@ fn test_config_bool_parsing() {
 fn test_config_invalid_env_values_use_defaults() {
     std::env::remove_var("LISTEN_PORT");
     std::env::remove_var("IDLE_TIMEOUT_MINUTES");
-    std::env::remove_var("SYSLOG_PORT");
     std::env::remove_var("BROTLI_QUALITY");
 
     std::env::set_var("LISTEN_PORT", "not_a_number");
     std::env::set_var("IDLE_TIMEOUT_MINUTES", "invalid");
-    std::env::set_var("SYSLOG_PORT", "not_a_port");
     std::env::set_var("BROTLI_QUALITY", "not_a_number");
 
     let config = Config::from_env();
 
     assert_eq!(config.listen_port, 63004);
     assert_eq!(config.idle_timeout_minutes, 10);
-    assert_eq!(config.syslog_port, 514);
     assert_eq!(config.brotli_quality, 11);
 
     std::env::remove_var("LISTEN_PORT");
     std::env::remove_var("IDLE_TIMEOUT_MINUTES");
-    std::env::remove_var("SYSLOG_PORT");
     std::env::remove_var("BROTLI_QUALITY");
 }

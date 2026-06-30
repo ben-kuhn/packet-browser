@@ -1,6 +1,6 @@
 services:
   packet-browser:
-    image: ghcr.io/ben-kuhn/docker-packet-browser:latest
+    image: ghcr.io/ben-kuhn/packet-browser:latest
 
     ports:
       # Bind to loopback only by default (security)
@@ -21,28 +21,33 @@ services:
 
       # SSRF prevention - blocked IP ranges
       # Remove ranges to allow access to local services
-      - BLOCKED_RANGES=127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16
+      - BLOCKED_RANGES=0.0.0.0/8,127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16
 
       # Blocklist settings
       - BLOCKLIST_ENABLED=true
       - BLOCKLIST_REFRESH_HOURS=24
       # - BLOCKLIST_URLS=https://example.com/blocklist.txt
 
-      # Logging
-      - LOG_ROTATE_ENABLED=true
-      - LOG_RETAIN_DAYS=30
-      - SYSLOG_ENABLED=false
-      # - SYSLOG_HOST=syslog.example.com
-      # - SYSLOG_PORT=514
-
     # Security hardening
     read_only: true
     tmpfs:
-      - /tmp:size=128M,mode=1777
-      - /dev/shm:size=64M,mode=1777
+      # Firefox needs more headroom than headless Chromium did — profile,
+      # caches, and the WebDriver session dir all live here.
+      - /tmp:size=512M,mode=1777
+      - /dev/shm:size=128M,mode=1777
 
     cap_drop:
       - ALL
+
+    # Firefox's content-process sandbox needs unshare(CLONE_NEWUSER), which
+    # Docker's default seccomp profile denies. Relaxing seccomp is a wider
+    # syscall surface for the container, but it's the price of getting an
+    # actual renderer sandbox (vs Chromium with --no-sandbox).
+    # TODO: ship a custom seccomp profile that allows just the namespace
+    # syscalls Firefox needs.
+    security_opt:
+      - seccomp=unconfined
+      - no-new-privileges:true
 
     # DNS filtering - uses OpenDNS Family Shield by default
     # These servers filter adult content, malware, and phishing sites

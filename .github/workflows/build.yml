@@ -259,7 +259,7 @@ jobs:
         if: github.event_name != 'pull_request'
         run: |
           echo "${{ steps.meta.outputs.tags }}" | while IFS= read -r tag; do
-            docker tag docker-packet-browser:latest "$tag"
+            docker tag packet-browser:latest "$tag"
             docker push "$tag"
           done
 

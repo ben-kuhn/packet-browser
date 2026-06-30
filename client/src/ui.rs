@@ -1,3 +1,31 @@
+/// Escape a string for safe insertion into HTML element text or attribute values
+/// (double-quoted). Covers the OWASP "HTML body" + "HTML attribute" contexts.
+pub fn h(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Make a JSON string safe to inline inside a `<script>` block by re-encoding
+/// the few characters that could close the script tag or break JS parsing.
+/// Each replacement is still valid JSON, so the runtime value is unchanged.
+fn json_for_script(s: &str) -> String {
+    s.replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
 pub const CSS: &str = r#"
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
@@ -365,11 +393,11 @@ pub fn connect_page(
 </body>
 </html>"#,
         css = CSS,
-        state = connection_state,
-        state_class = connection_state_class,
-        my_call = my_callsign,
-        target_call = target_callsign,
-        ports_json = ports_json,
+        state = h(connection_state),
+        state_class = h(connection_state_class),
+        my_call = h(my_callsign),
+        target_call = h(target_callsign),
+        ports_json = json_for_script(ports_json),
     )
 }
 
@@ -526,11 +554,11 @@ pub fn configuration_page(
 </body>
 </html>"#,
         css = CSS,
-        host = agwpe_host,
+        host = h(agwpe_host),
         port = agwpe_port,
-        my_callsign = my_callsign,
-        target_callsign = target_callsign,
-        bpq_command = bpq_command,
+        my_callsign = h(my_callsign),
+        target_callsign = h(target_callsign),
+        bpq_command = h(bpq_command),
         skip_checked = if skip_bpq_app { "checked" } else { "" },
     )
 }
@@ -559,24 +587,20 @@ pub fn error_page(message: &str) -> String {
 </body>
 </html>"#,
         css = CSS,
-        message = message,
+        message = h(message),
     )
 }
 
 pub fn browse_page(html_content: &str, url: &str) -> String {
-    let escaped_url = url
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;");
-    
+    let escaped_url = h(url);
+
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'">
     <title>Packet Browser</title>
     <style>{css}
     .browse-header {{

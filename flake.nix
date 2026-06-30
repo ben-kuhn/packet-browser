@@ -32,14 +32,15 @@
         };
 
         dockerImage = pkgs.dockerTools.buildImage {
-          name = "docker-packet-browser";
+          name = "packet-browser";
           tag = "latest";
 
           copyToRoot = pkgs.buildEnv {
             name = "image-root";
             paths = [
               packet-browser
-              pkgs.chromium
+              pkgs.firefox-esr-unwrapped
+              pkgs.geckodriver
               pkgs.dumb-init
               pkgs.logrotate
               pkgs.cacert
@@ -56,6 +57,10 @@
             Env = [
               "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
               "FONTCONFIG_FILE=${pkgs.fontconfig.out}/etc/fonts/fonts.conf"
+              "FIREFOX_PATH=/bin/firefox"
+              "GECKODRIVER_PATH=/bin/geckodriver"
+              # Firefox writes its profile + caches here; tempdirs land under /tmp.
+              "TMPDIR=/tmp"
             ];
             User = "1000:1000";
           };
@@ -80,7 +85,8 @@
             rustToolchain
             pkgs.pkg-config
             pkgs.openssl
-            pkgs.chromium
+            pkgs.firefox-esr-unwrapped
+            pkgs.geckodriver
             pkgs.direwolf
             pkgs.pipewire
             pkgs.python3

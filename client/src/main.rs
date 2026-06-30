@@ -6,7 +6,7 @@ mod state;
 mod ui;
 
 use config::CliArgs;
-use proxy::AppContext;
+use proxy::{allowed_origins_for, AppContext};
 use state::create_shared_state;
 use std::sync::Arc;
 use thiserror::Error;
@@ -69,6 +69,7 @@ async fn main() -> Result<(), ClientError> {
         state: shared_state,
         agwpe: agwpe_manager,
         log_tx,
+        allowed_origins: allowed_origins_for(&listen_addr),
     });
 
     let app = proxy::create_router(ctx);
