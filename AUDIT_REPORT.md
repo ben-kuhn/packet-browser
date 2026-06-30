@@ -217,11 +217,26 @@ These need real design work and are deliberately not fixed in this pass.
    refresher. A cleaner design is to mount a directory and have the server
    write its own resolver file, or block at a different layer.
 
-5. **Dependency freshness.** `reqwest 0.11`, `axum 0.7`, `openssl 0.10.81`.
-   None have known advisories against the pinned versions to my knowledge,
-   but running `cargo audit` regularly and tracking the major-version bumps
-   (reqwest 0.12, axum 0.8) is a deferred task that belongs in its own PR
-   because of the API surface changes.
+5. **Dependency freshness.** Bumped: `reqwest 0.11 → 0.12.28`, `axum 0.7 → 0.8.9`,
+   `lol_html 1 → 2.9`, `brotli 3 → 8.0.4`. `fantoccini` stays at 0.22 (latest
+   release). `openssl 0.10.81` left alone (no known advisories).
+
+   `cargo audit` against the new tree surfaces two advisories on transitive
+   deps. Both have unreachable code paths in our app but should be tracked:
+
+   - **RUSTSEC-2026-0009 (time 0.3.36, medium DoS via stack exhaustion).**
+     The `time = 0.3.36` pin is forced by `cookie 0.16` and `0.18` (both
+     pulled by fantoccini), which were written against the old single-arg
+     `Parsable::parse` signature. The vulnerable code path is `time`'s
+     date-parsing during cookie expiration parsing. We never enable
+     reqwest's cookie store (used only for blocklist fetches) and never
+     call fantoccini cookie APIs (WebDriver responses from geckodriver
+     don't carry Set-Cookie). Fix path: a `[patch.crates-io]` override
+     of `cookie` to a fork that adds the second `None` argument, or
+     wait for upstream cookie maintainers to publish a compatible release.
+   - **RUSTSEC-2026-0190 (anyhow 1.0.102, soundness warning).** Reachable
+     only via `wasm-metadata` / `wit-*` crates, which are part of
+     `brotli`'s WASM tooling — not in the Linux server build target.
 
 6. **Mutex poison panic-on-panic.** Now degrades to "continue with previous
    contents" rather than blocking the proxy. Acceptable for a single-user
