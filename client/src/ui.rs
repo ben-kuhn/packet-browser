@@ -165,6 +165,7 @@ pub fn connect_page(
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'">
     <title>Packet Browser - Connect</title>
     <style>{css}</style>
 </head>
@@ -202,6 +203,16 @@ pub fn connect_page(
             <button id="btn-connect" class="primary" onclick="ax25Connect()" disabled>AX.25 Connect</button>
             <button id="btn-disconnect" class="danger" onclick="ax25Disconnect()" disabled>Disconnect</button>
         </div>
+    </div>
+
+    <div class="card" id="browse-card" style="display:none">
+        <h2>Browse the Web</h2>
+        <form action="/browse" method="GET">
+            <div class="browse-bar">
+                <input type="text" name="url" placeholder="https://example.com" autocomplete="off" required>
+                <button type="submit" class="primary">Go</button>
+            </div>
+        </form>
     </div>
 
     <div id="msg-area"></div>
@@ -253,6 +264,10 @@ pub fn connect_page(
             btnAgwpe.disabled = (state === 'AGWPE Connected' || state === 'Connecting' || state === 'Connected');
             btnConnect.disabled = (state !== 'AGWPE Connected');
             btnDisconnect.disabled = (state !== 'Connected' && state !== 'Connecting');
+
+            // Reveal the Browse card only after the AX.25 link is up.
+            const browseCard = document.getElementById('browse-card');
+            if (browseCard) browseCard.style.display = (state === 'Connected') ? 'block' : 'none';
         }}
 
         function showMsg(text, isError) {{
@@ -415,6 +430,7 @@ pub fn configuration_page(
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'">
     <title>Packet Browser - Configuration</title>
     <style>{css}</style>
 </head>

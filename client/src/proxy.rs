@@ -30,7 +30,6 @@ pub struct AppContext {
     pub state: SharedState,
     pub agwpe: AgwpeManager,
     pub log_tx: broadcast::Sender<DebugLogEntry>,
-    pub allowed_origins: Vec<String>,
 }
 
 pub fn create_router(ctx: Arc<AppContext>) -> Router {
@@ -47,43 +46,48 @@ pub fn create_router(ctx: Arc<AppContext>) -> Router {
         .route("/api/config", get(api_config_get))
         .route("/api/config", post(api_config_post))
         .route("/events", get(events_handler))
-        .layer(middleware::from_fn_with_state(
-            ctx.clone(),
-            csrf_guard,
-        ))
+        .layer(middleware::from_fn(csrf_guard))
         .layer(Extension(ctx))
 }
 
-// Reject state-changing requests whose Origin (or Referer fallback) is not the
-// listener's own origin. Required because a page fetched via /browse is served
-// from the same origin as the API, so any visited site could otherwise script
-// /api/config and friends.
+// Reject state-changing requests whose Origin doesn't match the request's
+// own Host header. This is a textbook same-origin check that works the same
+// whether the client is bound to 127.0.0.1 or 0.0.0.0: in any deployment, a
+// legitimate browser POST to our UI carries Origin == "<scheme>://<Host>".
+// A cross-origin attacker (evil.com -> 127.0.0.1:8080/api/config) sends
+// Origin: http://evil.com and Host: 127.0.0.1:8080 — mismatch, rejected.
+//
+// We deliberately do not fall back to Referer: modern browsers always send
+// Origin on cross-origin POSTs, and Referer is much easier for an attacker
+// to suppress (Referrer-Policy, rel=noreferrer, certain redirect chains),
+// so a Referer-only fallback re-opens the bypass we're closing.
+//
+// Caveat: DNS rebinding (a hostile site whose DNS flips to the user's IP
+// mid-session) can produce Origin == Host both pointing at the attacker's
+// domain — the request goes through. Mitigating that requires a Host
+// allow-list, which puts us back in the configuration weeds. Documented
+// in AUDIT_REPORT.md.
 async fn csrf_guard(
-    axum::extract::State(ctx): axum::extract::State<Arc<AppContext>>,
     req: HttpRequest<axum::body::Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
     if req.method() == Method::POST {
         let headers = req.headers();
         let origin = headers.get("origin").and_then(|v| v.to_str().ok());
-        let referer = headers.get("referer").and_then(|v| v.to_str().ok());
+        let host = headers.get("host").and_then(|v| v.to_str().ok());
 
-        let ok = match (origin, referer) {
-            (Some(o), _) => ctx.allowed_origins.iter().any(|a| a == o),
-            (None, Some(r)) => ctx
-                .allowed_origins
-                .iter()
-                .any(|a| r == a || r.starts_with(&format!("{}/", a))),
-            (None, None) => false,
+        let ok = match (origin, host) {
+            (Some(o), Some(h)) => origin_matches_host(o, h),
+            _ => false,
         };
 
         if !ok {
             tracing::warn!(
-                "CSRF guard rejected {} {} (origin={:?}, referer={:?})",
+                "CSRF guard rejected {} {} (origin={:?}, host={:?})",
                 req.method(),
                 req.uri().path(),
                 origin,
-                referer
+                host
             );
             return Err(StatusCode::FORBIDDEN);
         }
@@ -91,14 +95,16 @@ async fn csrf_guard(
     Ok(next.run(req).await)
 }
 
-pub fn allowed_origins_for(listen_addr: &str) -> Vec<String> {
-    // Accept the literal listen address plus an http://localhost:<port> alias.
-    let port = listen_addr.rsplit(':').next().unwrap_or("");
-    let mut v = vec![format!("http://{}", listen_addr)];
-    if !port.is_empty() {
-        v.push(format!("http://localhost:{}", port));
+fn origin_matches_host(origin: &str, host: &str) -> bool {
+    // Strip "http://" / "https://" then compare the authority (host:port)
+    // against the Host header verbatim.
+    let authority = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"));
+    match authority {
+        Some(a) => a == host,
+        None => false,
     }
-    v
 }
 
 async fn root_handler() -> impl IntoResponse {

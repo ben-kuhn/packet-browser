@@ -144,12 +144,26 @@ Most were addressed; a small number are architectural and called out below.
   4 GiB per frame. Capped at 64 KiB; response and handshake-text accumulation
   also capped.
 - Client served `/api/*` POSTs with no CSRF protection. Any visited page
-  could rewrite the saved config. Added an Origin/Referer guard middleware.
+  could rewrite the saved config. Added a textbook same-origin guard:
+  every POST must carry an `Origin` header whose authority matches the
+  request's `Host` header. This works the same whether the client is
+  bound to 127.0.0.1 or 0.0.0.0 (the early Origin-allowlist version
+  bricked LAN deployments). The Referer fallback was dropped — modern
+  browsers always send `Origin` on cross-origin POSTs, and `Referer` is
+  easier for an attacker to suppress, so a Referer-only fallback would
+  re-open the bypass we're closing.
+- DNS rebinding (a hostile page whose DNS flips to your IP mid-session,
+  producing matching attacker-controlled Origin and Host) is not blocked
+  by the same-origin check. Mitigating it would require a Host allow-list,
+  which puts us back in the configuration weeds. Documented and accepted
+  for this single-user local-proxy threat model.
 - `ui.rs` interpolated `my_callsign`, `target_callsign`, error messages, and
   the AGWPE port-info JSON directly into HTML/script contexts. Added `h()`
   HTML-escape and `json_for_script()` JSON-escape helpers and routed every
-  user-influenced value through them. Also added a strict CSP `<meta>` to
-  the browse-page wrapper.
+  user-influenced value through them. Added a strict CSP `<meta>` to the
+  browse-page wrapper (no scripts allowed in returned page) and a more
+  permissive CSP on `connect_page` and `configuration_page` as
+  defence-in-depth against XSS regressions in our own UI.
 - `read_line` was bounded after the read, not during. Replaced with a
   `Take<&mut BufReader>` + `read_until` helper so an attacker cannot stream
   multi-GB lines past the size check.
@@ -182,6 +196,18 @@ Most were addressed; a small number are architectural and called out below.
   test that wouldn't compile (`FileConfig` was missing `skip_bpq_app`),
   removed dead `log_rotate_*` and `syslog_*` config fields that were read
   from env but never used.
+
+  UX (security-relevant):
+  - Client printed its listening URL via `tracing::info!`, which is silent
+    at the default WARN level. Users had no idea what port to open. Moved
+    to a `println!` startup banner that always fires and shows the actual
+    bound address (so `--listen-addr 127.0.0.1:0` resolves to a real port).
+  - Same banner now warns when bound to a non-loopback address: explains
+    that anyone on the network can use the proxy and change its config,
+    and offers the loopback flag to restrict it.
+  - The connect page had no affordance to actually browse anywhere — the
+    only path to `/browse` was to type the query string by hand. Added a
+    URL input + Go button that appears when the AX.25 link is up.
 
 ### Open, architectural
 
