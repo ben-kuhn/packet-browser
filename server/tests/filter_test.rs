@@ -1,4 +1,5 @@
-use packet_browser_server::filter::{validate_url, UrlError};
+use packet_browser_server::filter::{resolve_and_pin, validate_url, UrlError};
+use std::net::IpAddr;
 
 #[test]
 fn test_blocked_protocols() {
@@ -73,4 +74,40 @@ fn test_zero_address_blocked_by_default_range() {
     // covered or the blocklist's 0.0.0.0 sinkhole entries become an SSRF vector.
     let blocked = vec!["0.0.0.0/8".to_string()];
     assert!(validate_url("http://0.0.0.0/", &blocked).is_err());
+}
+
+#[test]
+fn resolve_and_pin_returns_ip_for_literal() {
+    let ip = resolve_and_pin("8.8.8.8", 443, &[]).unwrap();
+    assert_eq!(ip, "8.8.8.8".parse::<IpAddr>().unwrap());
+}
+
+#[test]
+fn resolve_and_pin_rejects_blocked_ip_literal() {
+    let blocked = vec!["127.0.0.0/8".to_string()];
+    assert!(resolve_and_pin("127.0.0.1", 80, &blocked).is_err());
+}
+
+#[test]
+fn resolve_and_pin_rejects_localhost_by_name() {
+    // The name-blocklist is orthogonal to blocked_ranges: "localhost" is
+    // rejected without even doing DNS.
+    assert!(resolve_and_pin("localhost", 80, &[]).is_err());
+}
+
+#[test]
+fn resolve_and_pin_handles_bracketed_v6() {
+    let ip = resolve_and_pin("[::1]", 80, &[]);
+    // ::1 is loopback, universally blocked in resolve_and_pin's v6 check.
+    assert!(matches!(ip, Err(UrlError::BlockedHost(_))));
+
+    let ip = resolve_and_pin("[2606:4700::1]", 80, &[]).unwrap();
+    assert_eq!(ip, "2606:4700::1".parse::<IpAddr>().unwrap());
+}
+
+#[test]
+fn resolve_and_pin_rejects_ipv4_mapped_v6_loopback() {
+    let blocked = vec!["127.0.0.0/8".to_string()];
+    let result = resolve_and_pin("[::ffff:127.0.0.1]", 80, &blocked);
+    assert!(matches!(result, Err(UrlError::BlockedHost(_))));
 }

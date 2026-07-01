@@ -20,6 +20,55 @@ const BLOCKED_HOSTNAMES: &[&str] = &[
     "broadcasthost",
 ];
 
+/// Validate a hostname + port and return a **single pinned IP** to connect to.
+/// The proxy uses this: it resolves DNS exactly once (here), checks the IP
+/// against blocked ranges, and then opens the outbound connection to that
+/// same IP — closing the classic DNS-rebinding TOCTOU where the filter and
+/// the fetch could each resolve to different addresses.
+pub fn resolve_and_pin(
+    host: &str,
+    port: u16,
+    blocked_ranges: &[String],
+) -> Result<IpAddr, UrlError> {
+    let host_lc = host.to_ascii_lowercase();
+    if BLOCKED_HOSTNAMES.iter().any(|h| *h == host_lc) {
+        return Err(UrlError::BlockedHost(host_lc));
+    }
+
+    // If the caller handed us an IP literal, just range-check it.
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if ip_is_blocked(&ip, blocked_ranges) {
+            return Err(UrlError::BlockedHost(ip.to_string()));
+        }
+        return Ok(ip);
+    }
+    // Ditto for bracketed IPv6.
+    if let Some(inner) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        if let Ok(ip) = inner.parse::<IpAddr>() {
+            if ip_is_blocked(&ip, blocked_ranges) {
+                return Err(UrlError::BlockedHost(ip.to_string()));
+            }
+            return Ok(ip);
+        }
+    }
+
+    // Hostname: resolve once, pick the first IP that's not in a blocked range.
+    // If the very first answer is blocked, treat the whole name as blocked --
+    // safer than iterating and picking a later "clean" answer, which would let
+    // an attacker hide a blocked target behind a mix of clean names.
+    let mut addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|_| UrlError::InvalidUrl)?;
+    let first = addrs.next().ok_or(UrlError::InvalidUrl)?.ip();
+    if ip_is_blocked(&first, blocked_ranges) {
+        return Err(UrlError::BlockedHost(format!(
+            "{} (resolves to {})",
+            host, first
+        )));
+    }
+    Ok(first)
+}
+
 pub fn validate_url(url: &str, blocked_ranges: &[String]) -> Result<(), UrlError> {
     let parsed = Url::parse(url).map_err(|_| UrlError::InvalidUrl)?;
 

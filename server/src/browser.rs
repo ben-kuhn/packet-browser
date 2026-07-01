@@ -1,8 +1,18 @@
 use fantoccini::{wd::Capabilities, Client, ClientBuilder};
 use std::process::{Child, Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::runtime::Runtime;
+
+/// Port of the in-process filtering proxy (see `crate::proxy`). Every Firefox
+/// instance is directed to route through here; setting this must happen once,
+/// before any [`BrowserInstance::new`] call.
+static PROXY_PORT: OnceLock<u16> = OnceLock::new();
+
+pub fn set_proxy_port(port: u16) {
+    let _ = PROXY_PORT.set(port);
+}
 
 #[derive(Error, Debug)]
 pub enum BrowserError {
@@ -100,6 +110,15 @@ impl BrowserInstance {
 
         eprintln!("[BROWSER] Geckodriver ready, creating session");
 
+        // Point Firefox at the in-process filtering proxy for every request
+        // it issues. Fatal if the proxy hasn't been started, because we cannot
+        // enforce the SSRF policy on subresource loads otherwise.
+        let proxy_port = *PROXY_PORT.get().ok_or_else(|| {
+            BrowserError::LaunchFailed(
+                "proxy port not initialized before BrowserInstance::new".to_string(),
+            )
+        })?;
+
         let mut caps: Capabilities = serde_json::Map::new();
         caps.insert(
             "moz:firefoxOptions".to_string(),
@@ -121,7 +140,21 @@ impl BrowserInstance {
                     "browser.contentblocking.category": "strict",
                     "network.cookie.cookieBehavior": 5,
                     // Surface stub PDF viewer rather than launching anything.
-                    "pdfjs.disabled": true
+                    "pdfjs.disabled": true,
+
+                    // Route every request through the in-process SSRF filter.
+                    // Also route DNS through the proxy so Firefox cannot bypass
+                    // us by resolving to a blocked address independently.
+                    "network.proxy.type": 1,
+                    "network.proxy.http": "127.0.0.1",
+                    "network.proxy.http_port": proxy_port,
+                    "network.proxy.ssl": "127.0.0.1",
+                    "network.proxy.ssl_port": proxy_port,
+                    "network.proxy.share_proxy_settings": true,
+                    "network.proxy.socks_remote_dns": true,
+                    "network.proxy.no_proxies_on": "",
+                    "network.dns.disablePrefetch": true,
+                    "network.prefetch-next": false
                 }
             }),
         );

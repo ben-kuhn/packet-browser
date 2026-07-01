@@ -1332,8 +1332,12 @@ dependencies = [
 name = "packet-browser-server"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "chrono",
  "fantoccini",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "openssl",
  "packet-browser-shared",
  "regex",

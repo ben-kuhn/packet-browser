@@ -3,4 +3,5 @@ pub mod browser;
 pub mod config;
 pub mod filter;
 pub mod logger;
+pub mod proxy;
 pub mod session;

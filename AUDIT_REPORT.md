@@ -217,18 +217,24 @@ Most were addressed; a small number are architectural and called out below.
 
 These need real design work and are deliberately not fixed in this pass.
 
-1. **Subresource SSRF via the headless browser.** `validate_url` only checks the
-   top-level navigation URL. Chromium then loads stylesheets, fonts, images,
-   inline `fetch()` from `JS_SCRUB_HTML`, and any other subresource via its
-   own DNS resolver, with no filter in the loop. Any visited page can cause
-   the server to issue arbitrary GETs to internal IPs the operator's box can
-   reach (cloud metadata, RFC1918, container-internal services). The proper
-   fix is to route Chromium through a local proxy we control that does the
-   filter check and pins the resolved IP to what was checked. Roughly a day
-   of work; deferred so the security pass stays bisectable.
+1. **Subresource SSRF via the headless browser** — resolved. Firefox now runs
+   with `network.proxy.http`, `network.proxy.ssl`, and
+   `network.proxy.socks_remote_dns` pointed at a small in-process forward
+   proxy (`server/src/proxy.rs`). Every request the browser issues — top
+   level navigation, stylesheets, fonts, images, inline `fetch()` from
+   `JS_SCRUB_HTML`, everything — is filtered before it leaves the process.
+   For plain HTTP the proxy parses the request, runs the URL through the
+   filter, opens a connection to the *pinned* IP, and streams the response.
+   For HTTPS the browser sends `CONNECT example.com:443`; the proxy
+   validates hostname + port, resolves DNS once, connects to that pinned
+   IP, and bidirectionally splices the TCP sockets. Non-web CONNECT ports
+   (anything other than 80/443) are refused up front. Live curl checks
+   against the running proxy pass all six expected outcomes.
 
-2. **DNS-rebinding TOCTOU between filter and renderer.** Same root cause as (1):
-   independent DNS lookups in `filter.rs` and the browser. Same fix.
+2. **DNS-rebinding TOCTOU between filter and renderer** — resolved by the
+   same change. `filter::resolve_and_pin()` performs a single DNS lookup
+   whose result is used for both the block check and the outbound TCP
+   `connect()`, so an attacker cannot flip the answer between the two.
 
 3. **Renderer sandbox** — resolved by the Firefox swap. The renderer now runs
    in Firefox's user-namespace + seccomp-bpf sandbox, which the engine sets

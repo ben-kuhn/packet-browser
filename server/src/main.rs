@@ -1,9 +1,10 @@
 use packet_browser_server::{
     blocklist::start_blocklist_manager,
-    browser::{BrowserError, BrowserInstance},
+    browser::{set_proxy_port, BrowserError, BrowserInstance},
     config::Config,
     filter::validate_url,
     logger::{LogEntry, LogStatus, Logger},
+    proxy::start_proxy,
     session::{validate_callsign, Session},
 };
 use packet_browser_shared::compress::brotli_compress;
@@ -39,6 +40,22 @@ fn main() {
     let config = Arc::new(Config::from_env());
     let connection_count = Arc::new(AtomicUsize::new(0));
     let peer_counts: PeerCounts = Arc::new(Mutex::new(HashMap::new()));
+
+    // In-process SSRF filtering proxy. Firefox will be pointed at this port
+    // so every subresource load goes through validate_url + a pinned DNS
+    // resolution. Fatal if it fails to start — the browser has no other way
+    // to enforce the SSRF policy at fetch time.
+    let proxy_port = match start_proxy(config.blocked_ranges.clone()) {
+        Ok(p) => {
+            println!("Filtering proxy listening on 127.0.0.1:{}", p);
+            p
+        }
+        Err(e) => {
+            eprintln!("[FATAL] Failed to start filtering proxy: {}", e);
+            std::process::exit(1);
+        }
+    };
+    set_proxy_port(proxy_port);
 
     println!("Starting packet-browser-server v{}", VERSION);
     println!("Listening on port {}", config.listen_port);

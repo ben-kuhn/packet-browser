@@ -292,18 +292,18 @@ before exposing the server:
   syscall (`bpf`, `perf_event_open`, `keyctl`, etc.). Net effect: an
   actual renderer sandbox with a syscall surface only marginally wider
   than the Docker default.
-- **Subresource loads are not filtered.** `BLOCKED_RANGES` is enforced on the
-  top-level navigation URL only. Stylesheets, fonts, images, and any
-  `fetch()` from the sanitizer JS go through Firefox's own resolver and
-  are not checked against the SSRF policy. A malicious page can cause the
-  server to issue arbitrary GETs to addresses the operator's host can reach.
-- **DNS rebinding is not fully closed.** The filter resolves once, Firefox
-  resolves again at connect time; an attacker can flip the answer between
-  the two. The check narrows but does not eliminate the SSRF surface.
-
-Closing the latter two properly requires routing Firefox through a local
-filtering proxy that pins the resolved IP. That is planned but out of
-scope for the current deployment.
+- **Subresource loads are filtered.** Firefox is configured to route all
+  requests (HTTP and HTTPS) through an in-process forward proxy that runs
+  every URL through `BLOCKED_RANGES` before opening a socket. For HTTPS
+  the proxy validates the `CONNECT` target, resolves DNS once, and
+  bidirectionally splices to the pinned IP; non-web CONNECT ports (80/443
+  only) are refused up front. Nothing Firefox loads — stylesheets,
+  fonts, `fetch()` from the sanitizer JS, subresources of subresources —
+  bypasses this check.
+- **DNS rebinding on subresource fetches is closed.** The proxy performs
+  a single DNS resolution per URL and uses the same IP for both the
+  block check and the outbound `connect()`, eliminating the window where
+  filter and browser could resolve to different addresses.
 
 ### Running with Nix (without Docker)
 
