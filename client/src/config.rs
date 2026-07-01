@@ -117,6 +117,7 @@ pub struct CliArgs {
     pub listen_addr: String,
     pub bpq_command: Option<String>,
     pub verbosity: u8,
+    pub allowed_hosts: Vec<String>,
 }
 
 impl CliArgs {
@@ -144,6 +145,13 @@ impl CliArgs {
 
             #[arg(short, long, action = clap::ArgAction::Count, help = "Verbosity level (-v, -vv, -vvv)")]
             verbose: u8,
+
+            #[arg(
+                long,
+                value_delimiter = ',',
+                help = "Extra hostnames to accept in the Host header (comma-separated). Useful for mDNS names like 'raspberrypi.local' when binding to a LAN interface. Loopback and LAN IP literals are already accepted based on --listen-addr."
+            )]
+            allowed_hosts: Vec<String>,
         }
 
         let args = Args::parse();
@@ -155,6 +163,12 @@ impl CliArgs {
             listen_addr: args.listen_addr,
             bpq_command: Some(args.bpq_command),
             verbosity: args.verbose,
+            allowed_hosts: args
+                .allowed_hosts
+                .into_iter()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect(),
         }
     }
 
@@ -257,6 +271,7 @@ mod tests {
             listen_addr: "127.0.0.1:8080".to_string(),
             bpq_command: Some("WEB".to_string()),
             verbosity: 0,
+            allowed_hosts: vec![],
         };
 
         let resolved = cli.resolve_config().unwrap();

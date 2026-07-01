@@ -152,11 +152,15 @@ Most were addressed; a small number are architectural and called out below.
   browsers always send `Origin` on cross-origin POSTs, and `Referer` is
   easier for an attacker to suppress, so a Referer-only fallback would
   re-open the bypass we're closing.
-- DNS rebinding (a hostile page whose DNS flips to your IP mid-session,
-  producing matching attacker-controlled Origin and Host) is not blocked
-  by the same-origin check. Mitigating it would require a Host allow-list,
-  which puts us back in the configuration weeds. Documented and accepted
-  for this single-user local-proxy threat model.
+- DNS rebinding closed. On top of the same-origin check, we now reject
+  requests whose `Host` header is not on a per-startup allowlist derived
+  from the actual bound IP: loopback always, the specific listen IP if
+  the operator picked one, or LAN IP literals (RFC1918, IPv6 ULA / link-
+  local) if bound to `0.0.0.0` / `::`. `localhost` is always allowed;
+  additional hostnames (e.g. `raspberrypi.local` for mDNS) can be added
+  via `--allowed-hosts host1,host2,...`. A hostile page whose DNS flips
+  to our IP still sends `Host: evil.com`, which is not in the allowlist,
+  so the request is rejected before reaching any handler.
 - `ui.rs` interpolated `my_callsign`, `target_callsign`, error messages, and
   the AGWPE port-info JSON directly into HTML/script contexts. Added `h()`
   HTML-escape and `json_for_script()` JSON-escape helpers and routed every

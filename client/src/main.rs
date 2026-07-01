@@ -6,7 +6,7 @@ mod state;
 mod ui;
 
 use config::CliArgs;
-use proxy::AppContext;
+use proxy::{AppContext, HostAllowlist};
 use state::create_shared_state;
 use std::sync::Arc;
 use thiserror::Error;
@@ -65,16 +65,25 @@ async fn main() -> Result<(), ClientError> {
         tracing::info!("No callsign configured, skipping auto-connect");
     }
 
+    // Bind first so we can derive the actual listening IP for the Host
+    // allowlist (matters when --listen-addr uses port 0 or the caller passes
+    // a hostname that resolves to a specific interface).
+    let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
+    let bound = listener.local_addr().ok();
+    let listen_ip = bound
+        .map(|a| a.ip())
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+
+    let host_allowlist = HostAllowlist::new(listen_ip, cli.allowed_hosts.clone());
+
     let ctx = Arc::new(AppContext {
         state: shared_state,
         agwpe: agwpe_manager,
         log_tx,
+        host_allowlist,
     });
 
     let app = proxy::create_router(ctx);
-
-    let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
-    let bound = listener.local_addr().ok();
 
     print_startup_banner(&listen_addr, bound.as_ref());
 

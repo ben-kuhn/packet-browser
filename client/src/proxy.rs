@@ -10,7 +10,9 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::convert::Infallible;
+use std::net::IpAddr;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::broadcast;
 
@@ -30,6 +32,97 @@ pub struct AppContext {
     pub state: SharedState,
     pub agwpe: AgwpeManager,
     pub log_tx: broadcast::Sender<DebugLogEntry>,
+    pub host_allowlist: HostAllowlist,
+}
+
+/// A whitelist of hostnames we are prepared to serve on. Used to block DNS
+/// rebinding: an attacker's page whose DNS flips to the client's IP would send
+/// a Host header with the attacker's hostname, which we reject up-front.
+///
+/// The default set is derived from `--listen-addr`:
+///   - Always: "localhost", plus any IP literal that is loopback.
+///   - If bound to a specific non-loopback IP: that literal IP is added.
+///   - If bound to the unspecified address (0.0.0.0 / ::): any IP literal on
+///     a local network (RFC1918 v4, ULA v6, or link-local for either) passes.
+///     This is the "shelter LAN" case; the operator opted into wide binding.
+///   - `--allowed-hosts` appends any additional hostnames (e.g. mDNS names).
+#[derive(Debug, Clone)]
+pub struct HostAllowlist {
+    hostnames: HashSet<String>,
+    bound_ip: Option<IpAddr>,
+    allow_lan: bool,
+}
+
+impl HostAllowlist {
+    pub fn new(listen_ip: IpAddr, extra_hostnames: Vec<String>) -> Self {
+        let mut hostnames: HashSet<String> =
+            std::iter::once("localhost".to_string()).collect();
+        for h in extra_hostnames {
+            let h = h.trim().to_ascii_lowercase();
+            if !h.is_empty() {
+                hostnames.insert(h);
+            }
+        }
+        Self {
+            hostnames,
+            bound_ip: (!listen_ip.is_loopback() && !listen_ip.is_unspecified())
+                .then_some(listen_ip),
+            allow_lan: listen_ip.is_unspecified(),
+        }
+    }
+
+    pub fn contains_host_header(&self, host_header: &str) -> bool {
+        let hostname = strip_port_from_host(host_header);
+
+        // Try to parse as an IP literal (also handles bracketed IPv6).
+        let ip_str = hostname
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .unwrap_or(hostname);
+        if let Ok(ip) = ip_str.parse::<IpAddr>() {
+            if ip.is_loopback() {
+                return true;
+            }
+            if let Some(bound) = self.bound_ip {
+                if bound == ip {
+                    return true;
+                }
+            }
+            if self.allow_lan && is_lan_ip(&ip) {
+                return true;
+            }
+            return false;
+        }
+
+        // Not an IP: match against configured hostnames (case-insensitive).
+        self.hostnames.contains(&hostname.to_ascii_lowercase())
+    }
+}
+
+fn strip_port_from_host(host: &str) -> &str {
+    if let Some(rest) = host.strip_prefix('[') {
+        // "[v6]:port" or "[v6]"
+        if let Some(end) = rest.find(']') {
+            return &host[..end + 2];
+        }
+    }
+    // "host:port" or bare "host". IPv6 without brackets doesn't come from
+    // a browser Host header, so ignore that case.
+    host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host)
+}
+
+fn is_lan_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            let o = v6.octets();
+            // ULA: fc00::/7 -- first byte 1111 111x.
+            let ula = (o[0] & 0xfe) == 0xfc;
+            // Link-local: fe80::/10 -- first byte 0xfe, second byte's top two bits 10.
+            let link_local = o[0] == 0xfe && (o[1] & 0xc0) == 0x80;
+            ula || link_local
+        }
+    }
 }
 
 pub fn create_router(ctx: Arc<AppContext>) -> Router {
@@ -46,41 +139,52 @@ pub fn create_router(ctx: Arc<AppContext>) -> Router {
         .route("/api/config", get(api_config_get))
         .route("/api/config", post(api_config_post))
         .route("/events", get(events_handler))
-        .layer(middleware::from_fn(csrf_guard))
+        .layer(middleware::from_fn_with_state(ctx.clone(), security_guard))
         .layer(Extension(ctx))
 }
 
-// Reject state-changing requests whose Origin doesn't match the request's
-// own Host header. This is a textbook same-origin check that works the same
-// whether the client is bound to 127.0.0.1 or 0.0.0.0: in any deployment, a
-// legitimate browser POST to our UI carries Origin == "<scheme>://<Host>".
-// A cross-origin attacker (evil.com -> 127.0.0.1:8080/api/config) sends
-// Origin: http://evil.com and Host: 127.0.0.1:8080 — mismatch, rejected.
+// Two-part gate against DNS rebinding and CSRF:
 //
-// We deliberately do not fall back to Referer: modern browsers always send
-// Origin on cross-origin POSTs, and Referer is much easier for an attacker
-// to suppress (Referrer-Policy, rel=noreferrer, certain redirect chains),
-// so a Referer-only fallback re-opens the bypass we're closing.
+//   1. The Host header must be one we recognize as ours (loopback, our
+//      listen IP, LAN IPs when bound to 0.0.0.0, or an explicit
+//      --allowed-hosts entry). This blocks DNS rebinding: a hostile page
+//      whose DNS flips to our IP mid-session still carries Host: evil.com,
+//      which is not in the allowlist.
 //
-// Caveat: DNS rebinding (a hostile site whose DNS flips to the user's IP
-// mid-session) can produce Origin == Host both pointing at the attacker's
-// domain — the request goes through. Mitigating that requires a Host
-// allow-list, which puts us back in the configuration weeds. Documented
-// in AUDIT_REPORT.md.
-async fn csrf_guard(
+//   2. On POST additionally, Origin's authority must match the Host header.
+//      Textbook same-origin check for classic CSRF.
+//
+// The Referer fallback was removed on purpose: modern browsers always send
+// Origin on cross-origin POSTs, and Referer is easier for an attacker to
+// suppress, so a Referer-only fallback re-opens the bypass this guard is
+// closing.
+async fn security_guard(
+    axum::extract::State(ctx): axum::extract::State<Arc<AppContext>>,
     req: HttpRequest<axum::body::Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
+    let headers = req.headers();
+    let host = headers.get("host").and_then(|v| v.to_str().ok());
+
+    let host = match host {
+        Some(h) if ctx.host_allowlist.contains_host_header(h) => h,
+        _ => {
+            tracing::warn!(
+                "Host allowlist rejected {} {} (host={:?})",
+                req.method(),
+                req.uri().path(),
+                host
+            );
+            return Err(StatusCode::FORBIDDEN);
+        }
+    };
+
     if req.method() == Method::POST {
-        let headers = req.headers();
         let origin = headers.get("origin").and_then(|v| v.to_str().ok());
-        let host = headers.get("host").and_then(|v| v.to_str().ok());
-
-        let ok = match (origin, host) {
-            (Some(o), Some(h)) => origin_matches_host(o, h),
-            _ => false,
+        let ok = match origin {
+            Some(o) => origin_matches_host(o, host),
+            None => false,
         };
-
         if !ok {
             tracing::warn!(
                 "CSRF guard rejected {} {} (origin={:?}, host={:?})",
@@ -92,6 +196,7 @@ async fn csrf_guard(
             return Err(StatusCode::FORBIDDEN);
         }
     }
+
     Ok(next.run(req).await)
 }
 
@@ -577,4 +682,120 @@ async fn events_handler(
     };
 
     Sse::new(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn loopback_allowlist() -> HostAllowlist {
+        HostAllowlist::new(IpAddr::V4(Ipv4Addr::LOCALHOST), vec![])
+    }
+
+    fn unspecified_allowlist() -> HostAllowlist {
+        HostAllowlist::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), vec![])
+    }
+
+    fn specific_lan_allowlist() -> HostAllowlist {
+        HostAllowlist::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), vec![])
+    }
+
+    #[test]
+    fn loopback_hosts_always_allowed() {
+        for wl in [
+            loopback_allowlist(),
+            unspecified_allowlist(),
+            specific_lan_allowlist(),
+        ] {
+            assert!(wl.contains_host_header("127.0.0.1"));
+            assert!(wl.contains_host_header("127.0.0.1:8080"));
+            assert!(wl.contains_host_header("[::1]:8080"));
+            assert!(wl.contains_host_header("localhost"));
+            assert!(wl.contains_host_header("localhost:8080"));
+            assert!(wl.contains_host_header("LocalHost:9"));
+        }
+    }
+
+    #[test]
+    fn arbitrary_hostnames_rejected_by_default() {
+        let wl = loopback_allowlist();
+        assert!(!wl.contains_host_header("evil.com"));
+        assert!(!wl.contains_host_header("evil.com:8080"));
+        assert!(!wl.contains_host_header("attacker.example.com"));
+    }
+
+    #[test]
+    fn extra_hostnames_added_via_constructor() {
+        let wl = HostAllowlist::new(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            vec!["raspberrypi.local".to_string(), "Radio.LAN".to_string()],
+        );
+        assert!(wl.contains_host_header("raspberrypi.local:8080"));
+        // Case-insensitive.
+        assert!(wl.contains_host_header("RASPBERRYPI.LOCAL:8080"));
+        assert!(wl.contains_host_header("radio.lan"));
+        // Still rejects other names.
+        assert!(!wl.contains_host_header("evil.com:8080"));
+    }
+
+    #[test]
+    fn loopback_bind_rejects_lan_ip_hosts() {
+        let wl = loopback_allowlist();
+        assert!(!wl.contains_host_header("192.168.1.10:8080"));
+        assert!(!wl.contains_host_header("10.0.0.5"));
+        assert!(!wl.contains_host_header("[fc00::1]:8080"));
+    }
+
+    #[test]
+    fn unspecified_bind_allows_lan_ip_hosts() {
+        let wl = unspecified_allowlist();
+        assert!(wl.contains_host_header("192.168.1.10:8080"));
+        assert!(wl.contains_host_header("10.0.0.5"));
+        assert!(wl.contains_host_header("172.16.0.1:80"));
+        assert!(wl.contains_host_header("169.254.10.5"));
+        assert!(wl.contains_host_header("[fc00::1]:8080"));
+        assert!(wl.contains_host_header("[fe80::1]:8080"));
+    }
+
+    #[test]
+    fn unspecified_bind_still_rejects_public_ip_hosts() {
+        let wl = unspecified_allowlist();
+        // 8.8.8.8 in a Host header is not something we should serve as ourselves.
+        assert!(!wl.contains_host_header("8.8.8.8:8080"));
+        assert!(!wl.contains_host_header("[2606:4700::1]:8080"));
+    }
+
+    #[test]
+    fn specific_bind_accepts_only_that_ip() {
+        let wl = specific_lan_allowlist();
+        assert!(wl.contains_host_header("192.168.1.10:8080"));
+        // Different LAN IP -- the operator didn't bind here.
+        assert!(!wl.contains_host_header("192.168.1.11:8080"));
+        // Loopback still allowed for the operator on the box.
+        assert!(wl.contains_host_header("127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn dns_rebinding_case_rejected() {
+        // Attacker page whose DNS flips to our IP would send Host: evil.com
+        // regardless of what our listen_addr is.
+        for wl in [
+            loopback_allowlist(),
+            unspecified_allowlist(),
+            specific_lan_allowlist(),
+        ] {
+            assert!(!wl.contains_host_header("evil.com:8080"));
+            assert!(!wl.contains_host_header("attacker.local"));
+        }
+    }
+
+    #[test]
+    fn origin_authority_matches_host() {
+        assert!(origin_matches_host("http://127.0.0.1:8080", "127.0.0.1:8080"));
+        assert!(origin_matches_host("https://raspberrypi.local", "raspberrypi.local"));
+        assert!(!origin_matches_host("http://evil.com", "127.0.0.1:8080"));
+        // Missing scheme -> not a valid Origin header.
+        assert!(!origin_matches_host("127.0.0.1:8080", "127.0.0.1:8080"));
+    }
 }
