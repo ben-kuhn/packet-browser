@@ -1,5 +1,5 @@
 use packet_browser_server::{
-    blocklist::start_blocklist_manager,
+    blocklist::{init_domain_blocklist, start_blocklist_manager},
     browser::{set_proxy_port, BrowserError, BrowserInstance},
     config::Config,
     filter::validate_url,
@@ -40,6 +40,9 @@ fn main() {
     let config = Arc::new(Config::from_env());
     let connection_count = Arc::new(AtomicUsize::new(0));
     let peer_counts: PeerCounts = Arc::new(Mutex::new(HashMap::new()));
+
+    // Initialize the domain blocklist state before anything reads it.
+    init_domain_blocklist();
 
     // In-process SSRF filtering proxy. Firefox will be pointed at this port
     // so every subresource load goes through validate_url + a pinned DNS

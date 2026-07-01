@@ -1,20 +1,52 @@
-use std::fs;
-use std::io::{self, Read};
+//! Fetches remote hosts-format blocklists on a schedule and holds them in
+//! process memory. The filtering proxy (see `crate::proxy`) consults this set
+//! before every DNS lookup, so entries here are enforced on every request
+//! Firefox issues -- no more coupling the container's /etc/hosts to the block
+//! layer.
+
+use std::collections::HashSet;
+use std::io::Read;
+use std::sync::{Arc, OnceLock, RwLock};
 use std::thread;
 use std::time::Duration;
 
-const BLOCKLIST_START: &str = "# BLOCKLIST-MANAGED START";
-const BLOCKLIST_END: &str = "# BLOCKLIST-MANAGED END";
-const HOSTS_PATH: &str = "/etc/hosts";
 const BLOCKLIST_FETCH_TIMEOUT_SECS: u64 = 30;
 const MAX_BLOCKLIST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DOMAIN_LEN: usize = 253;
+
+/// Global blocklist state. Set once at startup; readers get an Arc clone,
+/// the refresh thread holds the write side.
+static DOMAIN_BLOCKLIST: OnceLock<Arc<RwLock<HashSet<String>>>> = OnceLock::new();
+
+/// Initialize the (empty) blocklist. Idempotent; safe to call from `main`
+/// before any consumer looks at it.
+pub fn init_domain_blocklist() {
+    let _ = DOMAIN_BLOCKLIST.set(Arc::new(RwLock::new(HashSet::new())));
+}
+
+/// Case-insensitive membership check. Returns false if the blocklist has
+/// not been initialized yet, so consumers can call this unconditionally.
+pub fn is_domain_blocked(host: &str) -> bool {
+    let Some(state) = DOMAIN_BLOCKLIST.get() else {
+        return false;
+    };
+    let key = host.to_ascii_lowercase();
+    let guard = match state.read() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    guard.contains(&key)
+}
 
 // Start background blocklist manager: fetches on startup then refreshes on interval
 pub fn start_blocklist_manager(urls: Vec<String>, refresh_hours: u64) {
     if urls.is_empty() {
         return;
     }
+
+    // Ensure the shared state exists so callers of `is_domain_blocked` don't
+    // race the initial fetch.
+    init_domain_blocklist();
 
     if let Err(e) = update_blocklist(&urls) {
         eprintln!("Failed to update blocklist: {}", e);
@@ -29,7 +61,7 @@ pub fn start_blocklist_manager(urls: Vec<String>, refresh_hours: u64) {
 }
 
 fn update_blocklist(urls: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut domains: Vec<String> = Vec::new();
+    let mut domains: HashSet<String> = HashSet::new();
 
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(BLOCKLIST_FETCH_TIMEOUT_SECS))
@@ -49,17 +81,24 @@ fn update_blocklist(urls: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 if domain.len() > MAX_DOMAIN_LEN {
                     continue;
                 }
-                // Skip well-known local entries that should not be blocked
+                // Skip well-known local entries that should not be blocked.
                 if matches!(domain, "localhost" | "localhost.localdomain" | "broadcasthost") {
                     continue;
                 }
-                domains.push(format!("0.0.0.0 {}", domain));
+                domains.insert(domain.to_ascii_lowercase());
             }
         }
     }
 
-    write_hosts_file(&domains)?;
-    eprintln!("Blocklist updated: {} entries", domains.len());
+    let count = domains.len();
+    if let Some(state) = DOMAIN_BLOCKLIST.get() {
+        let mut guard = match state.write() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        *guard = domains;
+    }
+    eprintln!("Blocklist updated: {} entries", count);
     Ok(())
 }
 
@@ -97,48 +136,4 @@ fn fetch_capped(client: &reqwest::blocking::Client, url: &str) -> Result<String,
     }
 
     String::from_utf8(buf).map_err(Into::into)
-}
-
-fn write_hosts_file(domains: &[String]) -> io::Result<()> {
-    let existing = fs::read_to_string(HOSTS_PATH).unwrap_or_default();
-
-    // Collect lines that are outside the managed block
-    let mut custom_lines: Vec<&str> = Vec::new();
-    let mut in_managed = false;
-    for line in existing.lines() {
-        if line == BLOCKLIST_START {
-            in_managed = true;
-        } else if line == BLOCKLIST_END {
-            in_managed = false;
-        } else if !in_managed {
-            custom_lines.push(line);
-        }
-    }
-
-    let mut content = custom_lines.join("\n");
-    if !content.is_empty() && !content.ends_with('\n') {
-        content.push('\n');
-    }
-    content.push_str(BLOCKLIST_START);
-    content.push('\n');
-    for entry in domains {
-        content.push_str(entry);
-        content.push('\n');
-    }
-    content.push_str(BLOCKLIST_END);
-    content.push('\n');
-
-    // Prefer atomic write via rename. Fall back to in-place write if the
-    // rename crosses a mount boundary (e.g. /etc/hosts mounted in via Docker
-    // bind-mount): an EXDEV/EBUSY rename would leave the file untouched.
-    let temp_path = format!("{}.tmp", HOSTS_PATH);
-    fs::write(&temp_path, &content)?;
-    match fs::rename(&temp_path, HOSTS_PATH) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            // Clean up the temp file we cannot rename, then write in place.
-            let _ = fs::remove_file(&temp_path);
-            fs::write(HOSTS_PATH, content)
-        }
-    }
 }

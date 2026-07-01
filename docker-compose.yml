@@ -9,8 +9,6 @@ services:
     volumes:
       # Logs - accessible from host
       - ./logs:/var/log/packet-browser
-      # Hosts file for blocklist management
-      - ./hosts:/etc/hosts
 
     environment:
       # Service configuration

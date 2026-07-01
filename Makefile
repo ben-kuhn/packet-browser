@@ -20,7 +20,6 @@ build:
 smoke-test:
 	@echo "=== Smoke test: verifying Firefox starts and can load a page ==="
 	@mkdir -p /tmp/smoke-logs
-	@touch /tmp/smoke-hosts
 
 	@docker run -d --name smoke-test \
 	  --read-only \
@@ -28,7 +27,6 @@ smoke-test:
 	  --tmpfs /dev/shm:size=128M,mode=1777 \
 	  -p 127.0.0.1:63004:63004 \
 	  -v /tmp/smoke-logs:/var/log/packet-browser \
-	  -v /tmp/smoke-hosts:/etc/hosts \
 	  --cap-drop ALL \
 	  --security-opt seccomp=./packaging/seccomp/firefox.json \
 	  --security-opt no-new-privileges \

@@ -152,9 +152,8 @@ The server runs behind a BPQ node and handles web page fetching, sanitization, a
 #### Quick Start
 
 ```bash
-# Create directory and required files
+# Create directory for logs
 mkdir -p packet-browser/logs
-touch packet-browser/hosts
 
 # Create docker-compose.yml (see below)
 nano docker-compose.yml
@@ -178,8 +177,6 @@ services:
     volumes:
       # Logs - accessible from host
       - ./logs:/var/log/packet-browser
-      # Hosts file for blocklist management
-      - ./hosts:/etc/hosts
 
     environment:
       # Service configuration
@@ -236,7 +233,7 @@ services:
 | `IDLE_TIMEOUT_MINUTES` | `10` | Session timeout for idle connections |
 | `BROTLI_QUALITY` | `11` | Brotli compression level (0-11) |
 | `BLOCKED_RANGES` | `127.0.0.0/8,10.0.0.0/8,...` | CIDR ranges blocked for SSRF prevention |
-| `BLOCKLIST_ENABLED` | `true` | Enable/disable local hosts-based blocklist |
+| `BLOCKLIST_ENABLED` | `true` | Enable/disable the in-process domain blocklist |
 | `BLOCKLIST_REFRESH_HOURS` | `24` | How often to refresh blocklists from URLs |
 | `BLOCKLIST_URLS` | *(empty)* | Comma-separated URLs of hosts-format blocklists |
 | `FIREFOX_PATH` | `/bin/firefox` | Path to the Firefox binary (set in container image) |
@@ -268,7 +265,7 @@ APPLICATION 4,WEB,C 10 HOST 3 S
 
 ### Server Security Features
 
-- **Content Filtering**: DNS filtering (OpenDNS Family Shield) + hosts-based blocklist
+- **Content Filtering**: DNS filtering (OpenDNS Family Shield) + in-process domain blocklist enforced by the filtering proxy
 - **SSRF Prevention**: Blocks private IP ranges by default (IPv4 + IPv6 reserved
   ranges, including IPv4-mapped, ULA, link-local, and the `0.0.0.0/8` sinkhole)
 - **Protocol Filtering**: Only HTTP/HTTPS allowed (no file://, ftp://, etc.)
@@ -887,9 +884,11 @@ Client logs are available via:
 - Blocks adult content, phishing, malware sites
 - Configurable via DNS settings in Docker
 
-**Layer 2: Hosts-based Blocklist**
+**Layer 2: In-process Domain Blocklist**
 - Fetches hosts-format blocklists from URLs on startup
-- Writes blocked domains to `/etc/hosts` (resolves to 0.0.0.0)
+- Holds parsed domains in an in-memory `HashSet` (no `/etc/hosts` writes)
+- The filtering proxy in front of Firefox consults the set before every
+  DNS lookup, so entries are enforced on every request the browser issues
 - Refreshes every 24 hours (configurable)
 
 ### SSRF Prevention
@@ -918,23 +917,22 @@ By default, the following IP ranges are blocked:
 
 Blocklists refresh automatically every 24 hours (configurable via `BLOCKLIST_REFRESH_HOURS`).
 
-### Manual Host Blocking
+### Adding Custom Blocks
 
-Edit the hosts file volume to add custom blocks:
+The blocklist is populated exclusively from URLs in `BLOCKLIST_URLS`, so a
+custom local list just needs to live somewhere the container can reach.
+The simplest path: publish your own hosts-format file (locally via a
+`file:///` if the operator has filesystem access to the container, or
+served from a small HTTP host you control) and add it to
+`BLOCKLIST_URLS`:
 
-```bash
-# Edit hosts file
-nano hosts
-
-# Add custom blocks using hosts format
-0.0.0.0 unwanted-site.com
-0.0.0.0 another-blocked.com
-
-# Restart container to apply
-docker compose restart
+```yaml
+environment:
+  - BLOCKLIST_URLS=https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/hosts/ultimate.txt,https://internal.example/my-blocks.txt
 ```
 
-Custom entries outside the `# BLOCKLIST-MANAGED START/END` markers are preserved during automatic updates.
+`docker compose restart` picks up the change; the container refetches on
+each start and again every `BLOCKLIST_REFRESH_HOURS` hours.
 
 ### Disabling Blocklist
 

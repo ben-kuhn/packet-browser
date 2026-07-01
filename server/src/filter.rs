@@ -2,6 +2,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use thiserror::Error;
 use url::{Host, Url};
 
+use crate::blocklist::is_domain_blocked;
+
 #[derive(Error, Debug)]
 pub enum UrlError {
     #[error("Blocked protocol: {0}")]
@@ -32,6 +34,11 @@ pub fn resolve_and_pin(
 ) -> Result<IpAddr, UrlError> {
     let host_lc = host.to_ascii_lowercase();
     if BLOCKED_HOSTNAMES.iter().any(|h| *h == host_lc) {
+        return Err(UrlError::BlockedHost(host_lc));
+    }
+    // Consult the runtime domain blocklist (populated from BLOCKLIST_URLS).
+    // Cheap in-memory check, no DNS lookup needed.
+    if is_domain_blocked(&host_lc) {
         return Err(UrlError::BlockedHost(host_lc));
     }
 
@@ -85,11 +92,14 @@ pub fn validate_url(url: &str, blocked_ranges: &[String]) -> Result<(), UrlError
             if BLOCKED_HOSTNAMES.iter().any(|h| *h == name_lc) {
                 return Err(UrlError::BlockedHost(name_lc));
             }
+            if is_domain_blocked(&name_lc) {
+                return Err(UrlError::BlockedHost(name_lc));
+            }
 
             // Resolve and check every returned IP against the blocked ranges.
-            // Note: this only narrows the SSRF window; the headless browser will
-            // do its own DNS lookup at fetch time, so a rebinding attacker may
-            // still flip the answer between this check and Chrome's connect.
+            // For the top-level navigation URL this is a coarse check; the
+            // in-process proxy does the same check with a pinned IP at every
+            // subresource fetch, so any rebinding window is closed there.
             let port = parsed.port_or_known_default().unwrap_or(80);
             let resolved = (name, port)
                 .to_socket_addrs()

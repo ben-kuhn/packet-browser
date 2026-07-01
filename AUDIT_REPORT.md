@@ -249,12 +249,15 @@ These need real design work and are deliberately not fixed in this pass.
    still `read_only: true`), but the previous `--no-sandbox` Chromium
    posture is gone.
 
-4. **`/etc/hosts` bind-mount in docker-compose.** The atomic-rename codepath
-   now falls back to in-place writes for this case, but the broader
-   architecture — mounting a single file from the host as the container's
-   `/etc/hosts` — couples the host's name resolution to the blocklist
-   refresher. A cleaner design is to mount a directory and have the server
-   write its own resolver file, or block at a different layer.
+4. **`/etc/hosts` bind-mount in docker-compose** — resolved. The blocklist
+   no longer touches the filesystem: entries live in an in-process
+   `HashSet<String>` behind a `OnceLock<Arc<RwLock<...>>>`, refreshed on the
+   same schedule as before. The filtering proxy checks the set (via
+   `blocklist::is_domain_blocked`) inside `resolve_and_pin`, so every
+   request Firefox issues is filtered against the same list at exactly
+   one enforcement point. The `./hosts:/etc/hosts` bind mount, the
+   `# BLOCKLIST-MANAGED START/END` marker dance, the atomic-rename
+   fallback path, and the stub `hosts` template are all gone.
 
 5. **Dependency freshness.** Bumped: `reqwest 0.11 → 0.12.28`, `axum 0.7 → 0.8.9`,
    `lol_html 1 → 2.9`, `brotli 3 → 8.0.4`. `fantoccini` stays at 0.22 (latest
