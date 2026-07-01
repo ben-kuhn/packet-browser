@@ -40,13 +40,13 @@ services:
       - ALL
 
     # Firefox's content-process sandbox needs unshare(CLONE_NEWUSER), which
-    # Docker's default seccomp profile denies. Relaxing seccomp is a wider
-    # syscall surface for the container, but it's the price of getting an
-    # actual renderer sandbox (vs Chromium with --no-sandbox).
-    # TODO: ship a custom seccomp profile that allows just the namespace
-    # syscalls Firefox needs.
+    # Docker's default seccomp profile denies. The custom profile shipped in
+    # packaging/seccomp/firefox.json is the Moby default plus unconditional
+    # allows for unshare/setns/mount/umount/umount2/pivot_root/chroot/clone/
+    # clone3 -- just enough for the Firefox sandbox to initialize without
+    # opening the full syscall surface that seccomp=unconfined would.
     security_opt:
-      - seccomp=unconfined
+      - seccomp=./packaging/seccomp/firefox.json
       - no-new-privileges:true
 
     # DNS filtering - uses OpenDNS Family Shield by default

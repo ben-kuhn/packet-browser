@@ -226,15 +226,18 @@ These need real design work and are deliberately not fixed in this pass.
 2. **DNS-rebinding TOCTOU between filter and renderer.** Same root cause as (1):
    independent DNS lookups in `filter.rs` and the browser. Same fix.
 
-3. **Chromium runs with `--no-sandbox`.** Required because Chromium's setuid
-   sandbox cannot initialize as UID 1000 in a container without
-   CAP_SYS_ADMIN. The container's `cap_drop: ALL`, `read_only: true`, and
-   tmpfs limits compensate but do not replace a renderer sandbox. A
-   renderer compromise (one malicious page) gets the full server process's
-   ambient permissions. Documented in README. Long-term fix: switch to
-   Firefox (whose content sandbox initializes from unprivileged user
-   namespaces) or rework the container to give Chromium what its sandbox
-   needs.
+3. **Renderer sandbox** — resolved by the Firefox swap. The renderer now runs
+   in Firefox's user-namespace + seccomp-bpf sandbox, which the engine sets
+   up from inside the container. The container ships a custom seccomp
+   profile at `packaging/seccomp/firefox.json` (Moby default plus targeted
+   allows for `unshare`, `setns`, `pivot_root`, `chroot`, `mount`,
+   `umount`, `umount2`, `clone`, `clone3`) so Firefox can initialize the
+   sandbox without falling back to `seccomp=unconfined`. Every other
+   privilege-escalation syscall (`bpf`, `perf_event_open`, `keyctl`, …)
+   stays denied by the Docker default. Not the same as multi-layer
+   defence (still one Firefox process per session, still `cap_drop: ALL`,
+   still `read_only: true`), but the previous `--no-sandbox` Chromium
+   posture is gone.
 
 4. **`/etc/hosts` bind-mount in docker-compose.** The atomic-rename codepath
    now falls back to in-place writes for this case, but the broader

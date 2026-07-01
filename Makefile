@@ -30,7 +30,7 @@ smoke-test:
 	  -v /tmp/smoke-logs:/var/log/packet-browser \
 	  -v /tmp/smoke-hosts:/etc/hosts \
 	  --cap-drop ALL \
-	  --security-opt seccomp=unconfined \
+	  --security-opt seccomp=./packaging/seccomp/firefox.json \
 	  --security-opt no-new-privileges \
 	  -e BLOCKLIST_ENABLED=false \
 	  -e PORTAL_URL=https://example.com \

@@ -204,11 +204,12 @@ services:
       - /dev/shm:size=128M,mode=1777
     cap_drop:
       - ALL
-    # Firefox's content-process sandbox needs unshare(CLONE_NEWUSER), which
-    # Docker's default seccomp profile denies. See the threat-model section
-    # for the trade-off.
+    # Firefox's content-process sandbox needs unshare(CLONE_NEWUSER) and a
+    # few other namespace syscalls that Docker's default profile denies. The
+    # bundled packaging/seccomp/firefox.json is the Moby default plus those
+    # syscalls -- see the threat-model section.
     security_opt:
-      - seccomp=unconfined
+      - seccomp=./packaging/seccomp/firefox.json
       - no-new-privileges:true
 
     # DNS filtering - OpenDNS Family Shield
@@ -282,12 +283,15 @@ before exposing the server:
 - **Renderer sandbox.** The headless Firefox content process runs inside
   Firefox's own user-namespace + seccomp-bpf sandbox, which the engine
   initializes from inside the container without requiring `CAP_SYS_ADMIN`.
-  Docker's default seccomp profile blocks `unshare(CLONE_NEWUSER)` though,
-  so the compose file applies `security_opt: seccomp=unconfined` for the
-  container as a whole. The trade-off is a wider container syscall surface
-  in exchange for an actual sandbox around the renderer — preferable to
-  the previous `--no-sandbox` Chromium configuration where the renderer
-  had the full ambient permissions of the server process.
+  Docker's default seccomp profile blocks the namespace syscalls Firefox
+  needs (`unshare(CLONE_NEWUSER)`, `clone` with `CLONE_NEW*` flags,
+  `pivot_root`, `mount`). The compose file applies a custom profile at
+  `packaging/seccomp/firefox.json` that is the Moby default plus targeted
+  allows for those syscalls. Unlike `seccomp=unconfined`, this keeps the
+  Docker default deny-list intact for every other privilege-escalation
+  syscall (`bpf`, `perf_event_open`, `keyctl`, etc.). Net effect: an
+  actual renderer sandbox with a syscall surface only marginally wider
+  than the Docker default.
 - **Subresource loads are not filtered.** `BLOCKED_RANGES` is enforced on the
   top-level navigation URL only. Stylesheets, fonts, images, and any
   `fetch()` from the sanitizer JS go through Firefox's own resolver and
