@@ -55,11 +55,11 @@ smoke-test:
 	  docker stop smoke-test 2>/dev/null || true; docker rm smoke-test 2>/dev/null || true; \
 	  echo "FAIL: Firefox did not connect"; exit 1; \
 	fi; \
-	echo "Step 2/2: Waiting for page load (up to 60s)..."; \
+	echo "Step 2/2: Waiting for a fully rendered + compressed page (up to 60s)..."; \
 	RESULT=1; \
 	for i in $$(seq 1 60); do \
-	  if docker logs smoke-test 2>&1 | grep -q '\[FETCH\] Loading'; then \
-	    echo "PASS: Page load triggered after $${i}s"; RESULT=0; break; \
+	  if docker logs smoke-test 2>&1 | grep -q '\[SEND\]'; then \
+	    echo "PASS: page rendered and compressed after $${i}s"; RESULT=0; break; \
 	  fi; \
 	  sleep 1; \
 	done; \

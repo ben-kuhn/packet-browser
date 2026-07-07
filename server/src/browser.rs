@@ -79,6 +79,12 @@ impl BrowserInstance {
 
         eprintln!("[BROWSER] Launching geckodriver at {} on port {}", geckodriver_path, port);
 
+        // Firefox needs LD_LIBRARY_PATH set at exec time so NSS can dlopen
+        // libnssckbi.so (built-in root CAs). We set it here explicitly rather
+        // than relying on container Env inheritance, in case the shell that
+        // starts us strips or overrides it.
+        let ld_path = std::env::var("LD_LIBRARY_PATH").unwrap_or_else(|_| "/lib".to_string());
+
         let geckodriver = Command::new(&geckodriver_path)
             .arg("--port")
             .arg(port.to_string())
@@ -89,6 +95,7 @@ impl BrowserInstance {
             // Confine geckodriver/Firefox file accesses to the temp dir.
             .env("HOME", session_tmp.path())
             .env("MOZ_HEADLESS", "1")
+            .env("LD_LIBRARY_PATH", &ld_path)
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
@@ -139,6 +146,11 @@ impl BrowserInstance {
                     "browser.startup.homepage_override.mstone": "ignore",
                     "browser.contentblocking.category": "strict",
                     "network.cookie.cookieBehavior": 5,
+                    // The container doesn't run the nix-wrapped Firefox
+                    // script that would set up its own NSS DB, so tell
+                    // Firefox to look at the OS-level CA store (loaded via
+                    // p11-kit-trust from /lib) as an additional root source.
+                    "security.enterprise_roots.enabled": true,
                     // Surface stub PDF viewer rather than launching anything.
                     "pdfjs.disabled": true,
 
@@ -193,11 +205,14 @@ impl BrowserInstance {
             eprintln!("[BROWSER] Fetching: {}", url);
 
             client.goto(url).await.map_err(|e| {
-                let s = e.to_string();
-                if s.contains("session deleted") || s.contains("invalid session id") {
+                let display = e.to_string();
+                if display.contains("session deleted") || display.contains("invalid session id") {
                     BrowserError::BrowserCrashed
                 } else {
-                    BrowserError::NavigationFailed(s)
+                    // WebDriver "unknown error" strings can be empty; fall back
+                    // to Debug so the log has something to grep on.
+                    let msg = if display.is_empty() { format!("{e:?}") } else { display };
+                    BrowserError::NavigationFailed(msg)
                 }
             })?;
 

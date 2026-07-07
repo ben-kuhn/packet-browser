@@ -47,8 +47,20 @@
               pkgs.fontconfig
               pkgs.liberation_ttf
               pkgs.noto-fonts
+              # The nix-wrapped Firefox script sets LD_LIBRARY_PATH so the
+              # ELF binary can find NSS + p11-kit (for the CA trust store).
+              # We can't use the wrapped script because geckodriver rejects
+              # anything that isn't an ELF as --binary, so we ship the same
+              # libraries here and set LD_LIBRARY_PATH in Env below.
+              pkgs.nss
+              pkgs.p11-kit
+              # p11-kit variant of the CA bundle lives under
+              # /etc/ssl/trust-source/ca-bundle.trust.p11-kit and is what
+              # security.enterprise_roots.enabled=true will pick up via
+              # p11-kit's trust module.
+              pkgs.cacert.p11kit
             ];
-            pathsToLink = [ "/bin" "/etc" "/share" ];
+            pathsToLink = [ "/bin" "/etc" "/share" "/lib" ];
           };
 
           config = {
@@ -59,6 +71,10 @@
               "FONTCONFIG_FILE=${pkgs.fontconfig.out}/etc/fonts/fonts.conf"
               "FIREFOX_PATH=/bin/firefox"
               "GECKODRIVER_PATH=/bin/geckodriver"
+              # geckodriver inherits this and Firefox inherits it from
+              # geckodriver, giving NSS a runtime path to libnssckbi.so
+              # (built-in root CAs) and p11-kit's trust modules.
+              "LD_LIBRARY_PATH=/lib"
               # Firefox writes its profile + caches here; tempdirs land under /tmp.
               "TMPDIR=/tmp"
             ];

@@ -249,7 +249,21 @@ These need real design work and are deliberately not fixed in this pass.
    still `read_only: true`), but the previous `--no-sandbox` Chromium
    posture is gone.
 
-4. **`/etc/hosts` bind-mount in docker-compose** — resolved. The blocklist
+4. **Firefox TLS root CAs in the container** — resolved. The unwrapped
+   `firefox-esr-unwrapped` binary geckodriver needs (it rejects the wrapped
+   shell script) has no working NSS root-CA source out of the box. The
+   image now ships `pkgs.nss` (for `libnssckbi.so`), `pkgs.p11-kit`, and
+   `pkgs.cacert.p11kit` (Mozilla roots in the p11-kit trust-anchor
+   format), with `LD_LIBRARY_PATH=/lib` set on the process and on the
+   geckodriver spawn env. The Firefox pref `security.enterprise_roots
+   .enabled = true` tells Firefox to load p11-kit's trust module and
+   consume the trust anchors as root CAs. Firefox now validates real
+   Web PKI certs the same as any browser — no `acceptInsecureCerts`,
+   no CA injection, no MITM in the proxy. Smoke test verifies an
+   end-to-end fetch from https://example.com (page rendered, scrubbed,
+   compressed) rather than only checking that the fetch was attempted.
+
+5. **`/etc/hosts` bind-mount in docker-compose** — resolved. The blocklist
    no longer touches the filesystem: entries live in an in-process
    `HashSet<String>` behind a `OnceLock<Arc<RwLock<...>>>`, refreshed on the
    same schedule as before. The filtering proxy checks the set (via
@@ -259,7 +273,7 @@ These need real design work and are deliberately not fixed in this pass.
    `# BLOCKLIST-MANAGED START/END` marker dance, the atomic-rename
    fallback path, and the stub `hosts` template are all gone.
 
-5. **Dependency freshness.** Bumped: `reqwest 0.11 → 0.12.28`, `axum 0.7 → 0.8.9`,
+6. **Dependency freshness.** Bumped: `reqwest 0.11 → 0.12.28`, `axum 0.7 → 0.8.9`,
    `lol_html 1 → 2.9`, `brotli 3 → 8.0.4`. `fantoccini` stays at 0.22 (latest
    release). `openssl 0.10.81` left alone (no known advisories).
 
@@ -280,6 +294,19 @@ These need real design work and are deliberately not fixed in this pass.
      only via `wasm-metadata` / `wit-*` crates, which are part of
      `brotli`'s WASM tooling — not in the Linux server build target.
 
-6. **Mutex poison panic-on-panic.** Now degrades to "continue with previous
+7. **Mutex poison panic-on-panic.** Now degrades to "continue with previous
    contents" rather than blocking the proxy. Acceptable for a single-user
    local proxy; would not be acceptable for a multi-tenant service.
+
+### Filed for later
+
+- **MITM proxy with generated CA.** An alternate proxy design would
+  terminate TLS with Firefox using an ephemeral, per-container CA
+  installed into Firefox's cert database at startup, and re-encrypt
+  upstream with a real client TLS validator (rustls or reqwest). That
+  would give content-level HTTPS filtering (sanitize + inspect paths,
+  not just hostnames) and lift the "SSRF check runs on hostname only
+  for CONNECT" limit. Not needed for the current threat model — the
+  aggressive DOM sanitizer + `no scripts sent over the radio` posture
+  makes content-level HTTPS filtering low value — but worth revisiting
+  if the threat model ever expands.

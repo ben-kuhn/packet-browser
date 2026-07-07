@@ -109,6 +109,7 @@ async fn handle(
                 // Take ownership of the upgrade future *before* we return the
                 // 200 response, then spawn the tunnel once the upgrade lands.
                 let upgrade = hyper::upgrade::on(&mut req);
+                let host_for_log = host.clone();
                 tokio::spawn(async move {
                     match upgrade.await {
                         Ok(upgraded) => {
@@ -116,12 +117,12 @@ async fn handle(
                                 tunnel(upgraded, pinned_ip, port).await
                             {
                                 tracing::debug!(
-                                    "[PROXY] CONNECT tunnel to {host} ({pinned_ip}:{port}) closed: {e}"
+                                    "[PROXY] CONNECT tunnel to {host_for_log} ({pinned_ip}:{port}) error: {e}"
                                 );
                             }
                         }
                         Err(e) => {
-                            eprintln!("[PROXY] CONNECT upgrade failed: {e}");
+                            eprintln!("[PROXY] CONNECT upgrade failed for {host_for_log}: {e}");
                         }
                     }
                 });
@@ -171,16 +172,27 @@ async fn tunnel(
     ip: IpAddr,
     port: u16,
 ) -> std::io::Result<()> {
-    let upstream = tokio::time::timeout(
+    let mut upstream = tokio::time::timeout(
         OUTBOUND_CONNECT_TIMEOUT,
         TcpStream::connect(SocketAddr::new(ip, port)),
     )
     .await
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))??;
 
-    let mut upgraded = TokioIo::new(upgraded);
-    let mut upstream = upstream;
-    tokio::io::copy_bidirectional(&mut upgraded, &mut upstream).await?;
+    // hyper's Upgraded may have read bytes past the request headers before
+    // the upgrade completed (the client's TLS ClientHello typically lands in
+    // that buffer). Grab those bytes explicitly and write them upstream
+    // first, then splice the rest with copy_bidirectional. Skipping this
+    // step made every tunnel close cleanly with zero bytes across.
+    let hyper::upgrade::Parts { io, read_buf, .. } = upgraded
+        .downcast::<TokioIo<tokio::net::TcpStream>>()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "upgrade downcast failed"))?;
+    let mut client = io.into_inner();
+    if !read_buf.is_empty() {
+        use tokio::io::AsyncWriteExt;
+        upstream.write_all(&read_buf).await?;
+    }
+    tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
     Ok(())
 }
 
