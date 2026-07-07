@@ -13,6 +13,25 @@ from conftest import needs_chromium, needs_linbpq, pytestmark
 AGWPE_HEADER_SIZE = 36
 
 
+def _same_origin_headers(url):
+    """Return headers that make the client's same-origin CSRF guard happy.
+
+    The client rejects POSTs whose Origin authority doesn't match the request
+    Host. Real browsers send Origin automatically; the requests library does
+    not, so tests have to add it explicitly.
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    return {"Origin": f"{parsed.scheme}://{parsed.netloc}"}
+
+
+def post(url, **kwargs):
+    """requests.post with Origin set to match the target -- passes CSRF guard."""
+    kwargs.setdefault("headers", {}).update(_same_origin_headers(url))
+    return requests.post(url, **kwargs)
+
+
 def capture_client_logs(client_proc, timeout=1):
     """Capture and print client logs."""
     print("\n=== Client Logs ===")
@@ -150,7 +169,7 @@ class TestFullE2E:
         web_port = pb_client["web_port"]
         client_proc = pb_client["proc"]
 
-        resp = requests.post(f"http://127.0.0.1:{web_port}/api/agwpe-status", timeout=10)
+        resp = post(f"http://127.0.0.1:{web_port}/api/agwpe-status", timeout=10)
         assert resp.status_code == 200
         data = resp.json()
         print(f"\nAGWPE status response: {data}")
@@ -185,7 +204,7 @@ class TestFullE2E:
         client_proc = pb_client["proc"]
 
         # Connect to AGWPE
-        requests.post(f"http://127.0.0.1:{web_port}/api/agwpe-status", timeout=10)
+        post(f"http://127.0.0.1:{web_port}/api/agwpe-status", timeout=10)
 
         # For direct testing, we'll skip the BPQ handshake and just verify AGWPE connection
         resp = requests.get(f"http://127.0.0.1:{web_port}/api/agwpe-status", timeout=10)
@@ -200,7 +219,7 @@ class TestFullE2E:
         web_port = pb_client["web_port"]
 
         # Connect to AGWPE
-        requests.post(f"http://127.0.0.1:{web_port}/api/agwpe-status", timeout=10)
+        post(f"http://127.0.0.1:{web_port}/api/agwpe-status", timeout=10)
 
         # For direct testing, we'll just verify the web interface is accessible
         resp = requests.get(f"http://127.0.0.1:{web_port}/connect", timeout=10)
@@ -213,7 +232,7 @@ class TestFullE2E:
         web_port = pb_client["web_port"]
 
         # Connect to AGWPE
-        requests.post(f"http://127.0.0.1:{web_port}/api/agwpe-status", timeout=10)
+        post(f"http://127.0.0.1:{web_port}/api/agwpe-status", timeout=10)
 
         # For direct testing, we'll just verify the web interface is accessible
         resp = requests.get(f"http://127.0.0.1:{web_port}/configuration", timeout=10)
@@ -230,7 +249,7 @@ class TestFullE2E:
         assert resp.status_code == 200
         original = resp.json()
 
-        resp = requests.post(
+        resp = post(
             f"http://127.0.0.1:{web_port}/api/config",
             json={"agwpe_host": "192.168.1.100", "agwpe_port": 9000},
             timeout=10
@@ -245,7 +264,7 @@ class TestFullE2E:
         assert updated["agwpe_host"] == "192.168.1.100"
         assert updated["agwpe_port"] == 9000
 
-        requests.post(
+        post(
             f"http://127.0.0.1:{web_port}/api/config",
             json={"agwpe_host": original["agwpe_host"], "agwpe_port": original["agwpe_port"]},
             timeout=10

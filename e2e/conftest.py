@@ -31,10 +31,19 @@ needs_linbpq = pytest.mark.skipif(
     not shutil.which("linbpq"), reason="linbpq not installed"
 )
 
-needs_chromium = pytest.mark.skipif(
-    not (os.environ.get("CHROMIUM_PATH") or shutil.which("chromium") or os.path.exists("/bin/chromium")),
-    reason="chromium not available"
+def _have_browser():
+    ff = os.environ.get("FIREFOX_PATH") or shutil.which("firefox") or os.path.exists("/bin/firefox")
+    gd = os.environ.get("GECKODRIVER_PATH") or shutil.which("geckodriver") or os.path.exists("/bin/geckodriver")
+    return bool(ff and gd)
+
+
+needs_browser = pytest.mark.skipif(
+    not _have_browser(),
+    reason="firefox and geckodriver required"
 )
+# Alias kept so the existing @needs_chromium decorators in test files still
+# resolve; import path unchanged.
+needs_chromium = needs_browser
 
 
 def write_direwolf_config(path, mycall, agwport=0):
@@ -329,10 +338,15 @@ def pb_server(tmp_path, test_http_server):
     env["BROTLI_QUALITY"] = "11"
     env["BLOCKLIST_ENABLED"] = "false"
 
-    if "CHROMIUM_PATH" in env:
-        pass
-    elif shutil.which("chromium"):
-        env["CHROMIUM_PATH"] = shutil.which("chromium")
+    # Firefox + geckodriver: match what the container image sets.
+    if "FIREFOX_PATH" not in env:
+        ff = shutil.which("firefox")
+        if ff:
+            env["FIREFOX_PATH"] = ff
+    if "GECKODRIVER_PATH" not in env:
+        gd = shutil.which("geckodriver")
+        if gd:
+            env["GECKODRIVER_PATH"] = gd
 
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
