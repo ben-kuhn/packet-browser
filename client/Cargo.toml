@@ -1,6 +1,6 @@
 [package]
 name = "packet-browser-client"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Packet radio web browser client - AGWPE interface and local web proxy"
 license = "GPL-3.0"
