@@ -45,11 +45,26 @@ impl Session {
 }
 
 pub fn validate_callsign(callsign: &str) -> Result<String, SessionError> {
+    validate_callsign_with_allowlist(callsign, &[])
+}
+
+/// Accept a callsign if either it matches the strict ITU-shape regex OR its
+/// base (without any -N SSID suffix) appears in the operator-supplied
+/// allowlist. Meant for off-air testing where LinBPQ auto-injects synthetic
+/// identifiers like DEMOUSR that could not be issued on air. The allowlist
+/// entries are compared case-insensitively.
+pub fn validate_callsign_with_allowlist(
+    callsign: &str,
+    allowlist: &[String],
+) -> Result<String, SessionError> {
     let call = callsign.split('-').next().unwrap_or(callsign);
+    let upper = call.to_uppercase();
 
     if CALLSIGN_REGEX.is_match(call) {
-        Ok(call.to_uppercase())
-    } else {
-        Err(SessionError::InvalidCallsign)
+        return Ok(upper);
     }
+    if allowlist.iter().any(|entry| entry.eq_ignore_ascii_case(call)) {
+        return Ok(upper);
+    }
+    Err(SessionError::InvalidCallsign)
 }

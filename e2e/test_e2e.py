@@ -150,6 +150,102 @@ class AGWPEClient:
             await self.writer.wait_closed()
 
 
+class TestServerHandshake:
+    """Guard the BPQ-mode handshake contract on the server side.
+
+    In `C n HOST 0 S` mode LinBPQ opens the outbound TCP silently — it does
+    NOT auto-inject the connecting station's callsign, verified via a
+    packet-capturing bridge in front of the server. So the server must
+    prompt for the callsign, the client sends it, then the server prompts
+    for AGREE. Two failure modes we've hit before, one on each side:
+
+    1. Server reads before writing. Then LinBPQ is idle on TCP, the client
+       is waiting for a callsign prompt over AX.25, and both sides
+       deadlock until the client's 30 s handshake timeout.
+    2. Post-callsign prompt loses the "AGREE" token — the client's second
+       wait loop times out.
+    """
+
+    def test_server_prompts_for_callsign_then_agree(self, pb_server):
+        """Server writes a 'callsign' prompt first; then 'AGREE' after we reply."""
+        import socket
+
+        with socket.create_connection(
+            ("127.0.0.1", pb_server["port"]), timeout=5
+        ) as sock:
+            sock.settimeout(5)
+            chunks = []
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    chunk = sock.recv(4096)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if b"callsign" in b"".join(chunks).lower():
+                    break
+            received = b"".join(chunks).decode("utf-8", errors="replace")
+            assert "callsign" in received.lower(), (
+                "Server did not send a prompt containing 'callsign' before "
+                f"reading. LinBPQ HOST 0 doesn't auto-inject the callsign, "
+                f"so the client would deadlock. Got: {received!r}"
+            )
+
+            sock.sendall(b"W1TEST\n")
+
+            chunks = []
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    chunk = sock.recv(4096)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if b"AGREE" in b"".join(chunks):
+                    break
+            received = b"".join(chunks).decode("utf-8", errors="replace")
+            assert "AGREE" in received, (
+                "After receiving the callsign, server did not send an "
+                f"'AGREE' prompt. Client would time out. Got: {received!r}"
+            )
+
+
+class TestAgwpeFrameHandling:
+    """Guard client-side AGWPE frame-type handling in the BPQ handshake.
+
+    Direwolf reports incoming radio data with AGWPE frame kind 'D' (0x44) —
+    the same byte the client uses to *send* data. If a receive-side match
+    arm only recognises 0x64 (an alternate "DataReceived" byte some AGWPE
+    variants use), every direwolf-delivered prompt is silently ignored and
+    the handshake times out. This is easy to reintroduce because 0x44 vs
+    0x64 is a one-character difference in a match arm.
+    """
+
+    def test_agwpe_rx_arms_accept_both_data_bytes(self):
+        """Every RX-side match on DataReceived must also accept SendData."""
+        import pathlib
+
+        src = pathlib.Path(__file__).parent.parent / "client" / "src" / "agwpe.rs"
+        text = src.read_text()
+
+        bad_arms = [
+            lineno
+            for lineno, line in enumerate(text.splitlines(), start=1)
+            if line.strip() == "FrameType::DataReceived => {"
+        ]
+        assert not bad_arms, (
+            "Found bare `FrameType::DataReceived => {` in client/src/agwpe.rs "
+            f"at line(s) {bad_arms}. Must be `FrameType::DataReceived | "
+            "FrameType::SendData => {` — direwolf delivers received data "
+            "with the same 0x44 byte the client uses to send data, so a "
+            "match on DataReceived alone drops every inbound frame."
+        )
+
+
 class TestLinBPQ:
     """Validate LinBPQ starts and connects to Direwolf."""
 

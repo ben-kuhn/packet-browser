@@ -10,6 +10,12 @@ pub struct Config {
     pub blocklist_urls: Vec<String>,
     pub blocklist_refresh_hours: u64,
     pub blocklist_enabled: bool,
+    /// Callsigns that bypass the strict ITU-shape regex in
+    /// `session::validate_callsign`. Meant for off-air testing where
+    /// LinBPQ auto-injects synthetic callsigns like DEMOUSR or W1TEST.
+    /// Case-insensitive; SSID suffix ("-N") is stripped before comparison,
+    /// matching how the regex check strips it.
+    pub allowed_callsigns: Vec<String>,
 }
 
 impl Config {
@@ -34,6 +40,10 @@ impl Config {
             blocklist_urls: parse_env_vec("BLOCKLIST_URLS", vec![]),
             blocklist_refresh_hours: parse_env_u64("BLOCKLIST_REFRESH_HOURS", 24),
             blocklist_enabled: parse_env_bool("BLOCKLIST_ENABLED", true),
+            allowed_callsigns: parse_env_vec("ALLOWED_CALLSIGNS", vec![])
+                .into_iter()
+                .map(|s| s.to_uppercase())
+                .collect(),
         }
     }
 }
