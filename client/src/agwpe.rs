@@ -333,11 +333,12 @@ impl BackgroundState {
         let _ = log_tx.send(entry);
     }
 
-    fn set_state(state: &SharedState, _log_tx: &broadcast::Sender<DebugLogEntry>, cs: ConnectionState) {
-        {
+    fn set_state(state: &SharedState, log_tx: &broadcast::Sender<DebugLogEntry>, cs: ConnectionState) {
+        let entry = {
             let mut s = state.lock_or_poisoned();
-            s.set_connection_state(cs);
-        }
+            s.set_connection_state(cs)
+        };
+        let _ = log_tx.send(entry);
     }
 
     async fn send_frame(stream: &mut TcpStream, frame: &AgwpeFrame) -> Result<(), AgwpeError> {
@@ -559,11 +560,12 @@ async fn handle_disconnect_agwpe(
     bg.stream = None;
     bg.read_buf.clear();
 
-    {
+    let state_entry = {
         let mut s = state.lock_or_poisoned();
         s.clear_ports();
-        s.set_connection_state(ConnectionState::Disconnected);
-    }
+        s.set_connection_state(ConnectionState::Disconnected)
+    };
+    let _ = log_tx.send(state_entry);
 
     BackgroundState::push_log(
         state,
@@ -724,7 +726,12 @@ async fn perform_bpq_handshake(
         tracing::trace!("[BPQ] Sent BPQ command frame");
     }
 
-    // Wait for callsign prompt
+    // The far side (packet-browser-server, via LinBPQ HOST 0) does NOT
+    // auto-inject the callsign in this deployment — LinBPQ opens the TCP
+    // bridge silently and waits for actual data to flow. The server prompts
+    // for the callsign, and we send ours in response. Match the prompt on
+    // "callsign" (or "AGREE", which some pre-existing setups fold into a
+    // single banner) and send once we see it.
     let mut received_text = String::new();
     let mut callsign_prompt_found = false;
 
@@ -738,13 +745,16 @@ async fn perform_bpq_handshake(
 
     loop {
         let frame = bg.read_frame_with_timeout(30).await?;
-
-        tracing::trace!("[BPQ] Received frame type {:?} (0x{:02X}), data_len={}, data={:?}", 
-            frame.frame_type, frame.frame_type as u8, frame.data_len, 
-            String::from_utf8_lossy(&frame.data[..frame.data_len.min(100) as usize]));
+        tracing::trace!(
+            "[BPQ] Received frame type {:?} (0x{:02X}), data_len={}, data={:?}",
+            frame.frame_type,
+            frame.frame_type as u8,
+            frame.data_len,
+            String::from_utf8_lossy(&frame.data[..frame.data_len.min(100) as usize])
+        );
 
         match frame.frame_type {
-            FrameType::DataReceived => {
+            FrameType::DataReceived | FrameType::SendData => {
                 let text = String::from_utf8_lossy(&frame.data).to_string();
                 if received_text.len() + text.len() > MAX_HANDSHAKE_TEXT {
                     return Err(AgwpeError::ConnectionFailed(
@@ -752,19 +762,6 @@ async fn perform_bpq_handshake(
                     ));
                 }
                 received_text.push_str(&text);
-
-                BackgroundState::push_log(
-                    state,
-                    log_tx,
-                    DebugLogEntry::new(
-                        LogLevel::Trace,
-                        "BPQ",
-                        &format!("Received text: {:?}", text),
-                    )
-                    .with_direction(Direction::Rx),
-                );
-
-                // Look for callsign prompt (server sends "All activity is logged...")
                 if received_text.contains("callsign") || received_text.contains("AGREE") {
                     callsign_prompt_found = true;
                     break;
@@ -795,16 +792,14 @@ async fn perform_bpq_handshake(
         ));
     }
 
-    // Send callsign
+    // Send our callsign.
     let call_data = format!("{}\n", callsign);
-
     BackgroundState::push_log(
         state,
         log_tx,
         DebugLogEntry::new(LogLevel::Debug, "BPQ", &format!("Sending callsign: {:?}", call_data))
             .with_direction(Direction::Tx),
     );
-
     let call_frame = AgwpeFrame::new(
         bg.agwpe_port,
         FrameType::SendData,
@@ -812,11 +807,11 @@ async fn perform_bpq_handshake(
         &bg.remote_callsign,
         call_data.into_bytes(),
     );
-
     BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &call_frame).await?;
     tracing::trace!("[BPQ] Sent callsign frame");
 
-    // Wait for AGREE prompt
+    // Now wait for the AGREE prompt. Reuse received_text so any trailing
+    // bytes from the callsign frame are still available for the match.
     received_text.clear();
     let mut agree_prompt_found = false;
 
@@ -836,7 +831,9 @@ async fn perform_bpq_handshake(
             String::from_utf8_lossy(&frame.data[..frame.data_len.min(100) as usize]));
 
         match frame.frame_type {
-            FrameType::DataReceived => {
+            // Direwolf reports received data with frame type 'D' (0x44) — the
+            // same byte we use to send data — so we accept both here.
+            FrameType::DataReceived | FrameType::SendData => {
                 let text = String::from_utf8_lossy(&frame.data).to_string();
                 if received_text.len() + text.len() > MAX_HANDSHAKE_TEXT {
                     return Err(AgwpeError::ConnectionFailed(
@@ -886,7 +883,59 @@ async fn perform_bpq_handshake(
         ));
     }
 
-    // Send "AGREE\n"
+    // Park the handshake in `AwaitingConsent` and hand the disclaimer to the
+    // UI. We do not send "AGREE\n" until the operator explicitly clicks
+    // through /api/consent. This is the real consent step — auto-sending
+    // "AGREE" from code would sign a logging disclaimer no human ever saw.
+    let (consent_tx, consent_rx) = oneshot::channel::<bool>();
+    let state_entry = {
+        let mut s = state.lock_or_poisoned();
+        s.pending_consent = Some(consent_tx);
+        s.set_connection_state(ConnectionState::AwaitingConsent {
+            disclaimer: received_text.clone(),
+        })
+    };
+    // Broadcast the STATE transition so the browser's SSE listener flips the
+    // UI into "Awaiting consent" and opens the consent modal. Without this
+    // the handshake blocks on `consent_rx` with no way for the operator to
+    // reply.
+    let _ = log_tx.send(state_entry);
+    let _ = log_tx.send(DebugLogEntry::new(
+        LogLevel::Info,
+        "BPQ",
+        "Waiting for operator consent",
+    ));
+    tracing::trace!("[BPQ] Waiting for operator consent");
+
+    // Long timeout so a user who wanders off doesn't wedge the handshake
+    // forever, but generous enough for a real consent read.
+    let accepted = match tokio::time::timeout(
+        std::time::Duration::from_secs(300),
+        consent_rx,
+    )
+    .await
+    {
+        Ok(Ok(accepted)) => accepted,
+        // Sender dropped (e.g. new connect started, or explicit disconnect).
+        Ok(Err(_)) => false,
+        Err(_) => {
+            // Best-effort: clear the pending slot so a stale sender doesn't
+            // linger and mislead a later /api/consent call.
+            let mut s = state.lock_or_poisoned();
+            s.pending_consent = None;
+            return Err(AgwpeError::ConnectionFailed(
+                "Consent timeout: operator did not respond".to_string(),
+            ));
+        }
+    };
+
+    if !accepted {
+        return Err(AgwpeError::ConnectionFailed(
+            "Operator declined the logging disclaimer".to_string(),
+        ));
+    }
+
+    // Consent granted — now send "AGREE\n".
     let agree_data = b"AGREE\n".to_vec();
     let agree_frame = AgwpeFrame::new(
         bg.agwpe_port,
@@ -928,11 +977,13 @@ async fn handle_ax25_connect(
     bg.remote_callsign = target.to_string();
     bg.agwpe_port = port_num;
 
-    {
+    let state_entry = {
         let mut s = state.lock_or_poisoned();
-        s.set_connection_state(ConnectionState::Connecting);
+        let entry = s.set_connection_state(ConnectionState::Connecting);
         s.set_agwpe_port(port_num);
-    }
+        entry
+    };
+    let _ = log_tx.send(state_entry);
 
     let connect_frame = AgwpeFrame::new(
         port_num,
@@ -1153,6 +1204,7 @@ async fn handle_send_request(
 
     let mut response_data = Vec::new();
     let mut expected_len: Option<u32> = None;
+    let mut frame_start: usize = 0;
 
     BackgroundState::push_log(
         state,
@@ -1165,7 +1217,9 @@ async fn handle_send_request(
         let frame = bg.read_frame_with_timeout(120).await?;
 
         match frame.frame_type {
-            FrameType::DataReceived => {
+            // Direwolf reports received data with frame type 'D' (0x44) — the
+            // same byte we use to send data — so we accept both here.
+            FrameType::DataReceived | FrameType::SendData => {
                 if response_data.len() + frame.data.len() > MAX_RESPONSE_SIZE {
                     return Err(AgwpeError::InvalidFrame(format!(
                         "Response exceeded maximum size of {} bytes",
@@ -1185,34 +1239,73 @@ async fn handle_send_request(
                     .with_direction(Direction::Rx),
                 );
 
-                if expected_len.is_none() && response_data.len() >= 5 {
-                    let payload_len = u32::from_be_bytes([
-                        response_data[1],
-                        response_data[2],
-                        response_data[3],
-                        response_data[4],
-                    ]);
-                    if payload_len as usize > MAX_RESPONSE_SIZE {
-                        return Err(AgwpeError::InvalidFrame(format!(
-                            "Announced payload_len {} exceeds maximum {}",
-                            payload_len, MAX_RESPONSE_SIZE
-                        )));
+                // Look for the text-framed response header ("RESP<digit>
+                // <base64_len>\n"). The Response::decode_header scans past
+                // any leading garbage (banner text, echoed prompts) to find
+                // the RESP magic.
+                if expected_len.is_none() {
+                    match packet_browser_shared::protocol::Response::decode_header(&response_data) {
+                        Ok(Some((_status, b64_len, header_end))) => {
+                            if header_end > 0 {
+                                let preview_len = header_end.min(128);
+                                BackgroundState::push_log(
+                                    state,
+                                    log_tx,
+                                    DebugLogEntry::new(
+                                        LogLevel::Info,
+                                        "PROTOCOL",
+                                        &format!(
+                                            "Framed header found at offset {}. Preceding bytes: {:?}",
+                                            header_end,
+                                            String::from_utf8_lossy(&response_data[..preview_len]),
+                                        ),
+                                    ),
+                                );
+                            }
+                            expected_len = Some(b64_len);
+                            frame_start = header_end;
+                            BackgroundState::push_log(
+                                state,
+                                log_tx,
+                                DebugLogEntry::new(
+                                    LogLevel::Debug,
+                                    "PROTOCOL",
+                                    &format!(
+                                        "Response header: base64_payload_size={}",
+                                        b64_len,
+                                    ),
+                                ),
+                            );
+                        }
+                        Ok(None) => {
+                            // No complete header yet. If we've already seen
+                            // the RESP magic, keep reading (the header
+                            // terminator or length just hasn't arrived). If
+                            // there's no magic and the buffer is huge, bail
+                            // with a diagnostic dump.
+                            let has_magic = response_data
+                                .windows(packet_browser_shared::protocol::Response::MAGIC.len())
+                                .any(|w| w == packet_browser_shared::protocol::Response::MAGIC);
+                            if !has_magic && response_data.len() > 32 * 1024 {
+                                let preview = response_data.len().min(256);
+                                return Err(AgwpeError::InvalidFrame(format!(
+                                    "No RESP magic in first {} bytes. Text: {:?}",
+                                    response_data.len(),
+                                    String::from_utf8_lossy(&response_data[..preview]),
+                                )));
+                            }
+                        }
+                        Err(e) => {
+                            return Err(AgwpeError::InvalidFrame(format!(
+                                "Malformed response header: {:?}",
+                                e,
+                            )));
+                        }
                     }
-                    expected_len = Some(payload_len);
-
-                    BackgroundState::push_log(
-                        state,
-                        log_tx,
-                        DebugLogEntry::new(
-                            LogLevel::Debug,
-                            "PROTOCOL",
-                            &format!("Response header: status=0x{:02x}, payload_size={}", response_data[0], payload_len),
-                        ),
-                    );
                 }
 
                 if let Some(len) = expected_len {
-                    if response_data.len() >= 5 + len as usize {
+                    if response_data.len() >= frame_start + len as usize {
                         BackgroundState::push_log(
                             state,
                             log_tx,

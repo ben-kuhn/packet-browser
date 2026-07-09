@@ -114,25 +114,107 @@ impl Request {
     }
 }
 
+/// On-the-wire text framing for a Response, designed to survive LinBPQ's
+/// TELNET/HOST 0 S mode which strips NUL bytes and does CRLF translation.
+///
+/// Format (all printable ASCII, LF-terminated header, base64 payload,
+/// LF-terminated):
+///
+///   `RESP<status_digit> <base64_len>\n<base64_payload>\n`
+///
+/// * `RESP` — 4-byte magic so the receiver can resync on the frame start
+///   even if leading bytes (banners, prompt echoes) precede the response.
+/// * `<status_digit>` — one ASCII digit: `0` = Ok, `1` = Err, `2` = Blocked.
+/// * `<base64_len>` — length of the base64-encoded payload, ASCII decimal.
+/// * The payload is base64 (RFC 4648 standard alphabet + padding); it never
+///   contains NUL, CR, LF, IAC, or other bytes the telnet driver would molest.
+///
+/// # 47 CFR Part 97 note
+///
+/// The two transformations applied to the response body — RFC 7932 brotli
+/// compression and RFC 4648 base64 encoding — are both open, publicly
+/// documented, non-proprietary techniques. Neither is intended to obscure
+/// meaning; both are here purely for bandwidth (brotli) and telnet-layer
+/// byte-transparency (base64). Any listener who reads this comment can
+/// recover the transmitted HTML with off-the-shelf tools (`openssl base64
+/// -d | brotli --decompress`). See the "Wire Format & Part 97 Compliance"
+/// section of README.md for the full rationale.
 impl Response {
+    pub const MAGIC: &'static [u8] = b"RESP";
+
     pub fn encode(&self) -> Vec<u8> {
-        let payload_len = self.payload.len() as u32;
-        let mut data = Vec::with_capacity(5 + self.payload.len());
-        data.push(self.status as u8);
-        data.extend_from_slice(&payload_len.to_be_bytes());
-        data.extend_from_slice(&self.payload);
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let encoded_payload = STANDARD.encode(&self.payload);
+        let status_digit = match self.status {
+            Status::Ok => '0',
+            Status::Err => '1',
+            Status::Blocked => '2',
+        };
+        let mut data = Vec::with_capacity(
+            Self::MAGIC.len() + 16 + encoded_payload.len() + 2,
+        );
+        data.extend_from_slice(Self::MAGIC);
+        data.push(status_digit as u8);
+        data.push(b' ');
+        data.extend_from_slice(encoded_payload.len().to_string().as_bytes());
+        data.push(b'\n');
+        data.extend_from_slice(encoded_payload.as_bytes());
+        data.push(b'\n');
         data
     }
 
-    pub fn decode_header(data: &[u8]) -> Result<(Status, u32), ProtocolError> {
-        if data.len() < 5 {
+    /// Try to parse the response header out of `data`, tolerating any leading
+    /// bytes before the `RESP` magic. Returns `(status, base64_payload_len,
+    /// header_end_offset)` where `header_end_offset` is the index just past
+    /// the trailing `\n` of the header line — the base64 payload begins
+    /// there. If no complete header is present yet, returns `Ok(None)` so the
+    /// caller can keep reading.
+    pub fn decode_header(
+        data: &[u8],
+    ) -> Result<Option<(Status, u32, usize)>, ProtocolError> {
+        let magic_pos = match data
+            .windows(Self::MAGIC.len())
+            .position(|w| w == Self::MAGIC)
+        {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let after_magic = magic_pos + Self::MAGIC.len();
+        // status digit + space + at least one length digit + '\n' = ≥4 bytes
+        if data.len() < after_magic + 4 {
+            return Ok(None);
+        }
+        let status = match data[after_magic] {
+            b'0' => Status::Ok,
+            b'1' => Status::Err,
+            b'2' => Status::Blocked,
+            _ => return Err(ProtocolError::InvalidResponse),
+        };
+        if data[after_magic + 1] != b' ' {
             return Err(ProtocolError::InvalidResponse);
         }
+        let len_start = after_magic + 2;
+        // The LinBPQ TELNET driver often rewrites LF into CR on both
+        // directions; accept either as the header terminator.
+        let nl_offset = match data[len_start..].iter().position(|&b| b == b'\n' || b == b'\r') {
+            Some(o) => o,
+            None => return Ok(None),
+        };
+        let len_str = std::str::from_utf8(&data[len_start..len_start + nl_offset])
+            .map_err(|_| ProtocolError::InvalidResponse)?;
+        let payload_len: u32 = len_str
+            .parse()
+            .map_err(|_| ProtocolError::InvalidResponse)?;
+        let header_end = len_start + nl_offset + 1;
+        Ok(Some((status, payload_len, header_end)))
+    }
 
-        let status = Status::try_from(data[0])?;
-        let payload_len = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
-
-        Ok((status, payload_len))
+    /// Decode the base64 payload bytes back to the raw payload.
+    pub fn decode_payload(base64_bytes: &[u8]) -> Result<Vec<u8>, ProtocolError> {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        STANDARD
+            .decode(base64_bytes)
+            .map_err(|_| ProtocolError::InvalidResponse)
     }
 }
 
@@ -168,9 +250,68 @@ mod tests {
             payload: b"test payload".to_vec(),
         };
         let encoded = resp.encode();
-        let (status, len) = Response::decode_header(&encoded).unwrap();
+
+        // Every byte on the wire must be a printable/whitespace character —
+        // no NUL, no CR, no IAC — otherwise LinBPQ's TELNET driver mangles it.
+        for &b in &encoded {
+            assert!(
+                b == b'\n' || (0x20..=0x7e).contains(&b),
+                "wire byte 0x{:02x} is not telnet-safe",
+                b,
+            );
+        }
+
+        let (status, b64_len, header_end) =
+            Response::decode_header(&encoded).unwrap().unwrap();
         assert_eq!(status, Status::Ok);
-        assert_eq!(len, 12);
+        let payload = Response::decode_payload(
+            &encoded[header_end..header_end + b64_len as usize],
+        )
+        .unwrap();
+        assert_eq!(payload, b"test payload");
+    }
+
+    #[test]
+    fn test_response_resyncs_past_garbage() {
+        let resp = Response {
+            status: Status::Err,
+            payload: b"nope".to_vec(),
+        };
+        let mut with_prefix = b"junk banner text\r".to_vec();
+        with_prefix.extend_from_slice(&resp.encode());
+
+        let (status, b64_len, header_end) =
+            Response::decode_header(&with_prefix).unwrap().unwrap();
+        assert_eq!(status, Status::Err);
+        let payload = Response::decode_payload(
+            &with_prefix[header_end..header_end + b64_len as usize],
+        )
+        .unwrap();
+        assert_eq!(payload, b"nope");
+    }
+
+    #[test]
+    fn test_response_no_binary_bytes_in_wire() {
+        // A payload full of bytes LinBPQ historically drops (NUL) or interprets
+        // (CR, LF, IAC) must not appear raw on the wire — base64 keeps us safe.
+        let payload: Vec<u8> = (0u8..=255).collect();
+        let encoded = Response {
+            status: Status::Ok,
+            payload: payload.clone(),
+        }
+        .encode();
+
+        for &b in &encoded {
+            assert!(b != 0x00 && b != b'\r' && b != 0xff);
+        }
+
+        let (_, b64_len, header_end) =
+            Response::decode_header(&encoded).unwrap().unwrap();
+        let round_tripped = Response::decode_payload(
+            &encoded[header_end..header_end + b64_len as usize],
+        )
+        .unwrap();
+        assert_eq!(round_tripped, payload);
     }
 
     #[test]

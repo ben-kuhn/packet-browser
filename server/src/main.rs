@@ -5,7 +5,7 @@ use packet_browser_server::{
     filter::validate_url,
     logger::{LogEntry, LogStatus, Logger},
     proxy::start_proxy,
-    session::{validate_callsign, Session},
+    session::{validate_callsign_with_allowlist, Session},
 };
 use packet_browser_shared::compress::brotli_compress;
 use packet_browser_shared::protocol::{Request, Response, Status};
@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-const VERSION: &str = "0.2.0";
+const VERSION: &str = "0.3.0";
 const MAX_CONNECTIONS: usize = 50;
 const MAX_CONNECTIONS_PER_IP: usize = 5;
 const MAX_LINE_LENGTH: usize = 1024;
@@ -197,16 +197,32 @@ fn read_bounded_line(reader: &mut BufReader<TcpStream>) -> std::io::Result<Optio
 fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
 
+    // Prompt for the callsign. LinBPQ's HOST driver in `C n HOST 0 S` mode
+    // does NOT auto-inject the connecting station's callsign (verified with a
+    // packet-capturing bridge in front of the server). The client's BPQ
+    // handshake waits for a prompt containing "callsign" before it sends the
+    // configured callsign, so a plain "Enter your callsign:" is the trigger.
+    // PacketQTH's docs describe auto-injection but that behaviour depends on
+    // a different LinBPQ config (CMS mode with user table) that our HOST 0
+    // path doesn't opt into.
+    write!(stream, "Enter your callsign: ")?;
+    stream.flush()?;
+
     let callsign = match read_bounded_line(&mut reader)? {
         Some(s) => s.trim().to_string(),
         None => return Ok(()),
     };
 
-    let callsign = match validate_callsign(&callsign) {
+    let callsign = match validate_callsign_with_allowlist(&callsign, &config.allowed_callsigns) {
         Ok(call) => call,
         Err(_) => {
             eprintln!("[AUTH] Invalid callsign: {:?}", callsign);
-            send_error_response(&mut stream, "Invalid callsign format.")?;
+            // Send plain text — we're still in the pre-handshake header phase,
+            // before the framed request/response protocol starts. A brotli
+            // frame here reaches operators (via telnet or an AX.25 terminal)
+            // as garbled bytes; plain text at least tells them what's wrong.
+            let _ = writeln!(stream, "Invalid callsign format. Disconnecting.");
+            let _ = stream.flush();
             return Ok(());
         }
     };
@@ -217,12 +233,36 @@ fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::io::Res
     write!(stream, "All activity is logged including your callsign.\nType AGREE to proceed: ")?;
     stream.flush()?;
 
-    let input = match read_bounded_line(&mut reader)? {
-        Some(s) => s,
-        None => return Ok(()),
+    // LinBPQ's TELNET driver in HOST 0 S mode delivers the very first line of
+    // AX.25 input to the server TWICE: once with telnet-style CRLF conversion
+    // and again as the raw payload. That means what should be the AGREE line
+    // is often a duplicate of the callsign line. Skip any line that matches
+    // the just-validated callsign before checking for AGREE, so the operator
+    // consent step doesn't spuriously fail on the demo/off-air setup.
+    let input = loop {
+        let line = match read_bounded_line(&mut reader)? {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        let trimmed = line.trim().to_uppercase();
+        if trimmed == callsign {
+            eprintln!(
+                "[AUTH] Discarding duplicate callsign line delivered by LinBPQ for {}",
+                callsign,
+            );
+            continue;
+        }
+        break line;
     };
 
     if input.trim().to_uppercase() != "AGREE" {
+        eprintln!(
+            "[AUTH] AGREE rejected for {}. Received bytes ({} chars): {:?} hex: {:02x?}",
+            callsign,
+            input.len(),
+            input,
+            input.as_bytes(),
+        );
         writeln!(stream, "Acknowledgment required. Goodbye.")?;
         return Ok(());
     }
@@ -239,8 +279,13 @@ fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::io::Res
     );
     let _ = logger.log(&log_entry);
 
-    writeln!(stream, "\nWelcome {}! Packet browser v{} ready.\n", callsign, VERSION)?;
-
+    // Everything below AGREE flows through the framed binary protocol
+    // (status byte + payload_len + brotli payload). Do NOT write plain text
+    // here: a banner or auto-fetched portal response gets interleaved into
+    // the byte stream and the next framed Response the client tries to read
+    // starts partway through it, so `payload_len` parses as garbage
+    // ("Invalid frame: Announced payload_len ..."). If a landing page is
+    // desired the client should request it explicitly.
     eprintln!("[BROWSER] Initializing for {}", callsign);
     let mut browser: Option<BrowserInstance> = match BrowserInstance::new(&callsign) {
         Ok(b) => { eprintln!("[BROWSER] Ready for {}", callsign); Some(b) }
@@ -250,11 +295,6 @@ fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::io::Res
             return Ok(());
         }
     };
-
-    eprintln!("[PORTAL] Loading {} for {}", config.portal_url, callsign);
-    if let Err(e) = handle_request(&mut session, &mut browser, &callsign, &config, &logger, &mut stream, &config.portal_url) {
-        eprintln!("[PORTAL] Failed for {}: {}", callsign, e);
-    }
 
     loop {
         if session.is_timed_out(config.idle_timeout_minutes) {

@@ -136,6 +136,8 @@ pub fn create_router(ctx: Arc<AppContext>) -> Router {
         .route("/api/agwpe-status", post(api_agwpe_status_post))
         .route("/api/connect", post(api_connect_handler))
         .route("/api/disconnect", post(api_disconnect_handler))
+        .route("/api/consent", get(api_consent_get))
+        .route("/api/consent", post(api_consent_post))
         .route("/api/config", get(api_config_get))
         .route("/api/config", post(api_config_post))
         .route("/events", get(events_handler))
@@ -227,6 +229,7 @@ async fn connect_page_handler(
         ConnectionState::Disconnected => "status-disconnected",
         ConnectionState::AgwpeConnected => "status-agwpe-connected",
         ConnectionState::Connecting => "status-connecting",
+        ConnectionState::AwaitingConsent { .. } => "status-connecting",
         ConnectionState::Connected => "status-connected",
         ConnectionState::Error(_) => "status-error",
     };
@@ -276,13 +279,16 @@ async fn browse_get_handler(
     let url = match params.url {
         Some(u) if !u.is_empty() => u,
         _ => {
-            let state = ctx.state.lock_or_poisoned();
-            let portal_url = state.config.target_callsign.clone();
-            drop(state);
-            if portal_url.is_empty() {
-                return Redirect::to("/connect").into_response();
+            // No URL yet — this is the landing form. Only serve it once the
+            // AX.25 link is up; otherwise send the user back to /connect so
+            // they can bring the session up first.
+            {
+                let state = ctx.state.lock_or_poisoned();
+                if state.connection_state != ConnectionState::Connected {
+                    return Redirect::to("/connect").into_response();
+                }
             }
-            return Html(ui::error_page("No URL provided")).into_response();
+            return Html(ui::browse_page("", "")).into_response();
         }
     };
 
@@ -333,48 +339,47 @@ async fn handle_browse(
 
     match ctx.agwpe.send_request(encoded).await {
         Ok(response_data) => {
-            if response_data.len() < 5 {
-                return Html(ui::error_page("Invalid response from server")).into_response();
+            let (status, b64_len, header_end) = match ProtocolResponse::decode_header(&response_data) {
+                Ok(Some(triple)) => triple,
+                Ok(None) => {
+                    return Html(ui::error_page("Incomplete response header")).into_response();
+                }
+                Err(e) => {
+                    return Html(ui::error_page(&format!("Invalid response header: {}", e))).into_response();
+                }
+            };
+
+            let b64_end = header_end + b64_len as usize;
+            if response_data.len() < b64_end {
+                return Html(ui::error_page("Incomplete response payload")).into_response();
             }
 
-            match ProtocolResponse::decode_header(&response_data) {
-                Ok((status, payload_len)) => {
-                    let payload = &response_data[5..];
-                    if payload.len() < payload_len as usize {
-                        return Html(ui::error_page("Incomplete response")).into_response();
-                    }
-
-                    match brotli_decompress(&payload[..payload_len as usize]) {
-                        Ok(decompressed) => {
-                            match String::from_utf8(decompressed) {
-                                Ok(html) => {
-                                    match status {
-                                        Status::Ok => {
-                                            match rewrite_html(&html, url) {
-                                                Ok(rewritten) => {
-                                                    Html(ui::browse_page(&rewritten, url)).into_response()
-                                                }
-                                                Err(e) => {
-                                                    Html(ui::error_page(&format!("Failed to rewrite HTML: {}", e)))
-                                                        .into_response()
-                                                }
-                                            }
-                                        }
-                                        Status::Err => {
-                                            Html(ui::error_page(&format!("Server error: {}", html))).into_response()
-                                        }
-                                        Status::Blocked => {
-                                            Html(ui::error_page(&format!("URL blocked: {}", html))).into_response()
-                                        }
-                                    }
-                                }
-                                Err(_) => Html(ui::error_page("Invalid UTF-8 in response")).into_response(),
-                            }
-                        }
-                        Err(e) => Html(ui::error_page(&format!("Decompression failed: {}", e))).into_response(),
-                    }
+            let compressed = match ProtocolResponse::decode_payload(&response_data[header_end..b64_end]) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return Html(ui::error_page(&format!("Base64 decode failed: {}", e))).into_response();
                 }
-                Err(e) => Html(ui::error_page(&format!("Invalid response header: {}", e))).into_response(),
+            };
+
+            let decompressed = match brotli_decompress(&compressed) {
+                Ok(d) => d,
+                Err(e) => {
+                    return Html(ui::error_page(&format!("Decompression failed: {}", e))).into_response();
+                }
+            };
+            let html = match String::from_utf8(decompressed) {
+                Ok(h) => h,
+                Err(_) => {
+                    return Html(ui::error_page("Invalid UTF-8 in response")).into_response();
+                }
+            };
+            match status {
+                Status::Ok => match rewrite_html(&html, url) {
+                    Ok(rewritten) => Html(ui::browse_page(&rewritten, url)).into_response(),
+                    Err(e) => Html(ui::error_page(&format!("Failed to rewrite HTML: {}", e))).into_response(),
+                },
+                Status::Err => Html(ui::error_page(&format!("Server error: {}", html))).into_response(),
+                Status::Blocked => Html(ui::error_page(&format!("URL blocked: {}", html))).into_response(),
             }
         }
         Err(e) => Html(ui::error_page(&format!("Request failed: {}", e))).into_response(),
@@ -546,6 +551,72 @@ async fn api_disconnect_handler(
             ok: false,
             state: None,
             error: Some(e.to_string()),
+        }),
+    }
+}
+
+#[derive(Serialize)]
+struct ConsentInfoResponse {
+    awaiting: bool,
+    disclaimer: Option<String>,
+}
+
+async fn api_consent_get(
+    Extension(ctx): Extension<Arc<AppContext>>,
+) -> Json<ConsentInfoResponse> {
+    let state = ctx.state.lock_or_poisoned();
+    match &state.connection_state {
+        crate::state::ConnectionState::AwaitingConsent { disclaimer } => {
+            Json(ConsentInfoResponse {
+                awaiting: true,
+                disclaimer: Some(disclaimer.clone()),
+            })
+        }
+        _ => Json(ConsentInfoResponse {
+            awaiting: false,
+            disclaimer: None,
+        }),
+    }
+}
+
+#[derive(Deserialize)]
+struct ConsentDecision {
+    accepted: bool,
+}
+
+#[derive(Serialize)]
+struct ConsentResponse {
+    ok: bool,
+    error: Option<String>,
+}
+
+async fn api_consent_post(
+    Extension(ctx): Extension<Arc<AppContext>>,
+    Json(decision): Json<ConsentDecision>,
+) -> Json<ConsentResponse> {
+    // Take the sender out under the lock, then drop the guard before sending
+    // so we never hold the mutex across the wake. If the slot is empty, the
+    // handshake either already resumed or was never paused — either way this
+    // is a no-op the caller should treat as "nothing to consent to."
+    let sender = {
+        let mut s = ctx.state.lock_or_poisoned();
+        s.pending_consent.take()
+    };
+    match sender {
+        Some(tx) => {
+            if tx.send(decision.accepted).is_err() {
+                // Receiver already dropped (e.g. handshake cancelled while
+                // this request was in flight). Treat as a no-op.
+                return Json(ConsentResponse {
+                    ok: false,
+                    error: Some("Handshake no longer awaiting consent".to_string()),
+                });
+            }
+            Json(ConsentResponse { ok: true, error: None })
+        }
+        None => Json(ConsentResponse {
+            ok: false,
+            error: Some("No consent prompt is pending".to_string()),
         }),
     }
 }

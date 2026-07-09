@@ -2,7 +2,9 @@
 
 [![Build and Publish](https://github.com/ben-kuhn/packet-browser/actions/workflows/build.yml/badge.svg)](https://github.com/ben-kuhn/packet-browser/actions/workflows/build.yml)
 
-A client/server web browser for packet radio. The **server** (behind BPQ) fetches and sanitizes web pages using headless Firefox, compresses them with brotli, and sends them over AX.25. The **client** connects via AGWPE and provides a local web proxy that users browse with their regular browser.
+A client/server web browser for packet radio. The **server** (behind BPQ) fetches and sanitizes web pages using headless Firefox, compresses them with brotli, and sends them over AX.25 in a printable, telnet-transparent framing. The **client** connects via AGWPE and provides a local web proxy that users browse with their regular browser.
+
+All data crossing the air interface is public, unencrypted, and decodable with published algorithms (RFC 7932 brotli, RFC 4648 base64) — see [Wire Format & Part 97 Compliance](#wire-format--part-97-compliance) below.
 
 ## Architecture
 
@@ -37,25 +39,62 @@ A client/server web browser for packet radio. The **server** (behind BPQ) fetche
 3. **Client** sends BPQ APPLICATION command (e.g., `WEB`) to trigger the browser application
 4. **BPQ** connects to the **server** via TCP (port 63004)
 5. **Server** prompts for callsign, client sends it
-6. **Server** shows logging disclaimer, client sends `AGREE`
+6. **Server** shows logging disclaimer, client waits for operator consent, then sends `AGREE`
 7. User opens browser to client's web UI (default `http://localhost:8080`)
 8. User enters a URL or clicks links
-9. **Client** sends request over AX.25 to **server**
-10. **Server** fetches page with headless Firefox, sanitizes HTML, compresses with brotli
-11. **Server** sends compressed response back over AX.25
-12. **Client** decompresses, rewrites URLs to route through local proxy, displays in browser
+9. **Client** sends a plain-text `GET <url>\n` (or `POST <url>\n<len_be><body>`) request over AX.25 to the **server**
+10. **Server** fetches page with headless Firefox, sanitizes HTML, brotli-compresses the result, then base64-encodes it inside a printable `RESP…` frame
+11. **Server** sends the framed, base64-encoded response back over AX.25
+12. **Client** finds the `RESP` frame, base64-decodes and brotli-decompresses, rewrites URLs to route through the local proxy, and displays in the browser
 
 ### BPQ Handshake
 
-After AX.25 connection is established, the client performs an automated handshake:
+After AX.25 connection is established, the client performs an automated handshake. All bytes exchanged in the handshake are printable ASCII:
 
-1. Client sends the BPQ APPLICATION command (e.g., `WEB\n`)
-2. BPQ recognizes the command and connects to the server via TCP
-3. Server sends callsign prompt, client sends configured callsign
-4. Server sends logging disclaimer with "AGREE" prompt, client sends `AGREE\n`
-5. Server sends portal page, handshake complete
+1. Client sends the BPQ APPLICATION command (e.g., `WEB\n`), unless configured to skip it for a direct-alias connection.
+2. BPQ recognizes the command and opens a TCP session to the server.
+3. Server sends `Enter your callsign: `; client replies with the operator's configured callsign followed by `\n`.
+4. Server sends the logging disclaimer text with a `Type AGREE to proceed: ` prompt. The client surfaces the disclaimer verbatim to the operator via a consent modal in the local web UI and blocks until the operator explicitly agrees.
+5. On consent, the client sends `AGREE\n`. The server records the acknowledgement in its access log and switches into the framed request/response protocol.
 
-This is fully automated - no user interaction required.
+The AGREE step is the real consent gate: the client does not auto-answer AGREE on the operator's behalf. If the operator declines or times out, the client tears down the AX.25 link. LinBPQ's HOST-0 telnet driver has been observed to duplicate the first line of AX.25 input to the server; the server tolerates this by discarding a second copy of the just-validated callsign before checking for `AGREE`.
+
+### Wire Format & Part 97 Compliance
+
+Everything Packet Browser puts on the air is transmitted in the clear and can be recovered by any observer with the same freely-available tooling. There is no encryption, no proprietary transform, no shared secret. The two transformations applied to the payload — brotli compression and base64 encoding — are both well-known techniques whose specifications are published for public use, satisfying 47 CFR §97.113(a)(4) and §97.309(a)(4).
+
+**Request bytes (client → server).** Plain ASCII, LF-terminated:
+
+- `GET <url>\n`
+- `POST <url>\n<body_length_big_endian_u32><body_bytes>`
+
+`<url>` is a UTF-8 URL string. Nothing about the request is compressed or encoded — a listener sees the URL verbatim.
+
+**Response bytes (server → client).** A printable, telnet-transparent text frame:
+
+```
+RESP<status> <base64_len>\n<base64_payload>\n
+```
+
+- `RESP` — 4-byte ASCII magic (`0x52 0x45 0x53 0x50`) so a receiver can resync past any node banner text prepended by the transport.
+- `<status>` — one ASCII digit: `0` = Ok, `1` = server error, `2` = URL blocked by the sysop's filter.
+- `<base64_len>` — decimal ASCII length (in bytes) of the base64 payload that follows.
+- Header terminator is `\n` or `\r` (LinBPQ's TELNET driver rewrites one to the other in either direction; either is accepted).
+- `<base64_payload>` — the response body encoded with **RFC 4648 standard base64** (alphabet `A–Z a–z 0–9 + / =`, padded). Decoding the base64 yields the **RFC 7932 brotli**-compressed HTML (or plain-text error message for statuses `1` and `2`). Decompressing the brotli yields UTF-8 HTML that the operator's browser then renders. **Both algorithms are open, publicly documented, and implemented by widely available open-source libraries** (`brotli` and `base64` crates on the wire; any web browser's built-in brotli decoder and `openssl base64 -d` will recover the same bytes off a monitored packet capture).
+
+**Why the two transformations?**
+
+- **Brotli compression** — bandwidth. A typical modern web page is tens to hundreds of kilobytes; brotli at quality 11 typically produces a 10× reduction, which is the difference between a page arriving in seconds and arriving in minutes over a 1200-baud AX.25 link. Brotli is a lossless, deterministic reversal — the exact bytes the server's Firefox emitted are recoverable byte-for-byte.
+- **Base64 encoding** — transport transparency, **not** to hide meaning. LinBPQ's TELNET / HOST-mode driver has been observed to strip NUL bytes (`0x00`) from the byte stream and to rewrite `\n` ↔ `\r` in both directions. The old raw-binary framing lost the leading bytes of every response and any brotli output that happened to contain a `0x00` byte. Base64 restricts the on-air bytes to `A–Z a–z 0–9 + / = \n \r` — all of which the driver leaves alone — so the receiver reconstructs the exact compressed bytes.
+
+**Part 97 rationale.** §97.113(a)(4) prohibits "messages encoded for the purpose of obscuring their meaning." §97.309(a)(4) permits digital codes so long as the technique is "publicly documented" and the receiver has access to the specification. Packet Browser satisfies both:
+
+- No encryption of any kind is applied. There is no key, shared secret, or per-station transformation.
+- Both transformations are standardized, non-proprietary, and reversible with off-the-shelf software. RFC 4648 and RFC 7932 are freely readable; base64 decoders ship with virtually every OS; brotli decoders ship in every major web browser and are available as an open-source Rust crate (`brotli`), a C library (`libbrotli`), a Python module (`brotli`), and a command-line tool (`brotli(1)`).
+- A third-party operator monitoring the frequency who reads this section can, with those tools alone, recover the exact HTML page that was transmitted. The intent and effect of the encoding is bandwidth reduction and transport-layer safety, not concealment.
+- The server logs every URL retrieved (with the requesting operator's callsign and a timestamp) to `/var/log/packet-browser/access.log`, so the operator has a plain-text audit trail of what has been transmitted through their station.
+
+The full protocol source of truth is `shared/src/protocol.rs` (`Response::encode` and `Response::decode_header`). The tests in that file assert that no NUL, CR, or `0xFF` byte ever appears on the wire and that the round trip is byte-exact for every possible payload byte value.
 
 ---
 

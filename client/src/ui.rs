@@ -75,6 +75,47 @@ button.danger:hover { background: #a52a2a; }
 .form-group input, .form-group select {
     width: 100%;
 }
+.form-group input[type="checkbox"] {
+    width: auto;
+    margin: 0.25em 0 0;
+}
+.modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(10, 15, 30, 0.75);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    padding: 1em;
+}
+.modal {
+    background: #16213e;
+    border: 1px solid #0f3460;
+    border-radius: 8px;
+    padding: 1.25em 1.5em;
+    max-width: 640px;
+    width: 100%;
+    max-height: 90vh;
+    overflow-y: auto;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+}
+.consent-disclaimer {
+    background: #0f1a2e;
+    border: 1px solid #0f3460;
+    border-radius: 4px;
+    padding: 0.75em 1em;
+    color: #e6ecf5;
+    /* Prose, not code: inherit the page body font instead of forcing a
+       monospace stack whose named fonts (SF Mono, Consolas) don't exist on
+       Linux and fall back to the ugly default `monospace` glyphs. */
+    font-family: inherit;
+    font-size: 0.95em;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin: 0.75em 0;
+}
 .status-badge {
     display: inline-block;
     padding: 0.25em 0.75em;
@@ -100,7 +141,10 @@ button.danger:hover { background: #a52a2a; }
     margin-bottom: 1em;
 }
 .debug-log {
-    font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+    /* System monospace fallback chain: try the OS's own before dropping to
+       the CSS generic, which on Linux without SF Mono/Fira Code/Consolas
+       renders as an unstyled bitmap. */
+    font-family: ui-monospace, 'Cascadia Mono', 'JetBrains Mono', 'DejaVu Sans Mono', 'Liberation Mono', Menlo, Consolas, monospace;
     font-size: 0.8em;
     background: #0a0a1a;
     border: 1px solid #0f3460;
@@ -172,6 +216,7 @@ pub fn connect_page(
 <body>
     <nav>
         <a href="/connect" class="active">Connect</a>
+        <a href="/browse">Browse</a>
         <a href="/configuration">Configuration</a>
     </nav>
 
@@ -205,17 +250,20 @@ pub fn connect_page(
         </div>
     </div>
 
-    <div class="card" id="browse-card" style="display:none">
-        <h2>Browse the Web</h2>
-        <form action="/browse" method="GET">
-            <div class="browse-bar">
-                <input type="text" name="url" placeholder="https://example.com" autocomplete="off" required>
-                <button type="submit" class="primary">Go</button>
-            </div>
-        </form>
-    </div>
-
     <div id="msg-area"></div>
+
+    <div id="consent-modal" class="modal-backdrop" style="display:none" role="dialog" aria-modal="true" aria-labelledby="consent-modal-title">
+        <div class="modal">
+            <h2 id="consent-modal-title">Confirm connection</h2>
+            <p>The remote station is asking you to acknowledge the following notice before continuing:</p>
+            <pre id="consent-disclaimer" class="consent-disclaimer"></pre>
+            <p>Only agree if you accept the notice above.</p>
+            <div class="btn-row">
+                <button class="primary" onclick="submitConsent(true)">I Agree</button>
+                <button class="danger" onclick="submitConsent(false)">Decline &amp; Disconnect</button>
+            </div>
+        </div>
+    </div>
 
     <div class="card">
         <h2>Debug Log</h2>
@@ -261,13 +309,62 @@ pub fn connect_page(
             const btnConnect = document.getElementById('btn-connect');
             const btnDisconnect = document.getElementById('btn-disconnect');
 
-            btnAgwpe.disabled = (state === 'AGWPE Connected' || state === 'Connecting' || state === 'Connected');
+            const busy = (state === 'Connecting' || state === 'Awaiting consent');
+            btnAgwpe.disabled = (state === 'AGWPE Connected' || busy || state === 'Connected');
             btnConnect.disabled = (state !== 'AGWPE Connected');
-            btnDisconnect.disabled = (state !== 'Connected' && state !== 'Connecting');
+            btnDisconnect.disabled = (state !== 'Connected' && !busy);
 
-            // Reveal the Browse card only after the AX.25 link is up.
-            const browseCard = document.getElementById('browse-card');
-            if (browseCard) browseCard.style.display = (state === 'Connected') ? 'block' : 'none';
+            if (state === 'Awaiting consent') {{
+                openConsentModal();
+            }} else {{
+                closeConsentModal();
+            }}
+        }}
+
+        let consentOpen = false;
+        async function openConsentModal() {{
+            if (consentOpen) return;
+            consentOpen = true;
+            try {{
+                const resp = await fetch('/api/consent');
+                const data = await resp.json();
+                if (!data.awaiting) {{ consentOpen = false; return; }}
+                document.getElementById('consent-disclaimer').textContent =
+                    data.disclaimer || '(no disclaimer text provided)';
+                document.getElementById('consent-modal').style.display = 'flex';
+            }} catch (e) {{
+                consentOpen = false;
+                showMsg('Could not fetch consent prompt: ' + e.message, true);
+            }}
+        }}
+
+        function closeConsentModal() {{
+            document.getElementById('consent-modal').style.display = 'none';
+            consentOpen = false;
+        }}
+
+        async function submitConsent(accepted) {{
+            closeConsentModal();
+            try {{
+                const resp = await fetch('/api/consent', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ accepted: accepted }})
+                }});
+                const data = await resp.json();
+                if (!data.ok) {{
+                    showMsg(data.error || 'Consent submission failed', true);
+                    return;
+                }}
+                if (!accepted) {{
+                    showMsg('Declined. Disconnecting.');
+                    // Give the background handshake a moment to unwind, then
+                    // force-tear-down so we don't leave a half-open session.
+                    setTimeout(() => {{ ax25Disconnect(); }}, 250);
+                }}
+            }} catch (e) {{
+                showMsg('Error: ' + e.message, true);
+            }}
         }}
 
         function showMsg(text, isError) {{
@@ -318,7 +415,12 @@ pub fn connect_page(
                 const data = await resp.json();
                 if (data.ok) {{
                     updateUI('Connected');
-                    showMsg('AX.25 connected to ' + target);
+                    showMsg('AX.25 connected to ' + target + '. Opening browser…');
+                    // Send the user straight to the browse UI so there's an
+                    // obvious next step; the connect page has no other job
+                    // once the link is up.
+                    window.location.href = '/browse';
+                    return;
                 }} else {{
                     updateUI(data.state || 'Error');
                     showMsg(data.error || 'Connection failed', true);
@@ -386,6 +488,14 @@ pub fn connect_page(
                 try {{
                     const entry = JSON.parse(event.data);
                     addLogEntry(entry);
+                    // State transitions arrive as STATE-category log lines of
+                    // the form "State changed to: <name>". Parse them so the
+                    // UI can react to the AwaitingConsent → Connected flip
+                    // even while /api/connect is still awaiting server-side.
+                    if (entry.category === 'STATE') {{
+                        const m = /^State changed to:\s*(.+)$/.exec(entry.message);
+                        if (m) updateUI(m[1].trim());
+                    }}
                 }} catch (e) {{}}
             }};
             eventSource.onerror = function() {{
@@ -437,6 +547,7 @@ pub fn configuration_page(
 <body>
     <nav>
         <a href="/connect">Connect</a>
+        <a href="/browse">Browse</a>
         <a href="/configuration" class="active">Configuration</a>
     </nav>
 
@@ -474,17 +585,15 @@ pub fn configuration_page(
         </div>
 
         <div class="form-group">
+            <label for="skip-bpq-app">Skip BPQ Application Command</label>
+            <input type="checkbox" id="skip-bpq-app" {skip_checked} onchange="updateBpqCommandVisibility()">
+            <small>Enable if connecting directly to a node SSID that doesn't require an application command</small>
+        </div>
+
+        <div class="form-group" id="bpq-command-group">
             <label for="bpq-command">BPQ Application Command</label>
             <input type="text" id="bpq-command" value="{bpq_command}" placeholder="WEB">
             <small>The application command sent after connecting (e.g., WEB, BBS)</small>
-        </div>
-
-        <div class="form-group">
-            <label>
-                <input type="checkbox" id="skip-bpq-app" {skip_checked}>
-                Skip BPQ Application Command
-            </label>
-            <small>Enable if connecting directly to a node SSID that doesn't require an application command</small>
         </div>
 
         <div class="btn-row">
@@ -500,6 +609,11 @@ pub fn configuration_page(
             setTimeout(() => area.innerHTML = '', 5000);
         }}
 
+        function updateBpqCommandVisibility() {{
+            const skipped = document.getElementById('skip-bpq-app').checked;
+            document.getElementById('bpq-command-group').style.display = skipped ? 'none' : '';
+        }}
+
         async function loadConfig() {{
             try {{
                 const resp = await fetch('/api/config');
@@ -510,6 +624,7 @@ pub fn configuration_page(
                 document.getElementById('target-callsign').value = data.target_callsign || '';
                 document.getElementById('bpq-command').value = data.bpq_command || 'WEB';
                 document.getElementById('skip-bpq-app').checked = data.skip_bpq_app || false;
+                updateBpqCommandVisibility();
             }} catch (e) {{
                 showMsg('Failed to load config: ' + e.message, true);
             }}
@@ -592,6 +707,7 @@ pub fn error_page(message: &str) -> String {
 <body>
     <nav>
         <a href="/connect">Connect</a>
+        <a href="/browse">Browse</a>
         <a href="/configuration">Configuration</a>
     </nav>
 
@@ -642,10 +758,11 @@ pub fn browse_page(html_content: &str, url: &str) -> String {
 </head>
 <body style="max-width:none;padding:0">
     <div class="browse-header">
-        <a href="/connect">Back</a>
+        <a href="/connect">Connect</a>
+        <a href="/configuration">Config</a>
         <form action="/browse" method="GET" style="display:flex;gap:0.5em;flex:1">
-            <input type="text" name="url" value="{url}" placeholder="Enter URL...">
-            <button type="submit">Go</button>
+            <input type="text" name="url" value="{url}" placeholder="Enter a URL, e.g. https://example.com" autocomplete="off" autofocus>
+            <button type="submit" class="primary">Go</button>
         </form>
     </div>
     <div class="browse-content">

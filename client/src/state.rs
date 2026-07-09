@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use tokio::sync::oneshot;
 
 use crate::config::FileConfig;
 
@@ -24,6 +25,11 @@ pub enum ConnectionState {
     Disconnected,
     AgwpeConnected,
     Connecting,
+    /// BPQ handshake reached the "type AGREE to proceed" prompt and is
+    /// waiting for the operator to acknowledge in the UI. The variant holds
+    /// the exact disclaimer text so we can surface what the operator is
+    /// consenting to.
+    AwaitingConsent { disclaimer: String },
     Connected,
     Error(String),
 }
@@ -34,6 +40,9 @@ impl std::fmt::Display for ConnectionState {
             ConnectionState::Disconnected => write!(f, "Disconnected"),
             ConnectionState::AgwpeConnected => write!(f, "AGWPE Connected"),
             ConnectionState::Connecting => write!(f, "Connecting"),
+            // Fixed string only — the disclaimer body is fetched via
+            // /api/consent, not through the state Display used for log lines.
+            ConnectionState::AwaitingConsent { .. } => write!(f, "Awaiting consent"),
             ConnectionState::Connected => write!(f, "Connected"),
             ConnectionState::Error(msg) => write!(f, "Error: {}", msg),
         }
@@ -117,6 +126,11 @@ pub struct AppState {
     pub debug_log: VecDeque<DebugLogEntry>,
     pub available_ports: Vec<PortInfo>,
     pub agwpe_port_num: Option<u8>,
+    /// One-shot the background BPQ handshake is awaiting on while parked in
+    /// `AwaitingConsent`. `/api/consent` takes it out and sends the
+    /// operator's decision; if the connect is cancelled another way, dropping
+    /// it wakes the handshake with `RecvError`, treated as a decline.
+    pub pending_consent: Option<oneshot::Sender<bool>>,
     log_capacity: usize,
 }
 
@@ -128,6 +142,7 @@ impl AppState {
             debug_log: VecDeque::new(),
             available_ports: Vec::new(),
             agwpe_port_num: None,
+            pending_consent: None,
             log_capacity: 1000,
         }
     }
@@ -138,13 +153,19 @@ impl AppState {
         self
     }
 
-    pub fn set_connection_state(&mut self, state: ConnectionState) {
+    /// Returns the STATE log entry that was appended, so the caller can also
+    /// broadcast it on the SSE `log_tx` channel. Without that broadcast the
+    /// UI never sees state transitions (e.g. `AwaitingConsent`) and things
+    /// like the consent modal never open.
+    pub fn set_connection_state(&mut self, state: ConnectionState) -> DebugLogEntry {
         self.connection_state = state.clone();
-        self.add_log(DebugLogEntry::new(
+        let entry = DebugLogEntry::new(
             LogLevel::Info,
             "STATE",
             &format!("State changed to: {}", state),
-        ));
+        );
+        self.add_log(entry.clone());
+        entry
     }
 
     pub fn set_error(&mut self, error: &str) {
@@ -208,6 +229,10 @@ mod tests {
         assert_eq!(
             ConnectionState::Error("test".to_string()).to_string(),
             "Error: test"
+        );
+        assert_eq!(
+            ConnectionState::AwaitingConsent { disclaimer: "x".to_string() }.to_string(),
+            "Awaiting consent"
         );
     }
 
