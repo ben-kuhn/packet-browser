@@ -57,7 +57,7 @@ save_pid() { echo "$1" >> "$DEMO_DIR/pids"; }
 check_dependencies() {
     log "Checking dependencies..."
     local missing=()
-    for cmd in direwolf linbpq pw-link pw-dump python3; do
+    for cmd in direwolf linbpq pw-link pw-dump python3 firefox geckodriver; do
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
     if [[ ! -f "$SCRIPT_DIR/target/debug/packet-browser-server" ]]; then
@@ -474,7 +474,12 @@ start_server() {
     export IDLE_TIMEOUT_MINUTES=10
     export BROTLI_QUALITY=11
     export BLOCKLIST_ENABLED=false
-    export CHROMIUM_PATH=$(which chromium 2>/dev/null || echo "/usr/bin/chromium")
+    # Post-Firefox-swap: the server spawns geckodriver + firefox and defaults
+    # to /bin/geckodriver and /bin/firefox (the layout inside the hardened
+    # container). On the demo host we resolve them from PATH so nix-develop
+    # store paths work without touching the server's production defaults.
+    export FIREFOX_PATH=$(command -v firefox)
+    export GECKODRIVER_PATH=$(command -v geckodriver)
     # Off-air test callsigns. These wouldn't pass the ITU-shape regex the
     # server enforces on production ("DEMOUSR" has no digit in position 4),
     # so they're whitelisted here so LinBPQ's auto-injected identifier can
