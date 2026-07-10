@@ -1,5 +1,5 @@
 Name: packet-browser-client
-Version: 0.2.0
+Version: %{?pkg_version}%{!?pkg_version:0.1.1}
 Release: 1%{?dist}
 Summary: Client component for Packet Browser - Web browser over AX.25 packet radio
 License: MIT
@@ -49,5 +49,7 @@ rm -rf /tmp/packet-browser-extract
 %{_unitdir}/packet-browser-client.service
 
 %changelog
+* Thu Jul  9 2026 Ben Kuhn <ben@ben-kuhn.com> - 0.1.1-1
+- time crate security bump (GHSA-r6v5-fh4h-64xc)
 * Thu Jun 26 2026 Your Name <your.email@example.com> - 0.2.0-1
 - Initial package

@@ -167,44 +167,52 @@ jobs:
           mkdir -p extracted
           tar -xzf artifacts/packet-browser-x86_64-unknown-linux-gnu.tar.gz -C extracted/
 
+      - name: Extract package version
+        id: version
+        run: |
+          VERSION=$(grep -m1 '^version' client/Cargo.toml | cut -d'"' -f2)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
       - name: Build Debian package
         run: |
           mkdir -p deb-build/DEBIAN
           mkdir -p deb-build/usr/bin
           mkdir -p deb-build/etc/packet-browser
           mkdir -p deb-build/lib/systemd/system
-          
+
           cp extracted/packet-browser-client deb-build/usr/bin/
           cp extracted/config.example.ini deb-build/etc/packet-browser/
           cp extracted/packet-browser-client.service deb-build/lib/systemd/system/
-          
-          cat > deb-build/DEBIAN/control << 'EOF'
+
+          cat > deb-build/DEBIAN/control << EOF
           Package: packet-browser-client
-          Version: 0.2.0
+          Version: ${VERSION}
           Architecture: amd64
           Maintainer: Your Name <your.email@example.com>
           Description: Client component for Packet Browser
            Web browser over AX.25 packet radio
           Depends: libc6, libssl3
           EOF
-          
-          dpkg-deb --build deb-build packet-browser-client_0.2.0_amd64.deb
+
+          dpkg-deb --build deb-build "packet-browser-client_${VERSION}_amd64.deb"
 
       - name: Build RPM package
         run: |
           mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
           cp artifacts/packet-browser-x86_64-unknown-linux-gnu.tar.gz rpmbuild/SOURCES/
           cp packaging/rpm/packet-browser-client.spec rpmbuild/SPECS/
-          
-          rpmbuild --define "_topdir $(pwd)/rpmbuild" -bb rpmbuild/SPECS/packet-browser-client.spec
-          
+
+          rpmbuild --define "_topdir $(pwd)/rpmbuild" \
+                   --define "pkg_version ${VERSION}" \
+                   -bb rpmbuild/SPECS/packet-browser-client.spec
+
           cp rpmbuild/RPMS/x86_64/*.rpm .
 
       - name: Upload Debian package
         uses: actions/upload-artifact@v4
         with:
           name: packet-browser-client-deb
-          path: packet-browser-client_0.2.0_amd64.deb
+          path: packet-browser-client_${{ env.VERSION }}_amd64.deb
 
       - name: Upload RPM package
         uses: actions/upload-artifact@v4
@@ -286,7 +294,7 @@ jobs:
             artifacts/packet-browser-x86_64-pc-windows-msvc/packet-browser-x86_64-pc-windows-msvc.zip
             artifacts/packet-browser-x86_64-apple-darwin/packet-browser-x86_64-apple-darwin.tar.gz
             artifacts/packet-browser-aarch64-apple-darwin/packet-browser-aarch64-apple-darwin.tar.gz
-            artifacts/packet-browser-client-deb/packet-browser-client_0.2.0_amd64.deb
+            artifacts/packet-browser-client-deb/*.deb
             artifacts/packet-browser-client-rpm/*.rpm
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
