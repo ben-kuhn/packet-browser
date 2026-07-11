@@ -5,6 +5,16 @@ set -euo pipefail
 # Sets up a complete off-air test environment with virtual radio
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# The demo relies on direwolf, linbpq, geckodriver, firefox, etc. that only
+# live in the flake's dev shell. If we're not already inside it and a flake
+# is present, re-exec through `nix develop` so the user doesn't have to
+# remember. Set PACKET_BROWSER_SKIP_NIX=1 to opt out (e.g. non-Nix systems
+# where the deps are on PATH by other means).
+if [[ -z "${IN_NIX_SHELL:-}" && -z "${PACKET_BROWSER_SKIP_NIX:-}" && -f "$SCRIPT_DIR/flake.nix" ]] && command -v nix >/dev/null; then
+    exec nix --extra-experimental-features 'nix-command flakes' \
+        develop "$SCRIPT_DIR" -c "$0" "$@"
+fi
 DEMO_DIR=$(mktemp -d)
 trap 'cleanup' EXIT
 
