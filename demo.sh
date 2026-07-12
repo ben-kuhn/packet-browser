@@ -7,11 +7,18 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # The demo relies on direwolf, linbpq, geckodriver, firefox, etc. that only
-# live in the flake's dev shell. If we're not already inside it and a flake
-# is present, re-exec through `nix develop` so the user doesn't have to
-# remember. Set PACKET_BROWSER_SKIP_NIX=1 to opt out (e.g. non-Nix systems
-# where the deps are on PATH by other means).
-if [[ -z "${IN_NIX_SHELL:-}" && -z "${PACKET_BROWSER_SKIP_NIX:-}" && -f "$SCRIPT_DIR/flake.nix" ]] && command -v nix >/dev/null; then
+# live in the flake's dev shell on this host. If any of those aren't on PATH
+# yet and a flake is present, re-exec through `nix develop` so the user
+# doesn't have to remember to enter it first. If they're already resolvable
+# (dev shell, system packages, wrapper script), we run inline.
+PATH_DEPS=(direwolf linbpq pw-link pw-dump python3 firefox geckodriver)
+_have_all_path_deps() {
+    local cmd
+    for cmd in "${PATH_DEPS[@]}"; do
+        command -v "$cmd" >/dev/null 2>&1 || return 1
+    done
+}
+if ! _have_all_path_deps && [[ -f "$SCRIPT_DIR/flake.nix" ]] && command -v nix >/dev/null 2>&1; then
     exec nix --extra-experimental-features 'nix-command flakes' \
         develop "$SCRIPT_DIR" -c "$0" "$@"
 fi
@@ -67,7 +74,7 @@ save_pid() { echo "$1" >> "$DEMO_DIR/pids"; }
 check_dependencies() {
     log "Checking dependencies..."
     local missing=()
-    for cmd in direwolf linbpq pw-link pw-dump python3 firefox geckodriver; do
+    for cmd in "${PATH_DEPS[@]}"; do
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
     if [[ ! -f "$SCRIPT_DIR/target/debug/packet-browser-server" ]]; then
