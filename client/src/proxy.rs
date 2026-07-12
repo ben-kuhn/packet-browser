@@ -378,8 +378,11 @@ async fn handle_browse(
                     Ok(rewritten) => Html(ui::browse_page(&rewritten, url)).into_response(),
                     Err(e) => Html(ui::error_page(&format!("Failed to rewrite HTML: {}", e))).into_response(),
                 },
-                Status::Err => Html(ui::error_page(&format!("Server error: {}", html))).into_response(),
-                Status::Blocked => Html(ui::error_page(&format!("URL blocked: {}", html))).into_response(),
+                // The server now sends a self-describing message ("Host could
+                // not be resolved: X", "Blocked host: Y", ...) so pass it
+                // through verbatim rather than wrapping in a generic prefix
+                // that used to mask the actual cause.
+                Status::Err | Status::Blocked => Html(ui::error_page(&html)).into_response(),
             }
         }
         Err(e) => Html(ui::error_page(&format!("Request failed: {}", e))).into_response(),

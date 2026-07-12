@@ -10,6 +10,8 @@ pub enum UrlError {
     BlockedProtocol(String),
     #[error("Blocked host: {0}")]
     BlockedHost(String),
+    #[error("Host could not be resolved: {0}")]
+    UnresolvableHost(String),
     #[error("Invalid URL")]
     InvalidUrl,
 }
@@ -65,8 +67,11 @@ pub fn resolve_and_pin(
     // an attacker hide a blocked target behind a mix of clean names.
     let mut addrs = (host, port)
         .to_socket_addrs()
-        .map_err(|_| UrlError::InvalidUrl)?;
-    let first = addrs.next().ok_or(UrlError::InvalidUrl)?.ip();
+        .map_err(|_| UrlError::UnresolvableHost(host.to_string()))?;
+    let first = addrs
+        .next()
+        .ok_or_else(|| UrlError::UnresolvableHost(host.to_string()))?
+        .ip();
     if ip_is_blocked(&first, blocked_ranges) {
         return Err(UrlError::BlockedHost(format!(
             "{} (resolves to {})",
@@ -103,7 +108,7 @@ pub fn validate_url(url: &str, blocked_ranges: &[String]) -> Result<(), UrlError
             let port = parsed.port_or_known_default().unwrap_or(80);
             let resolved = (name, port)
                 .to_socket_addrs()
-                .map_err(|_| UrlError::InvalidUrl)?;
+                .map_err(|_| UrlError::UnresolvableHost(name.to_string()))?;
             for addr in resolved {
                 if ip_is_blocked(&addr.ip(), blocked_ranges) {
                     return Err(UrlError::BlockedHost(format!(

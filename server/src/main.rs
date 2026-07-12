@@ -2,7 +2,7 @@ use packet_browser_server::{
     blocklist::{init_domain_blocklist, start_blocklist_manager},
     browser::{set_proxy_port, BrowserError, BrowserInstance},
     config::Config,
-    filter::validate_url,
+    filter::{validate_url, UrlError},
     logger::{LogEntry, LogStatus, Logger},
     proxy::start_proxy,
     session::{validate_callsign_with_allowlist, Session},
@@ -392,15 +392,26 @@ fn handle_request(
     url: &str,
 ) -> std::io::Result<()> {
     if let Err(e) = validate_url(url, &config.blocked_ranges) {
-        eprintln!("[FILTER] Blocked URL {} for {}: {}", url, callsign, e);
+        eprintln!("[FILTER] Rejected URL {} for {}: {}", url, callsign, e);
+        // Distinguish an actual policy block from an unreachable/invalid URL
+        // so the client can tell the operator apart from the network.
+        let (status, log_status) = match e {
+            UrlError::BlockedProtocol(_) | UrlError::BlockedHost(_) => {
+                (Status::Blocked, LogStatus::Blocked)
+            }
+            UrlError::UnresolvableHost(_) | UrlError::InvalidUrl => {
+                (Status::Err, LogStatus::Error)
+            }
+        };
+        let message = e.to_string();
         let log_entry = LogEntry::new(
             session.callsign.clone(),
             url.to_string(),
-            LogStatus::Blocked,
-            Some(e.to_string()),
+            log_status,
+            Some(message.clone()),
         );
         let _ = logger.log(&log_entry);
-        send_error_response(stream, "URL blocked")?;
+        send_status_response(stream, status, &message)?;
         return Ok(());
     }
 
@@ -479,11 +490,19 @@ fn handle_request(
 }
 
 fn send_error_response(stream: &mut TcpStream, message: &str) -> std::io::Result<()> {
+    send_status_response(stream, Status::Err, message)
+}
+
+fn send_status_response(
+    stream: &mut TcpStream,
+    status: Status,
+    message: &str,
+) -> std::io::Result<()> {
     let compressed = brotli_compress(message.as_bytes(), 11)
         .unwrap_or_else(|_| message.as_bytes().to_vec());
 
     let response = Response {
-        status: Status::Err,
+        status,
         payload: compressed,
     };
 
