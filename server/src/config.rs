@@ -16,6 +16,9 @@ pub struct Config {
     /// Case-insensitive; SSID suffix ("-N") is stripped before comparison,
     /// matching how the regex check strips it.
     pub allowed_callsigns: Vec<String>,
+    pub origin_cc_head_timeout_ms: u64,
+    pub default_max_age_seconds: i32,
+    pub max_max_age_seconds: i32,
 }
 
 impl Config {
@@ -44,6 +47,9 @@ impl Config {
                 .into_iter()
                 .map(|s| s.to_uppercase())
                 .collect(),
+            origin_cc_head_timeout_ms: parse_env_u64("ORIGIN_CC_HEAD_TIMEOUT_MS", 3000),
+            default_max_age_seconds: parse_env_i32("DEFAULT_MAX_AGE_SECONDS", 3600),
+            max_max_age_seconds: parse_env_i32("MAX_MAX_AGE_SECONDS", 2_592_000),
         }
     }
 }
@@ -69,6 +75,13 @@ fn parse_env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn parse_env_i32(key: &str, default: i32) -> i32 {
+    env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(default)
+}
+
 fn parse_env_bool(key: &str, default: bool) -> bool {
     env::var(key)
         .ok()
@@ -90,4 +103,22 @@ fn parse_env_vec(key: &str, default: Vec<String>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_config_defaults() {
+        // from_env reads process env; test isolation is best-effort — we assume
+        // these keys are unset in the test process.
+        std::env::remove_var("ORIGIN_CC_HEAD_TIMEOUT_MS");
+        std::env::remove_var("DEFAULT_MAX_AGE_SECONDS");
+        std::env::remove_var("MAX_MAX_AGE_SECONDS");
+        let c = Config::from_env();
+        assert_eq!(c.origin_cc_head_timeout_ms, 3000);
+        assert_eq!(c.default_max_age_seconds, 3600);
+        assert_eq!(c.max_max_age_seconds, 2_592_000);
+    }
 }
