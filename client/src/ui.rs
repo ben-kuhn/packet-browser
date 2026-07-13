@@ -726,6 +726,13 @@ pub fn error_page(message: &str) -> String {
 pub fn browse_page(html_content: &str, url: &str) -> String {
     let escaped_url = h(url);
 
+    // Style rules here are scoped to `.browse-header` so the client's chrome
+    // stays consistent while the fetched content below renders under browser
+    // defaults + whatever inline CSS the author's <style>/style="" blocks
+    // supplied. Global body/a/h1/input rules from the shared CSS const are
+    // deliberately not included — they'd cascade into browse-content and
+    // repaint every page in the client's palette, which is exactly what the
+    // reader was complaining about.
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -734,35 +741,67 @@ pub fn browse_page(html_content: &str, url: &str) -> String {
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-action 'self'; base-uri 'none'; frame-ancestors 'none'">
     <title>Packet Browser</title>
-    <style>{css}
+    <style>
+    .browse-header, .browse-header * {{
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    }}
     .browse-header {{
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        z-index: 2147483647;
         background: #16213e;
+        color: #e0e0e0;
         border-bottom: 1px solid #0f3460;
         padding: 0.5em 1em;
         display: flex;
         gap: 0.5em;
         align-items: center;
     }}
-    .browse-header input {{
-        flex: 1;
-        font-size: 0.9em;
-    }}
     .browse-header a {{
+        color: #4da6ff;
         font-size: 0.85em;
         white-space: nowrap;
+        text-decoration: none;
     }}
-    .browse-content {{
-        padding: 1em;
+    .browse-header a:hover {{ text-decoration: underline; }}
+    .browse-header input {{
+        background: #0f1a2e;
+        color: #e0e0e0;
+        border: 1px solid #0f3460;
+        border-radius: 4px;
+        padding: 0.4em 0.6em;
+        font-size: 0.9em;
+        flex: 1;
     }}
+    .browse-header input:focus {{ outline: none; border-color: #4da6ff; }}
+    .browse-header button {{
+        background: #1a6b3c;
+        color: #e0e0e0;
+        border: 1px solid #0f3460;
+        border-radius: 4px;
+        padding: 0.4em 0.9em;
+        font-size: 0.9em;
+        cursor: pointer;
+    }}
+    .browse-header button:hover {{ background: #228b4e; }}
+    /* Leave room for the fixed header so fetched content isn't hidden under
+       it. margin-top lives on browse-content (not body) so we don't fight
+       with body-level rules from the fetched CSS. */
+    .browse-content {{ margin-top: 3.25em; }}
     </style>
 </head>
-<body style="max-width:none;padding:0">
+<body>
     <div class="browse-header">
         <a href="/connect">Connect</a>
         <a href="/configuration">Config</a>
-        <form action="/browse" method="GET" style="display:flex;gap:0.5em;flex:1">
+        <form action="/browse" method="GET" style="display:flex;gap:0.5em;flex:1;margin:0">
             <input type="text" name="url" value="{url}" placeholder="Enter a URL, e.g. https://example.com" autocomplete="off" autofocus>
-            <button type="submit" class="primary">Go</button>
+            <button type="submit">Go</button>
         </form>
     </div>
     <div class="browse-content">
@@ -770,7 +809,6 @@ pub fn browse_page(html_content: &str, url: &str) -> String {
     </div>
 </body>
 </html>"#,
-        css = CSS,
         url = escaped_url,
         content = html_content,
     )

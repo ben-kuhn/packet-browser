@@ -46,7 +46,15 @@ pub fn rewrite_html(html: &str, base_url: &str) -> Result<String, RewriteError> 
                 }),
                 // Server already strips these in JS_SCRUB_HTML, but defense in depth
                 // so the client cannot be backdoored by trusting the server alone.
-                element!("script, style, link[rel=stylesheet], iframe, frame, frameset, object, embed, applet, noscript, base", |el| {
+                //
+                // Inline <style> is intentionally NOT stripped: it costs a few
+                // dozen bytes and lets author styling reach the reader instead
+                // of the client's chrome swallowing the page. External sheets
+                // are still gone (link[rel=stylesheet]) so no extra fetches.
+                // CSP on the browse page keeps style-src to 'unsafe-inline'
+                // and blocks the URL-based CSS exfil vectors (@import, url()
+                // requesting anything other than data:).
+                element!("script, link[rel=stylesheet], iframe, frame, frameset, object, embed, applet, noscript, base", |el| {
                     el.remove();
                     Ok(())
                 }),
@@ -76,9 +84,10 @@ pub fn rewrite_html(html: &str, base_url: &str) -> Result<String, RewriteError> 
                                 }
                             }
                         }
-                        if name == "style" {
-                            el.remove_attribute(&name);
-                        }
+                        // style="..." is kept: CSP allows 'unsafe-inline'
+                        // for style-src, and it's typically what makes the
+                        // fetched page look like itself instead of the
+                        // client shell.
                     }
                     Ok(())
                 }),
@@ -210,11 +219,14 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_inline_style_and_style_attr() {
+    fn test_preserve_inline_style_and_style_attr() {
+        // Author styling is intentionally allowed through so pages render as
+        // themselves rather than in the client's chrome palette. External
+        // stylesheets are still gone (verified by test_strip_stylesheet_links).
         let html = r#"<style>body{color:red}</style><p style="color:blue">x</p>"#;
         let result = rewrite_html(html, "https://example.com").unwrap();
-        assert!(!result.contains("<style>"));
-        assert!(!result.contains("style=\"color:blue\""));
+        assert!(result.contains("<style>"));
+        assert!(result.contains("style=\"color:blue\""));
         assert!(result.contains("x"));
     }
 
