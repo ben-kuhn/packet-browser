@@ -225,6 +225,12 @@ impl Response {
         let mut parts = header_line.split(' ');
         let len_str = parts.next().ok_or(ProtocolError::InvalidResponse)?;
         let etag = parts.next().ok_or(ProtocolError::InvalidResponse)?.to_string();
+        let valid_etag = etag == "-"
+            || (etag.len() == 16
+                && etag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
+        if !valid_etag {
+            return Err(ProtocolError::InvalidResponse);
+        }
         let max_age_str = parts.next().ok_or(ProtocolError::InvalidResponse)?;
         if parts.next().is_some() {
             return Err(ProtocolError::InvalidResponse);
@@ -376,6 +382,27 @@ mod tests {
         assert_eq!(Status::try_from(0x00).unwrap(), Status::Ok);
         assert_eq!(Status::try_from(0x01).unwrap(), Status::Err);
         assert_eq!(Status::try_from(0x02).unwrap(), Status::Blocked);
+        assert_eq!(Status::try_from(0x03).unwrap(), Status::NotModified);
+        assert!(Status::try_from(0x04).is_err());
+    }
+
+    #[test]
+    fn decode_header_rejects_malformed_etag() {
+        // 17-char etag — too long.
+        let bad = b"RESP0 3 aBcDeFgHiJkLmNoPq 0\nabc\n";
+        assert!(matches!(
+            Response::decode_header(bad),
+            Err(ProtocolError::InvalidResponse)
+        ));
+        // Etag with a byte outside the base64url alphabet (`+`).
+        let bad = b"RESP0 3 aBcDeFgHiJk+mNoP 0\nabc\n";
+        assert!(matches!(
+            Response::decode_header(bad),
+            Err(ProtocolError::InvalidResponse)
+        ));
+        // Placeholder "-" is still accepted.
+        let ok = b"RESP1 3 - -1\nabc\n";
+        assert!(Response::decode_header(ok).is_ok());
     }
 
     #[test]
