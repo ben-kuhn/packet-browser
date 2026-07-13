@@ -29,20 +29,20 @@ fn json_for_script(s: &str) -> String {
 pub const CSS: &str = r#"
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
-    background: #1a1a2e;
-    color: #e0e0e0;
+    background: #0c1222;
+    color: #f1f5f9;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     line-height: 1.6;
     padding: 1em;
     max-width: 900px;
     margin: 0 auto;
 }
-h1, h2, h3 { margin: 0.5em 0; color: #a0c4ff; }
-a { color: #4da6ff; }
+h1, h2, h3 { margin: 0.5em 0; color: #22d3ee; }
+a { color: #22d3ee; }
 input, select, button, textarea {
-    background: #16213e;
-    color: #e0e0e0;
-    border: 1px solid #0f3460;
+    background: #0f172a;
+    color: #f1f5f9;
+    border: 1px solid #1e293b;
     padding: 0.5em 0.75em;
     border-radius: 4px;
     font-size: 1em;
@@ -50,26 +50,26 @@ input, select, button, textarea {
 }
 input:focus, select:focus, textarea:focus {
     outline: none;
-    border-color: #4da6ff;
+    border-color: #22d3ee;
 }
 button {
-    background: #0f3460;
+    background: #1e293b;
     cursor: pointer;
     transition: background 0.2s;
 }
-button:hover { background: #1a4a80; }
+button:hover { background: #334155; }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
-button.primary { background: #1a6b3c; }
-button.primary:hover { background: #228b4e; }
-button.danger { background: #8b1a1a; }
-button.danger:hover { background: #a52a2a; }
+button.primary { background: #16a34a; }
+button.primary:hover { background: #22c55e; }
+button.danger { background: #dc2626; }
+button.danger:hover { background: #ef4444; }
 .form-group {
     margin-bottom: 1em;
 }
 .form-group label {
     display: block;
     margin-bottom: 0.25em;
-    color: #a0c4ff;
+    color: #22d3ee;
     font-size: 0.9em;
 }
 .form-group input, .form-group select {
@@ -82,7 +82,7 @@ button.danger:hover { background: #a52a2a; }
 .modal-backdrop {
     position: fixed;
     inset: 0;
-    background: rgba(10, 15, 30, 0.75);
+    background: rgba(12, 18, 34, 0.75);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -90,8 +90,8 @@ button.danger:hover { background: #a52a2a; }
     padding: 1em;
 }
 .modal {
-    background: #16213e;
-    border: 1px solid #0f3460;
+    background: #0f172a;
+    border: 1px solid #1e293b;
     border-radius: 8px;
     padding: 1.25em 1.5em;
     max-width: 640px;
@@ -101,11 +101,11 @@ button.danger:hover { background: #a52a2a; }
     box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
 }
 .consent-disclaimer {
-    background: #0f1a2e;
-    border: 1px solid #0f3460;
+    background: #0c1222;
+    border: 1px solid #1e293b;
     border-radius: 4px;
     padding: 0.75em 1em;
-    color: #e6ecf5;
+    color: #f1f5f9;
     /* Prose, not code: inherit the page body font instead of forcing a
        monospace stack whose named fonts (SF Mono, Consolas) don't exist on
        Linux and fall back to the ugly default `monospace` glyphs. */
@@ -123,19 +123,19 @@ button.danger:hover { background: #a52a2a; }
     font-size: 0.85em;
     font-weight: bold;
 }
-.status-disconnected { background: #3d1515; color: #f44336; }
-.status-agwpe-connected { background: #153d2e; color: #4caf50; }
-.status-connecting { background: #3d2e15; color: #ff9800; }
-.status-connected { background: #153d1a; color: #4caf50; }
-.status-error { background: #3d1515; color: #f44336; }
+.status-disconnected { background: #450a0a; color: #ef4444; }
+.status-agwpe-connected { background: #052e16; color: #22c55e; }
+.status-connecting { background: #422006; color: #fbbf24; }
+.status-connected { background: #052e16; color: #22c55e; }
+.status-error { background: #450a0a; color: #ef4444; }
 .btn-row {
     display: flex;
     gap: 0.5em;
     margin-top: 1em;
 }
 .card {
-    background: #16213e;
-    border: 1px solid #0f3460;
+    background: #0f172a;
+    border: 1px solid #1e293b;
     border-radius: 8px;
     padding: 1em;
     margin-bottom: 1em;
@@ -146,8 +146,8 @@ button.danger:hover { background: #a52a2a; }
        renders as an unstyled bitmap. */
     font-family: ui-monospace, 'Cascadia Mono', 'JetBrains Mono', 'DejaVu Sans Mono', 'Liberation Mono', Menlo, Consolas, monospace;
     font-size: 0.8em;
-    background: #0a0a1a;
-    border: 1px solid #0f3460;
+    background: #020617;
+    border: 1px solid #1e293b;
     border-radius: 4px;
     padding: 0.5em;
     height: 300px;
@@ -156,38 +156,38 @@ button.danger:hover { background: #a52a2a; }
     word-break: break-all;
 }
 .debug-log .log-entry { margin-bottom: 2px; }
-.debug-log .log-info { color: #a0c4ff; }
-.debug-log .log-debug { color: #808080; }
-.debug-log .log-trace { color: #606060; }
-.debug-log .log-tx { color: #ff9800; }
-.debug-log .log-rx { color: #4caf50; }
-.debug-log .log-error { color: #f44336; }
-.debug-log .log-state { color: #ce93d8; }
+.debug-log .log-info { color: #22d3ee; }
+.debug-log .log-debug { color: #64748b; }
+.debug-log .log-trace { color: #475569; }
+.debug-log .log-tx { color: #fbbf24; }
+.debug-log .log-rx { color: #22c55e; }
+.debug-log .log-error { color: #ef4444; }
+.debug-log .log-state { color: #a78bfa; }
 .log-controls {
     display: flex;
     gap: 0.5em;
     margin-bottom: 0.5em;
     align-items: center;
 }
-.log-controls label { font-size: 0.85em; color: #a0c4ff; }
+.log-controls label { font-size: 0.85em; color: #22d3ee; }
 .log-controls select { padding: 0.25em 0.5em; font-size: 0.85em; }
 nav {
     display: flex;
     gap: 1em;
     margin-bottom: 1em;
     padding-bottom: 0.5em;
-    border-bottom: 1px solid #0f3460;
+    border-bottom: 1px solid #1e293b;
 }
 nav a {
     text-decoration: none;
     padding: 0.25em 0.5em;
     border-radius: 4px;
 }
-nav a:hover { background: #0f3460; }
-nav a.active { background: #0f3460; color: #fff; }
+nav a:hover { background: #1e293b; }
+nav a.active { background: #1e293b; color: #f1f5f9; }
 .msg { padding: 0.5em 0.75em; border-radius: 4px; margin-bottom: 1em; }
-.msg-success { background: #153d1a; color: #4caf50; border: 1px solid #228b4e; }
-.msg-error { background: #3d1515; color: #f44336; border: 1px solid #a52a2a; }
+.msg-success { background: #052e16; color: #22c55e; border: 1px solid #22c55e; }
+.msg-error { background: #450a0a; color: #ef4444; border: 1px solid #ef4444; }
 .browse-bar {
     display: flex;
     gap: 0.5em;
@@ -754,41 +754,41 @@ pub fn browse_page(html_content: &str, url: &str) -> String {
         left: 0;
         right: 0;
         z-index: 2147483647;
-        background: #16213e;
-        color: #e0e0e0;
-        border-bottom: 1px solid #0f3460;
+        background: #0f172a;
+        color: #f1f5f9;
+        border-bottom: 1px solid #1e293b;
         padding: 0.5em 1em;
         display: flex;
         gap: 0.5em;
         align-items: center;
     }}
     .browse-header a {{
-        color: #4da6ff;
+        color: #22d3ee;
         font-size: 0.85em;
         white-space: nowrap;
         text-decoration: none;
     }}
     .browse-header a:hover {{ text-decoration: underline; }}
     .browse-header input {{
-        background: #0f1a2e;
-        color: #e0e0e0;
-        border: 1px solid #0f3460;
+        background: #0c1222;
+        color: #f1f5f9;
+        border: 1px solid #1e293b;
         border-radius: 4px;
         padding: 0.4em 0.6em;
         font-size: 0.9em;
         flex: 1;
     }}
-    .browse-header input:focus {{ outline: none; border-color: #4da6ff; }}
+    .browse-header input:focus {{ outline: none; border-color: #22d3ee; }}
     .browse-header button {{
-        background: #1a6b3c;
-        color: #e0e0e0;
-        border: 1px solid #0f3460;
+        background: #16a34a;
+        color: #f1f5f9;
+        border: 1px solid #1e293b;
         border-radius: 4px;
         padding: 0.4em 0.9em;
         font-size: 0.9em;
         cursor: pointer;
     }}
-    .browse-header button:hover {{ background: #228b4e; }}
+    .browse-header button:hover {{ background: #22c55e; }}
     /* Leave room for the fixed header so fetched content isn't hidden under
        it. margin-top lives on browse-content (not body) so we don't fight
        with body-level rules from the fetched CSS. */
