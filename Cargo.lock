@@ -1384,6 +1384,7 @@ dependencies = [
  "chrono",
  "fantoccini",
  "http-body-util",
+ "httpdate",
  "hyper",
  "hyper-util",
  "openssl",
