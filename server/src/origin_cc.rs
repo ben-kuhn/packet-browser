@@ -96,8 +96,8 @@ pub fn probe_origin_cc(url: &str, config: &Config) -> OriginDirectives {
         Ok(r) if r.status().as_u16() == 405 => {
             // Retry as GET, discard body; several origins reject HEAD.
             match client.get(url).send() {
-                Ok(r) => r.headers().clone(),
-                Err(_) => return default_out,
+                Ok(r) if r.status().is_success() || r.status().is_redirection() => r.headers().clone(),
+                _ => return default_out,
             }
         }
         Ok(_) => return default_out,
