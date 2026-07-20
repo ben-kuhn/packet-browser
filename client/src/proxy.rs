@@ -133,6 +133,7 @@ pub fn create_router(ctx: Arc<AppContext>) -> Router {
         .route("/configuration", get(configuration_page_handler))
         .route("/browse", get(browse_get_handler))
         .route("/browse", post(browse_post_handler))
+        .route("/cache", get(cache_page_handler))
         .route("/api/agwpe-status", get(api_agwpe_status_get))
         .route("/api/agwpe-status", post(api_agwpe_status_post))
         .route("/api/connect", post(api_connect_handler))
@@ -141,6 +142,8 @@ pub fn create_router(ctx: Arc<AppContext>) -> Router {
         .route("/api/consent", post(api_consent_post))
         .route("/api/config", get(api_config_get))
         .route("/api/config", post(api_config_post))
+        .route("/api/cache/clear", post(api_cache_clear))
+        .route("/api/cache/delete", post(api_cache_delete))
         .route("/events", get(events_handler))
         .layer(middleware::from_fn_with_state(ctx.clone(), security_guard))
         .layer(Extension(ctx))
@@ -874,6 +877,62 @@ async fn events_handler(
     };
 
     Sse::new(stream)
+}
+
+async fn cache_page_handler(Extension(ctx): Extension<Arc<AppContext>>) -> impl IntoResponse {
+    let now = std::time::SystemTime::now();
+    let mut rows = Vec::new();
+    let (total, cap) = match ctx.cache.as_ref() {
+        Some(cache) => {
+            let entries = cache.list();
+            let total: u64 = entries.iter().map(|e| e.size).sum();
+            for e in entries {
+                let remaining = now
+                    .duration_since(e.fetched_at)
+                    .map(|age| e.max_age.checked_sub(age).unwrap_or_default().as_secs() as i64)
+                    .unwrap_or(0);
+                rows.push(ui::CachePageRow {
+                    url: e.url,
+                    size_bytes: e.size,
+                    fetched_at_iso: iso_from_system_time(e.fetched_at),
+                    last_used_iso: iso_from_system_time(e.last_used),
+                    ttl_remaining_secs: remaining,
+                    etag: e.etag,
+                });
+            }
+            (total, cache.cap_bytes())
+        }
+        None => (0, 0),
+    };
+    Html(ui::cache_page(&rows, total, cap))
+}
+
+fn iso_from_system_time(t: std::time::SystemTime) -> String {
+    use chrono::{DateTime, Utc};
+    let dt: DateTime<Utc> = t.into();
+    dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+#[derive(Deserialize)]
+struct CacheDeleteRequest {
+    url: String,
+}
+
+async fn api_cache_delete(
+    Extension(ctx): Extension<Arc<AppContext>>,
+    axum::extract::Form(req): axum::extract::Form<CacheDeleteRequest>,
+) -> Redirect {
+    if let Some(cache) = ctx.cache.as_ref() {
+        cache.delete(&req.url);
+    }
+    Redirect::to("/cache")
+}
+
+async fn api_cache_clear(Extension(ctx): Extension<Arc<AppContext>>) -> Redirect {
+    if let Some(cache) = ctx.cache.as_ref() {
+        cache.clear();
+    }
+    Redirect::to("/cache")
 }
 
 #[cfg(test)]

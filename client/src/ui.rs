@@ -799,6 +799,8 @@ pub fn browse_page(html_content: &str, url: &str) -> String {
     <div class="browse-header">
         <a href="/connect">Connect</a>
         <a href="/configuration">Config</a>
+        <a href="/cache">Cache</a>
+        <a href="/browse?url={url}&amp;nocache=1" title="Bypass cache and refetch">Reload</a>
         <form action="/browse" method="GET" style="display:flex;gap:0.5em;flex:1;margin:0">
             <input type="text" name="url" value="{url}" placeholder="Enter a URL, e.g. https://example.com" autocomplete="off" autofocus>
             <button type="submit">Go</button>
@@ -811,5 +813,59 @@ pub fn browse_page(html_content: &str, url: &str) -> String {
 </html>"#,
         url = escaped_url,
         content = html_content,
+    )
+}
+
+pub struct CachePageRow {
+    pub url: String,
+    pub size_bytes: u64,
+    pub fetched_at_iso: String,
+    pub last_used_iso: String,
+    pub ttl_remaining_secs: i64,
+    pub etag: String,
+}
+
+pub fn cache_page(rows: &[CachePageRow], total_bytes: u64, cap_bytes: u64) -> String {
+    let mut body = String::new();
+    body.push_str(&format!(
+        "<p>{} entries — {} / {} bytes used.</p>",
+        rows.len(),
+        total_bytes,
+        cap_bytes,
+    ));
+    body.push_str(r#"<form method="POST" action="/api/cache/clear" style="margin-bottom:1em"><button class="danger" type="submit">Clear all</button></form>"#);
+    body.push_str(r#"<table style="width:100%;border-collapse:collapse">"#);
+    body.push_str(r#"<thead><tr><th style="text-align:left">URL</th><th>Size</th><th>Fetched</th><th>Last used</th><th>TTL left</th><th></th></tr></thead><tbody>"#);
+    for row in rows {
+        body.push_str(&format!(
+            r#"<tr>
+                <td style="max-width:40em;overflow:hidden;text-overflow:ellipsis">{url}</td>
+                <td>{size}</td>
+                <td>{fetched}</td>
+                <td>{used}</td>
+                <td>{ttl}s</td>
+                <td>
+                    <form method="POST" action="/api/cache/delete" style="margin:0">
+                        <input type="hidden" name="url" value="{url_attr}">
+                        <button class="danger" type="submit">Delete</button>
+                    </form>
+                </td>
+            </tr>"#,
+            url = h(&row.url),
+            size = row.size_bytes,
+            fetched = h(&row.fetched_at_iso),
+            used = h(&row.last_used_iso),
+            ttl = row.ttl_remaining_secs,
+            url_attr = h(&row.url),
+        ));
+    }
+    body.push_str("</tbody></table>");
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Cache</title><style>{css}</style></head>
+<body><h1>Cache</h1><p><a href="/browse">Back to browse</a></p>{body}</body></html>"#,
+        css = CSS,
+        body = body,
     )
 }
