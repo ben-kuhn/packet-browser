@@ -435,7 +435,9 @@ async fn background_task(
     response_timeout_secs: u64,
 ) {
     let mut bg = BackgroundState::new();
-    bg.response_timeout_secs = response_timeout_secs;
+    // Clamp to at least 1s: a zero-second timeout would fire on every read,
+    // instantly SessionDied-ing every request and looping through reconnects.
+    bg.response_timeout_secs = response_timeout_secs.max(1);
 
     while let Some(cmd) = command_rx.recv().await {
         match cmd {
