@@ -351,6 +351,7 @@ async fn handle_browse(
             if let Some(hit) = cache.lookup(url) {
                 if hit.is_fresh(SystemTime::now()) {
                     if browser_if_none_match.as_deref() == Some(&hit.etag) {
+                        cache.touch_last_used(url);
                         return axum::http::Response::builder()
                             .status(StatusCode::NOT_MODIFIED)
                             .header("etag", format!("\"{}\"", hit.etag))
@@ -497,16 +498,22 @@ fn serve_from_hit(hit: &crate::cache::Hit, url: &str) -> Response {
 pub(crate) fn build_cached_html_response(body: String, etag: &str, ttl_secs: u64) -> Response {
     let mut resp = Html(body).into_response();
     let headers = resp.headers_mut();
-    headers.insert(
-        axum::http::header::CACHE_CONTROL,
-        axum::http::HeaderValue::from_str(&format!("private, max-age={}", ttl_secs))
-            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("private, max-age=0")),
-    );
-    headers.insert(
-        axum::http::header::ETAG,
-        axum::http::HeaderValue::from_str(&format!("\"{}\"", etag))
-            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("\"-\"")),
-    );
+    match axum::http::HeaderValue::from_str(&format!("private, max-age={}", ttl_secs)) {
+        Ok(value) => {
+            headers.insert(axum::http::header::CACHE_CONTROL, value);
+        }
+        Err(e) => {
+            tracing::error!("cache-control value rejected by HeaderValue::from_str: {} — omitting Cache-Control header", e);
+        }
+    }
+    match axum::http::HeaderValue::from_str(&format!("\"{}\"", etag)) {
+        Ok(value) => {
+            headers.insert(axum::http::header::ETAG, value);
+        }
+        Err(e) => {
+            tracing::error!("etag {:?} rejected by HeaderValue::from_str: {} — omitting ETag header", etag, e);
+        }
+    }
     resp
 }
 
