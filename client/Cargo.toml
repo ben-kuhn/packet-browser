@@ -23,6 +23,7 @@ clap = { version = "4", features = ["derive"] }
 async-stream = "0.3"
 regex = "1"
 packet-browser-shared = { path = "../shared" }
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"

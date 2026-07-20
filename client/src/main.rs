@@ -1,4 +1,5 @@
 mod agwpe;
+mod cache;
 mod config;
 mod proxy;
 mod rewrite;

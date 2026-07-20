@@ -332,6 +332,7 @@ async fn handle_browse(
         },
         None => Request::Get {
             url: url.to_string(),
+            if_none_match: None,
         },
     };
 
@@ -339,8 +340,8 @@ async fn handle_browse(
 
     match ctx.agwpe.send_request(encoded).await {
         Ok(response_data) => {
-            let (status, b64_len, header_end) = match ProtocolResponse::decode_header(&response_data) {
-                Ok(Some(triple)) => triple,
+            let (status, b64_len, _etag, _max_age, header_end) = match ProtocolResponse::decode_header(&response_data) {
+                Ok(Some(tuple)) => tuple,
                 Ok(None) => {
                     return Html(ui::error_page("Incomplete response header")).into_response();
                 }
@@ -383,6 +384,8 @@ async fn handle_browse(
                 // through verbatim rather than wrapping in a generic prefix
                 // that used to mask the actual cause.
                 Status::Err | Status::Blocked => Html(ui::error_page(&html)).into_response(),
+                // NotModified is handled in Task 7 when the cache is wired up.
+                Status::NotModified => Html(ui::error_page("Not Modified (cache not yet wired)")).into_response(),
             }
         }
         Err(e) => Html(ui::error_page(&format!("Request failed: {}", e))).into_response(),
