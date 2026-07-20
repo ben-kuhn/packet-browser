@@ -679,60 +679,59 @@ async fn handle_query_ports(
     Ok(())
 }
 
-async fn perform_bpq_handshake(
+/// Send the BPQ application command (e.g. "WEB\n") over the current AX.25
+/// session.  Called only when `skip_bpq_app` is false.
+async fn bpq_send_app_command(
     bg: &mut BackgroundState,
     state: &SharedState,
     log_tx: &broadcast::Sender<DebugLogEntry>,
 ) -> Result<(), AgwpeError> {
-    let (bpq_command, skip_bpq_app) = {
+    let bpq_command = {
         let s = state.lock_or_poisoned();
-        (s.config.bpq_command.clone(), s.config.skip_bpq_app)
+        s.config.bpq_command.clone()
     };
 
+    BackgroundState::push_log(
+        state,
+        log_tx,
+        DebugLogEntry::new(
+            LogLevel::Info,
+            "BPQ",
+            &format!("Starting BPQ handshake with command: {}", bpq_command),
+        ),
+    );
+
+    let cmd_data = format!("{}\n", bpq_command);
+
+    BackgroundState::push_log(
+        state,
+        log_tx,
+        DebugLogEntry::new(LogLevel::Debug, "BPQ", &format!("Sending BPQ command: {:?}", cmd_data))
+            .with_direction(Direction::Tx),
+    );
+
+    let cmd_frame = AgwpeFrame::new(
+        bg.agwpe_port,
+        FrameType::SendData,
+        &bg.local_callsign,
+        &bg.remote_callsign,
+        cmd_data.into_bytes(),
+    );
+
+    BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &cmd_frame).await?;
+    tracing::trace!("[BPQ] Sent BPQ command frame");
+    Ok(())
+}
+
+/// Wait for the server's callsign prompt and send our local callsign in
+/// response.  The prompt is identified by the presence of the word "callsign"
+/// (or "AGREE", which some deployments include in the same banner line).
+async fn bpq_await_callsign_prompt_and_send_callsign(
+    bg: &mut BackgroundState,
+    state: &SharedState,
+    log_tx: &broadcast::Sender<DebugLogEntry>,
+) -> Result<(), AgwpeError> {
     let callsign = bg.local_callsign.clone();
-
-    if skip_bpq_app {
-        BackgroundState::push_log(
-            state,
-            log_tx,
-            DebugLogEntry::new(
-                LogLevel::Info,
-                "BPQ",
-                "Skipping BPQ application command (direct connection mode)",
-            ),
-        );
-    } else {
-        BackgroundState::push_log(
-            state,
-            log_tx,
-            DebugLogEntry::new(
-                LogLevel::Info,
-                "BPQ",
-                &format!("Starting BPQ handshake with command: {}", bpq_command),
-            ),
-        );
-
-        // Send BPQ command immediately (e.g., "WEB\n")
-        let cmd_data = format!("{}\n", bpq_command);
-
-        BackgroundState::push_log(
-            state,
-            log_tx,
-            DebugLogEntry::new(LogLevel::Debug, "BPQ", &format!("Sending BPQ command: {:?}", cmd_data))
-                .with_direction(Direction::Tx),
-        );
-
-        let cmd_frame = AgwpeFrame::new(
-            bg.agwpe_port,
-            FrameType::SendData,
-            &bg.local_callsign,
-            &bg.remote_callsign,
-            cmd_data.into_bytes(),
-        );
-
-        BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &cmd_frame).await?;
-        tracing::trace!("[BPQ] Sent BPQ command frame");
-    }
 
     // The far side (packet-browser-server, via LinBPQ HOST 0) does NOT
     // auto-inject the callsign in this deployment — LinBPQ opens the TCP
@@ -817,10 +816,19 @@ async fn perform_bpq_handshake(
     );
     BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &call_frame).await?;
     tracing::trace!("[BPQ] Sent callsign frame");
+    Ok(())
+}
 
-    // Now wait for the AGREE prompt. Reuse received_text so any trailing
-    // bytes from the callsign frame are still available for the match.
-    received_text.clear();
+/// Wait for the server's logging-disclaimer / AGREE prompt and return the raw
+/// disclaimer text (byte-for-byte, no trim or normalisation).  The caller
+/// decides what to do with it — either surface it for operator consent or
+/// compare it against a stored value for auto-consent.
+async fn bpq_await_disclaimer(
+    bg: &mut BackgroundState,
+    state: &SharedState,
+    log_tx: &broadcast::Sender<DebugLogEntry>,
+) -> Result<String, AgwpeError> {
+    let mut received_text = String::new();
     let mut agree_prompt_found = false;
 
     BackgroundState::push_log(
@@ -834,8 +842,8 @@ async fn perform_bpq_handshake(
     loop {
         let frame = bg.read_frame_with_timeout(30).await?;
 
-        tracing::trace!("[BPQ] Received frame type {:?} (0x{:02X}), data_len={}, data={:?}", 
-            frame.frame_type, frame.frame_type as u8, frame.data_len, 
+        tracing::trace!("[BPQ] Received frame type {:?} (0x{:02X}), data_len={}, data={:?}",
+            frame.frame_type, frame.frame_type as u8, frame.data_len,
             String::from_utf8_lossy(&frame.data[..frame.data_len.min(100) as usize]));
 
         match frame.frame_type {
@@ -890,6 +898,37 @@ async fn perform_bpq_handshake(
             "AGREE prompt not received".to_string(),
         ));
     }
+
+    Ok(received_text)
+}
+
+async fn perform_bpq_handshake(
+    bg: &mut BackgroundState,
+    state: &SharedState,
+    log_tx: &broadcast::Sender<DebugLogEntry>,
+) -> Result<(), AgwpeError> {
+    let skip_bpq_app = {
+        let s = state.lock_or_poisoned();
+        s.config.skip_bpq_app
+    };
+
+    if skip_bpq_app {
+        BackgroundState::push_log(
+            state,
+            log_tx,
+            DebugLogEntry::new(
+                LogLevel::Info,
+                "BPQ",
+                "Skipping BPQ application command (direct connection mode)",
+            ),
+        );
+    } else {
+        bpq_send_app_command(bg, state, log_tx).await?;
+    }
+
+    bpq_await_callsign_prompt_and_send_callsign(bg, state, log_tx).await?;
+
+    let received_text = bpq_await_disclaimer(bg, state, log_tx).await?;
 
     // Park the handshake in `AwaitingConsent` and hand the disclaimer to the
     // UI. We do not send "AGREE\n" until the operator explicitly clicks
@@ -971,6 +1010,114 @@ async fn perform_bpq_handshake(
     Ok(())
 }
 
+/// Send an AX.25 Connect frame and loop until the peer acknowledges the
+/// connection (either via a `Connected` frame or LinBPQ's `Connect` + `***
+/// CONNECTED` banner).  On success `bg.remote_callsign` and `bg.agwpe_port`
+/// are already set by the caller (`handle_ax25_connect`) or were preserved
+/// from the previous session (`handle_reconnect`).
+async fn ax25_open_and_await_connected(
+    bg: &mut BackgroundState,
+    state: &SharedState,
+    log_tx: &broadcast::Sender<DebugLogEntry>,
+) -> Result<(), AgwpeError> {
+    let target = bg.remote_callsign.clone();
+    let port_num = bg.agwpe_port;
+
+    let connect_frame = AgwpeFrame::new(
+        port_num,
+        FrameType::Connect,
+        &bg.local_callsign,
+        &target,
+        vec![],
+    );
+
+    BackgroundState::push_log(
+        state,
+        log_tx,
+        DebugLogEntry::new(
+            LogLevel::Info,
+            "PROTOCOL",
+            &format!("AX.25 connect to {} on port {}", target, port_num),
+        )
+        .with_direction(Direction::Tx),
+    );
+
+    BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &connect_frame).await?;
+
+    loop {
+        let frame = bg.read_frame_with_timeout(30).await?;
+
+        tracing::trace!("[AGWPE] AX.25 connect: received frame type {:?} (0x{:02X}), data_len={}, data={:?}",
+            frame.frame_type, frame.frame_type as u8, frame.data_len,
+            String::from_utf8_lossy(&frame.data[..frame.data_len.min(50) as usize]));
+
+        match frame.frame_type {
+            FrameType::Connected => {
+                BackgroundState::push_log(
+                    state,
+                    log_tx,
+                    DebugLogEntry::new(
+                        LogLevel::Info,
+                        "PROTOCOL",
+                        &format!("AX.25 connected to {}", target),
+                    )
+                    .with_direction(Direction::Rx),
+                );
+                return Ok(());
+            }
+            // LinBPQ sends 0x43 ('C') for both connect request AND connected notification.
+            // Check if this is actually a connected notification by looking at the data.
+            FrameType::Connect if frame.data.starts_with(b"***") => {
+                let text = String::from_utf8_lossy(&frame.data);
+                if text.contains("CONNECTED") {
+                    BackgroundState::push_log(
+                        state,
+                        log_tx,
+                        DebugLogEntry::new(
+                            LogLevel::Info,
+                            "PROTOCOL",
+                            &format!("AX.25 connected to {} (LinBPQ style)", target),
+                        )
+                        .with_direction(Direction::Rx),
+                    );
+                    return Ok(());
+                } else {
+                    BackgroundState::push_log(
+                        state,
+                        log_tx,
+                        DebugLogEntry::new(
+                            LogLevel::Debug,
+                            "PROTOCOL",
+                            &format!("Ignoring frame while connecting: {:?}", frame.frame_type),
+                        ),
+                    );
+                }
+            }
+            FrameType::ConnectionRejected => {
+                let msg = format!("AX.25 connection to {} rejected", target);
+                BackgroundState::push_log(
+                    state,
+                    log_tx,
+                    DebugLogEntry::new(LogLevel::Info, "ERROR", &msg)
+                        .with_direction(Direction::Rx),
+                );
+                return Err(AgwpeError::ConnectionFailed(msg));
+            }
+            _ => {
+                BackgroundState::push_log(
+                    state,
+                    log_tx,
+                    DebugLogEntry::new(
+                        LogLevel::Debug,
+                        "PROTOCOL",
+                        &format!("Ignoring frame while connecting: {:?}", frame.frame_type),
+                    ),
+                );
+            }
+        }
+    }
+}
+
 async fn handle_ax25_connect(
     bg: &mut BackgroundState,
     state: &SharedState,
@@ -993,142 +1140,29 @@ async fn handle_ax25_connect(
     };
     let _ = log_tx.send(state_entry);
 
-    let connect_frame = AgwpeFrame::new(
-        port_num,
-        FrameType::Connect,
-        &bg.local_callsign,
-        target,
-        vec![],
-    );
+    // Update stored target so subsequent reconnects know where to aim.
+    {
+        let mut s = state.lock_or_poisoned();
+        s.config.update_target(target);
+    }
 
-    BackgroundState::push_log(
-        state,
-        log_tx,
-        DebugLogEntry::new(
-            LogLevel::Info,
-            "PROTOCOL",
-            &format!("AX.25 connect to {} on port {}", target, port_num),
-        )
-        .with_direction(Direction::Tx),
-    );
+    ax25_open_and_await_connected(bg, state, log_tx).await?;
 
-    BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &connect_frame).await?;
-
-    loop {
-        let frame = bg.read_frame_with_timeout(30).await?;
-
-        tracing::trace!("[AGWPE] AX.25 connect: received frame type {:?} (0x{:02X}), data_len={}, data={:?}", 
-            frame.frame_type, frame.frame_type as u8, frame.data_len, 
-            String::from_utf8_lossy(&frame.data[..frame.data_len.min(50) as usize]));
-
-        match frame.frame_type {
-            FrameType::Connected => {
-                BackgroundState::push_log(
-                    state,
-                    log_tx,
-                    DebugLogEntry::new(
-                        LogLevel::Info,
-                        "PROTOCOL",
-                        &format!("AX.25 connected to {}", target),
-                    )
-                    .with_direction(Direction::Rx),
-                );
-
-                {
-                    let mut s = state.lock_or_poisoned();
-                    s.config.update_target(target);
-                }
-
-                // Perform BPQ handshake
-                match perform_bpq_handshake(bg, state, log_tx).await {
-                    Ok(()) => {
-                        BackgroundState::set_state(state, log_tx, ConnectionState::Connected);
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        let msg = format!("BPQ handshake failed: {}", e);
-                        BackgroundState::push_log(
-                            state,
-                            log_tx,
-                            DebugLogEntry::new(LogLevel::Info, "ERROR", &msg),
-                        );
-                        BackgroundState::set_state(state, log_tx, ConnectionState::Error(msg.clone()));
-                        return Err(AgwpeError::ConnectionFailed(msg));
-                    }
-                }
-            }
-            // LinBPQ sends 0x43 ('C') for both connect request AND connected notification
-            // Check if this is actually a connected notification by looking at the data
-            FrameType::Connect if frame.data.starts_with(b"***") => {
-                let text = String::from_utf8_lossy(&frame.data);
-                if text.contains("CONNECTED") {
-                    BackgroundState::push_log(
-                        state,
-                        log_tx,
-                        DebugLogEntry::new(
-                            LogLevel::Info,
-                            "PROTOCOL",
-                            &format!("AX.25 connected to {} (LinBPQ style)", target),
-                        )
-                        .with_direction(Direction::Rx),
-                    );
-
-                    {
-                        let mut s = state.lock_or_poisoned();
-                        s.config.update_target(target);
-                    }
-
-                    // Perform BPQ handshake
-                    match perform_bpq_handshake(bg, state, log_tx).await {
-                        Ok(()) => {
-                            BackgroundState::set_state(state, log_tx, ConnectionState::Connected);
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            let msg = format!("BPQ handshake failed: {}", e);
-                            BackgroundState::push_log(
-                                state,
-                                log_tx,
-                                DebugLogEntry::new(LogLevel::Info, "ERROR", &msg),
-                            );
-                            BackgroundState::set_state(state, log_tx, ConnectionState::Error(msg.clone()));
-                            return Err(AgwpeError::ConnectionFailed(msg));
-                        }
-                    }
-                } else {
-                    BackgroundState::push_log(
-                        state,
-                        log_tx,
-                        DebugLogEntry::new(
-                            LogLevel::Debug,
-                            "PROTOCOL",
-                            &format!("Ignoring frame while connecting: {:?}", frame.frame_type),
-                        ),
-                    );
-                }
-            }
-            FrameType::ConnectionRejected => {
-                let msg = format!("AX.25 connection to {} rejected", target);
-                BackgroundState::push_log(
-                    state,
-                    log_tx,
-                    DebugLogEntry::new(LogLevel::Info, "ERROR", &msg)
-                        .with_direction(Direction::Rx),
-                );
-                BackgroundState::set_state(state, log_tx, ConnectionState::Error(msg.clone()));
-                return Err(AgwpeError::ConnectionFailed(msg));
-            }
-            _ => {
-                BackgroundState::push_log(
-                    state,
-                    log_tx,
-                    DebugLogEntry::new(
-                        LogLevel::Debug,
-                        "PROTOCOL",
-                        &format!("Ignoring frame while connecting: {:?}", frame.frame_type),
-                    ),
-                );
-            }
+    // Perform BPQ handshake
+    match perform_bpq_handshake(bg, state, log_tx).await {
+        Ok(()) => {
+            BackgroundState::set_state(state, log_tx, ConnectionState::Connected);
+            Ok(())
+        }
+        Err(e) => {
+            let msg = format!("BPQ handshake failed: {}", e);
+            BackgroundState::push_log(
+                state,
+                log_tx,
+                DebugLogEntry::new(LogLevel::Info, "ERROR", &msg),
+            );
+            BackgroundState::set_state(state, log_tx, ConnectionState::Error(msg.clone()));
+            Err(AgwpeError::ConnectionFailed(msg))
         }
     }
 }
@@ -1166,6 +1200,128 @@ async fn handle_ax25_disconnect(
 
 fn is_session_dead_payload(data: &[u8]) -> bool {
     data.starts_with(b"*** DISCONNECTED")
+}
+
+/// Returns `true` iff `server_text` is byte-for-byte equal to the stored
+/// disclaimer. `None` stored means we have never seen a consent, so we always
+/// return `false` — the operator must consent explicitly.
+fn matches_stored_disclaimer(server_text: &str, stored: Option<&str>) -> bool {
+    match stored {
+        Some(s) => s == server_text,
+        None => false,
+    }
+}
+
+/// Re-run the full AX.25 + BPQ + AGREE handshake for a session that died
+/// unexpectedly.  Transitions to `Reconnecting` at entry and `Connected` on
+/// successful auto-consent.  Returns `Err(NeedsReconsent)` when the server's
+/// disclaimer text differs from the stored consent, leaving the state as
+/// `AwaitingConsent` so the UI can open the consent modal on the operator's
+/// next visit.
+async fn handle_reconnect(
+    bg: &mut BackgroundState,
+    state: &SharedState,
+    log_tx: &broadcast::Sender<DebugLogEntry>,
+    reason: String,
+) -> Result<(), AgwpeError> {
+    BackgroundState::set_state(
+        state,
+        log_tx,
+        ConnectionState::Reconnecting { reason: reason.clone() },
+    );
+    BackgroundState::push_log(
+        state,
+        log_tx,
+        DebugLogEntry::new(
+            LogLevel::Info,
+            "PROTOCOL",
+            &format!("Session lost ({}); attempting reconnect", reason),
+        ),
+    );
+
+    // Best-effort close of the client's AX.25 side before we re-open.  The
+    // session is already dead, so we ignore any send error here.
+    if bg.stream.is_some() {
+        let close_frame = AgwpeFrame::new(
+            bg.agwpe_port,
+            FrameType::SendData,
+            &bg.local_callsign,
+            &bg.remote_callsign,
+            vec![],
+        );
+        let _ = BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &close_frame).await;
+    }
+
+    // Re-run the AX.25 handshake using the same helpers as handle_ax25_connect.
+    ax25_open_and_await_connected(bg, state, log_tx).await?;
+
+    let skip_bpq_app = {
+        let s = state.lock_or_poisoned();
+        s.config.skip_bpq_app
+    };
+    if !skip_bpq_app {
+        bpq_send_app_command(bg, state, log_tx).await?;
+    } else {
+        BackgroundState::push_log(
+            state,
+            log_tx,
+            DebugLogEntry::new(
+                LogLevel::Info,
+                "BPQ",
+                "Skipping BPQ application command (direct connection mode)",
+            ),
+        );
+    }
+    bpq_await_callsign_prompt_and_send_callsign(bg, state, log_tx).await?;
+    let disclaimer = bpq_await_disclaimer(bg, state, log_tx).await?;
+
+    // Auto-consent check — exact-string equality only.
+    let stored = {
+        let s = state.lock_or_poisoned();
+        s.last_agreed_disclaimer.clone()
+    };
+    if !matches_stored_disclaimer(&disclaimer, stored.as_deref()) {
+        BackgroundState::push_log(
+            state,
+            log_tx,
+            DebugLogEntry::new(
+                LogLevel::Info,
+                "PROTOCOL",
+                "Server disclaimer differs from stored consent; re-consent required",
+            ),
+        );
+        BackgroundState::set_state(
+            state,
+            log_tx,
+            ConnectionState::AwaitingConsent { disclaimer },
+        );
+        return Err(AgwpeError::NeedsReconsent);
+    }
+
+    // Disclaimer matches — send AGREE on the wire so the server logs it.
+    // Disclaimer suppression is purely UI; the wire protocol always requires AGREE.
+    let agree_frame = AgwpeFrame::new(
+        bg.agwpe_port,
+        FrameType::SendData,
+        &bg.local_callsign,
+        &bg.remote_callsign,
+        b"AGREE\n".to_vec(),
+    );
+    BackgroundState::push_log(
+        state,
+        log_tx,
+        DebugLogEntry::new(LogLevel::Info, "BPQ", "Auto-sending AGREE (matches stored consent)")
+            .with_direction(Direction::Tx),
+    );
+    BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &agree_frame).await?;
+
+    BackgroundState::set_state(state, log_tx, ConnectionState::Connected);
+    BackgroundState::push_log(
+        state,
+        log_tx,
+        DebugLogEntry::new(LogLevel::Info, "PROTOCOL", "Reconnect successful"),
+    );
+    Ok(())
 }
 
 async fn handle_send_request(
@@ -1505,5 +1661,21 @@ mod tests {
         // And a normal RESP frame should not trip it.
         let ok_bytes: Vec<u8> = b"RESP0 5 abcdef 3600\rhello".to_vec();
         assert!(!is_session_dead_payload(&ok_bytes));
+    }
+
+    #[test]
+    fn test_matches_stored_disclaimer() {
+        let text = "All activity is logged including your callsign.\rType AGREE to proceed: ";
+        assert!(matches_stored_disclaimer(text, Some(text)));
+
+        // Different whitespace does NOT match.
+        let differs_by_space = "All activity is logged including your callsign. \rType AGREE to proceed: ";
+        assert!(!matches_stored_disclaimer(differs_by_space, Some(text)));
+
+        // None never matches.
+        assert!(!matches_stored_disclaimer(text, None));
+
+        // Empty strings compare equal.
+        assert!(matches_stored_disclaimer("", Some("")));
     }
 }
