@@ -14,6 +14,35 @@ pub enum ConfigError {
 }
 
 #[derive(Debug, Clone)]
+pub struct CacheSection {
+    pub enabled: bool,
+    pub max_bytes: u64,
+    pub max_ttl_seconds: u64,
+    pub dir: Option<PathBuf>,
+}
+
+impl Default for CacheSection {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_bytes: 209_715_200, // 200 MiB
+            max_ttl_seconds: 86_400,
+            dir: None,
+        }
+    }
+}
+
+impl CacheSection {
+    pub fn effective_dir(&self) -> Result<PathBuf, ConfigError> {
+        if let Some(d) = &self.dir {
+            return Ok(d.clone());
+        }
+        let cache_root = dirs::cache_dir().ok_or(ConfigError::NoConfigDir)?;
+        Ok(cache_root.join("packet-browser"))
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct FileConfig {
     pub agwpe_host: String,
     pub agwpe_port: u16,
@@ -21,6 +50,7 @@ pub struct FileConfig {
     pub target_callsign: String,
     pub bpq_command: String,
     pub skip_bpq_app: bool,
+    pub cache: CacheSection,
 }
 
 impl Default for FileConfig {
@@ -32,6 +62,7 @@ impl Default for FileConfig {
             target_callsign: String::new(),
             bpq_command: "WEB".to_string(),
             skip_bpq_app: false,
+            cache: CacheSection::default(),
         }
     }
 }
@@ -76,6 +107,23 @@ impl FileConfig {
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false);
 
+        let cache_enabled = ini
+            .get("cache", "enabled")
+            .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes" | "on"))
+            .unwrap_or(true);
+        let cache_max_bytes = ini
+            .get("cache", "max_bytes")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(209_715_200);
+        let cache_max_ttl_seconds = ini
+            .get("cache", "max_ttl_seconds")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(86_400);
+        let cache_dir = ini
+            .get("cache", "dir")
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from);
+
         Ok(Self {
             agwpe_host,
             agwpe_port,
@@ -83,6 +131,12 @@ impl FileConfig {
             target_callsign,
             bpq_command,
             skip_bpq_app,
+            cache: CacheSection {
+                enabled: cache_enabled,
+                max_bytes: cache_max_bytes,
+                max_ttl_seconds: cache_max_ttl_seconds,
+                dir: cache_dir,
+            },
         })
     }
 
@@ -99,6 +153,13 @@ impl FileConfig {
         ini.set("session", "target_callsign", Some(self.target_callsign.clone()));
         ini.set("session", "bpq_command", Some(self.bpq_command.clone()));
         ini.set("session", "skip_bpq_app", Some(self.skip_bpq_app.to_string()));
+
+        ini.set("cache", "enabled", Some(self.cache.enabled.to_string()));
+        ini.set("cache", "max_bytes", Some(self.cache.max_bytes.to_string()));
+        ini.set("cache", "max_ttl_seconds", Some(self.cache.max_ttl_seconds.to_string()));
+        if let Some(d) = &self.cache.dir {
+            ini.set("cache", "dir", Some(d.to_string_lossy().into_owned()));
+        }
 
         ini.write(path).map_err(|e| ConfigError::Parse(e.to_string()))?;
         Ok(())
@@ -223,6 +284,7 @@ mod tests {
             target_callsign: "NODE1".to_string(),
             bpq_command: "BROWSE".to_string(),
             skip_bpq_app: false,
+            cache: CacheSection::default(),
         };
 
         config.save(&path).unwrap();
@@ -277,5 +339,42 @@ mod tests {
         let resolved = cli.resolve_config().unwrap();
         assert_eq!(resolved.agwpe_host, "192.168.1.1");
         assert_eq!(resolved.agwpe_port, 7000);
+    }
+
+    #[test]
+    fn cache_defaults_are_applied_when_section_absent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        let cfg = FileConfig::default();
+        cfg.save(&path).unwrap();
+        let loaded = FileConfig::load(&path).unwrap();
+        assert!(loaded.cache.enabled);
+        assert_eq!(loaded.cache.max_bytes, 209_715_200);
+        assert_eq!(loaded.cache.max_ttl_seconds, 86_400);
+        assert!(loaded.cache.dir.is_none());
+    }
+
+    #[test]
+    fn cache_section_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        let cfg = FileConfig {
+            cache: CacheSection {
+                enabled: false,
+                max_bytes: 42,
+                max_ttl_seconds: 7,
+                dir: Some(std::path::PathBuf::from("/tmp/pb-cache")),
+            },
+            ..FileConfig::default()
+        };
+        cfg.save(&path).unwrap();
+        let loaded = FileConfig::load(&path).unwrap();
+        assert!(!loaded.cache.enabled);
+        assert_eq!(loaded.cache.max_bytes, 42);
+        assert_eq!(loaded.cache.max_ttl_seconds, 7);
+        assert_eq!(
+            loaded.cache.dir.as_deref().map(|p| p.to_string_lossy().into_owned()),
+            Some("/tmp/pb-cache".to_string())
+        );
     }
 }
