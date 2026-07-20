@@ -133,6 +133,7 @@ pub struct AppState {
     /// operator's decision; if the connect is cancelled another way, dropping
     /// it wakes the handshake with `RecvError`, treated as a decline.
     pub pending_consent: Option<oneshot::Sender<bool>>,
+    pub last_agreed_disclaimer: Option<String>,
     log_capacity: usize,
 }
 
@@ -145,6 +146,7 @@ impl AppState {
             available_ports: Vec::new(),
             agwpe_port_num: None,
             pending_consent: None,
+            last_agreed_disclaimer: None,
             log_capacity: 1000,
         }
     }
@@ -209,6 +211,14 @@ impl AppState {
     pub fn clear_ports(&mut self) {
         self.available_ports.clear();
         self.agwpe_port_num = None;
+    }
+
+    pub fn record_agreed_disclaimer(&mut self, text: String) {
+        self.last_agreed_disclaimer = Some(text);
+    }
+
+    pub fn clear_agreed_disclaimer(&mut self) {
+        self.last_agreed_disclaimer = None;
     }
 }
 
@@ -329,5 +339,15 @@ mod tests {
             reason: "no response after 30s".to_string(),
         };
         assert_eq!(s.to_string(), "Reconnecting: no response after 30s");
+    }
+
+    #[test]
+    fn test_agreed_disclaimer_set_and_clear() {
+        let mut s = AppState::new(FileConfig::default());
+        assert!(s.last_agreed_disclaimer.is_none());
+        s.record_agreed_disclaimer("logging notice text".to_string());
+        assert_eq!(s.last_agreed_disclaimer.as_deref(), Some("logging notice text"));
+        s.clear_agreed_disclaimer();
+        assert!(s.last_agreed_disclaimer.is_none());
     }
 }

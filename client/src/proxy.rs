@@ -674,11 +674,17 @@ async fn api_disconnect_handler(
     Extension(ctx): Extension<Arc<AppContext>>,
 ) -> Json<ConnectResponse> {
     match ctx.agwpe.ax25_disconnect().await {
-        Ok(()) => Json(ConnectResponse {
-            ok: true,
-            state: Some("Disconnected".to_string()),
-            error: None,
-        }),
+        Ok(()) => {
+            {
+                let mut s = ctx.state.lock_or_poisoned();
+                s.clear_agreed_disclaimer();
+            }
+            Json(ConnectResponse {
+                ok: true,
+                state: Some("Disconnected".to_string()),
+                error: None,
+            })
+        }
         Err(e) => Json(ConnectResponse {
             ok: false,
             state: None,
@@ -736,6 +742,20 @@ async fn api_consent_post(
     };
     match sender {
         Some(tx) => {
+            // Record the agreed disclaimer text if operator accepted
+            if decision.accepted {
+                let disclaimer_text = {
+                    let s = ctx.state.lock_or_poisoned();
+                    match &s.connection_state {
+                        ConnectionState::AwaitingConsent { disclaimer } => Some(disclaimer.clone()),
+                        _ => None,
+                    }
+                };
+                if let Some(text) = disclaimer_text {
+                    let mut s = ctx.state.lock_or_poisoned();
+                    s.record_agreed_disclaimer(text);
+                }
+            }
             if tx.send(decision.accepted).is_err() {
                 // Receiver already dropped (e.g. handshake cancelled while
                 // this request was in flight). Treat as a no-op.
