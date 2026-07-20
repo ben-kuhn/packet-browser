@@ -14,7 +14,9 @@ use std::collections::HashSet;
 use std::convert::Infallible;
 use std::net::IpAddr;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 use tokio::sync::broadcast;
+use crate::cache::Cache;
 
 static CALLSIGN_REGEX: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"^[a-zA-Z0-9]{1,3}[0-9][a-zA-Z0-9]{0,3}[a-zA-Z]$").unwrap()
@@ -33,6 +35,8 @@ pub struct AppContext {
     pub agwpe: AgwpeManager,
     pub log_tx: broadcast::Sender<DebugLogEntry>,
     pub host_allowlist: HostAllowlist,
+    pub cache: Option<Arc<Cache>>,
+    pub cache_max_ttl: Duration,
 }
 
 /// A whitelist of hostnames we are prepared to serve on. Used to block DNS

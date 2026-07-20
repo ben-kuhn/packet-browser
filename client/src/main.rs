@@ -10,6 +10,7 @@ use config::CliArgs;
 use proxy::{AppContext, HostAllowlist};
 use state::create_shared_state;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::broadcast;
 
@@ -77,11 +78,33 @@ async fn main() -> Result<(), ClientError> {
 
     let host_allowlist = HostAllowlist::new(listen_ip, cli.allowed_hosts.clone());
 
+    let cache_max_ttl = Duration::from_secs(config.cache.max_ttl_seconds);
+    let cache = if config.cache.enabled {
+        match config
+            .cache
+            .effective_dir()
+            .map_err(|e| e.to_string())
+            .and_then(|d| {
+                crate::cache::Cache::open(&d, config.cache.max_bytes, cache_max_ttl)
+                    .map_err(|e| e.to_string())
+            }) {
+            Ok(c) => Some(std::sync::Arc::new(c)),
+            Err(e) => {
+                tracing::warn!("cache disabled for this session: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let ctx = Arc::new(AppContext {
         state: shared_state,
         agwpe: agwpe_manager,
         log_tx,
         host_allowlist,
+        cache,
+        cache_max_ttl,
     });
 
     let app = proxy::create_router(ctx);
