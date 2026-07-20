@@ -1252,76 +1252,102 @@ async fn handle_reconnect(
         let _ = BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &close_frame).await;
     }
 
-    // Re-run the AX.25 handshake using the same helpers as handle_ax25_connect.
-    ax25_open_and_await_connected(bg, state, log_tx).await?;
+    // Run the full handshake in an inner block so we can intercept any error
+    // and transition to Error state before returning.  The NeedsReconsent path
+    // is the only exit that must NOT transition to Error — it sets
+    // AwaitingConsent explicitly and is handled via a dedicated early-return
+    // above the inner block.
+    let result: Result<(), AgwpeError> = async {
+        // Re-run the AX.25 handshake using the same helpers as handle_ax25_connect.
+        ax25_open_and_await_connected(bg, state, log_tx).await?;
 
-    let skip_bpq_app = {
-        let s = state.lock_or_poisoned();
-        s.config.skip_bpq_app
-    };
-    if !skip_bpq_app {
-        bpq_send_app_command(bg, state, log_tx).await?;
-    } else {
+        let skip_bpq_app = {
+            let s = state.lock_or_poisoned();
+            s.config.skip_bpq_app
+        };
+        if !skip_bpq_app {
+            bpq_send_app_command(bg, state, log_tx).await?;
+        } else {
+            BackgroundState::push_log(
+                state,
+                log_tx,
+                DebugLogEntry::new(
+                    LogLevel::Info,
+                    "BPQ",
+                    "Skipping BPQ application command (direct connection mode)",
+                ),
+            );
+        }
+        bpq_await_callsign_prompt_and_send_callsign(bg, state, log_tx).await?;
+        let disclaimer = bpq_await_disclaimer(bg, state, log_tx).await?;
+
+        // Auto-consent check — exact-string equality only.
+        let stored = {
+            let s = state.lock_or_poisoned();
+            s.last_agreed_disclaimer.clone()
+        };
+        if !matches_stored_disclaimer(&disclaimer, stored.as_deref()) {
+            BackgroundState::push_log(
+                state,
+                log_tx,
+                DebugLogEntry::new(
+                    LogLevel::Info,
+                    "PROTOCOL",
+                    "Server disclaimer differs from stored consent; re-consent required",
+                ),
+            );
+            BackgroundState::set_state(
+                state,
+                log_tx,
+                ConnectionState::AwaitingConsent { disclaimer },
+            );
+            return Err(AgwpeError::NeedsReconsent);
+        }
+
+        // Disclaimer matches — send AGREE on the wire so the server logs it.
+        // Disclaimer suppression is purely UI; the wire protocol always requires AGREE.
+        let agree_frame = AgwpeFrame::new(
+            bg.agwpe_port,
+            FrameType::SendData,
+            &bg.local_callsign,
+            &bg.remote_callsign,
+            b"AGREE\n".to_vec(),
+        );
         BackgroundState::push_log(
             state,
             log_tx,
-            DebugLogEntry::new(
-                LogLevel::Info,
-                "BPQ",
-                "Skipping BPQ application command (direct connection mode)",
-            ),
+            DebugLogEntry::new(LogLevel::Info, "BPQ", "Auto-sending AGREE (matches stored consent)")
+                .with_direction(Direction::Tx),
         );
-    }
-    bpq_await_callsign_prompt_and_send_callsign(bg, state, log_tx).await?;
-    let disclaimer = bpq_await_disclaimer(bg, state, log_tx).await?;
+        BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &agree_frame).await?;
 
-    // Auto-consent check — exact-string equality only.
-    let stored = {
-        let s = state.lock_or_poisoned();
-        s.last_agreed_disclaimer.clone()
-    };
-    if !matches_stored_disclaimer(&disclaimer, stored.as_deref()) {
+        BackgroundState::set_state(state, log_tx, ConnectionState::Connected);
         BackgroundState::push_log(
             state,
             log_tx,
-            DebugLogEntry::new(
-                LogLevel::Info,
-                "PROTOCOL",
-                "Server disclaimer differs from stored consent; re-consent required",
-            ),
+            DebugLogEntry::new(LogLevel::Info, "PROTOCOL", "Reconnect successful"),
         );
-        BackgroundState::set_state(
-            state,
-            log_tx,
-            ConnectionState::AwaitingConsent { disclaimer },
-        );
-        return Err(AgwpeError::NeedsReconsent);
+        Ok(())
     }
+    .await;
 
-    // Disclaimer matches — send AGREE on the wire so the server logs it.
-    // Disclaimer suppression is purely UI; the wire protocol always requires AGREE.
-    let agree_frame = AgwpeFrame::new(
-        bg.agwpe_port,
-        FrameType::SendData,
-        &bg.local_callsign,
-        &bg.remote_callsign,
-        b"AGREE\n".to_vec(),
-    );
-    BackgroundState::push_log(
-        state,
-        log_tx,
-        DebugLogEntry::new(LogLevel::Info, "BPQ", "Auto-sending AGREE (matches stored consent)")
-            .with_direction(Direction::Tx),
-    );
-    BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &agree_frame).await?;
-
-    BackgroundState::set_state(state, log_tx, ConnectionState::Connected);
-    BackgroundState::push_log(
-        state,
-        log_tx,
-        DebugLogEntry::new(LogLevel::Info, "PROTOCOL", "Reconnect successful"),
-    );
-    Ok(())
+    match result {
+        Ok(()) => Ok(()),
+        // NeedsReconsent already transitioned to AwaitingConsent — pass through.
+        Err(AgwpeError::NeedsReconsent) => Err(AgwpeError::NeedsReconsent),
+        // Any other error: transition to Error state so the UI shows a failure
+        // instead of a spinner stuck on Reconnecting.
+        Err(e) => {
+            let msg = format!("Reconnect failed: {}", e);
+            BackgroundState::push_log(
+                state,
+                log_tx,
+                DebugLogEntry::new(LogLevel::Info, "ERROR", &msg),
+            );
+            BackgroundState::set_state(state, log_tx, ConnectionState::Error(msg));
+            Err(e)
+        }
+    }
 }
 
 async fn handle_send_request(
