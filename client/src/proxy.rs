@@ -34,6 +34,7 @@ pub struct AppContext {
     pub host_allowlist: HostAllowlist,
     pub cache: Option<Arc<Cache>>,
     pub cache_max_ttl: Duration,
+    pub config: FileConfig,
 }
 
 /// A whitelist of hostnames we are prepared to serve on. Used to block DNS
@@ -235,6 +236,7 @@ async fn connect_page_handler(
         ConnectionState::Connecting => "status-connecting",
         ConnectionState::AwaitingConsent { .. } => "status-connecting",
         ConnectionState::Connected => "status-connected",
+        ConnectionState::Reconnecting { .. } => "status-reconnecting",
         ConnectionState::Error(_) => "status-error",
     };
     let ports_json = serde_json::to_string(&state.available_ports).unwrap_or_else(|_| "[]".to_string());
@@ -395,7 +397,12 @@ async fn dispatch_ax25(
         _ => None,
     };
 
-    match ctx.agwpe.send_request(encoded).await {
+    let send_result = if ctx.config.connection.auto_reconnect {
+        ctx.agwpe.send_request_with_reconnect(encoded).await
+    } else {
+        ctx.agwpe.send_request(encoded).await
+    };
+    match send_result {
         Ok(response_data) => {
             let (status, b64_len, etag, max_age, header_end) =
                 match ProtocolResponse::decode_header(&response_data) {
@@ -461,6 +468,26 @@ async fn dispatch_ax25(
                     Html(ui::error_page(&text)).into_response()
                 }
             }
+        }
+        Err(crate::agwpe::AgwpeError::NeedsReconsent) => {
+            Html(ui::render_session_error_page(
+                "Session dropped and the disclaimer text changed. Please reconnect and re-consent.",
+                true,
+            )).into_response()
+        }
+        Err(crate::agwpe::AgwpeError::SessionDied { reason }) => {
+            // Auto-reconnect already ran and this is the second failure, OR
+            // auto-reconnect was disabled. Either way, surface the error.
+            Html(ui::render_session_error_page(
+                &format!("Session lost: {}. Please reconnect.", reason),
+                true,
+            )).into_response()
+        }
+        Err(crate::agwpe::AgwpeError::DisconnectedByOperator) => {
+            Html(ui::render_session_error_page(
+                "Request cancelled by operator disconnect.",
+                true,
+            )).into_response()
         }
         Err(e) => Html(ui::error_page(&format!("Request failed: {}", e))).into_response(),
     }
@@ -673,11 +700,17 @@ async fn api_disconnect_handler(
     Extension(ctx): Extension<Arc<AppContext>>,
 ) -> Json<ConnectResponse> {
     match ctx.agwpe.ax25_disconnect().await {
-        Ok(()) => Json(ConnectResponse {
-            ok: true,
-            state: Some("Disconnected".to_string()),
-            error: None,
-        }),
+        Ok(()) => {
+            {
+                let mut s = ctx.state.lock_or_poisoned();
+                s.clear_agreed_disclaimer();
+            }
+            Json(ConnectResponse {
+                ok: true,
+                state: Some("Disconnected".to_string()),
+                error: None,
+            })
+        }
         Err(e) => Json(ConnectResponse {
             ok: false,
             state: None,
@@ -735,6 +768,20 @@ async fn api_consent_post(
     };
     match sender {
         Some(tx) => {
+            // Record the agreed disclaimer text if operator accepted
+            if decision.accepted {
+                let disclaimer_text = {
+                    let s = ctx.state.lock_or_poisoned();
+                    match &s.connection_state {
+                        ConnectionState::AwaitingConsent { disclaimer } => Some(disclaimer.clone()),
+                        _ => None,
+                    }
+                };
+                if let Some(text) = disclaimer_text {
+                    let mut s = ctx.state.lock_or_poisoned();
+                    s.record_agreed_disclaimer(text);
+                }
+            }
             if tx.send(decision.accepted).is_err() {
                 // Receiver already dropped (e.g. handshake cancelled while
                 // this request was in flight). Treat as a no-op.

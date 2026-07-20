@@ -45,7 +45,7 @@ async fn main() -> Result<(), ClientError> {
     let shared_state = create_shared_state(config.clone());
     let (log_tx, _) = broadcast::channel::<state::DebugLogEntry>(256);
 
-    let agwpe_manager = agwpe::AgwpeManager::new(shared_state.clone(), log_tx.clone());
+    let agwpe_manager = agwpe::AgwpeManager::new(shared_state.clone(), log_tx.clone(), config.connection.response_timeout_secs);
 
     // Auto-connect to AGWPE on startup
     if !config.my_callsign.is_empty() {
@@ -105,6 +105,7 @@ async fn main() -> Result<(), ClientError> {
         host_allowlist,
         cache,
         cache_max_ttl,
+        config: config.clone(),
     });
 
     let app = proxy::create_router(ctx);

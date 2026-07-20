@@ -14,6 +14,21 @@ pub enum ConfigError {
 }
 
 #[derive(Debug, Clone)]
+pub struct ConnectionConfig {
+    pub response_timeout_secs: u64,
+    pub auto_reconnect: bool,
+}
+
+impl Default for ConnectionConfig {
+    fn default() -> Self {
+        Self {
+            response_timeout_secs: 30,
+            auto_reconnect: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct CacheSection {
     pub enabled: bool,
     pub max_bytes: u64,
@@ -51,6 +66,7 @@ pub struct FileConfig {
     pub bpq_command: String,
     pub skip_bpq_app: bool,
     pub cache: CacheSection,
+    pub connection: ConnectionConfig,
 }
 
 impl Default for FileConfig {
@@ -63,6 +79,7 @@ impl Default for FileConfig {
             bpq_command: "WEB".to_string(),
             skip_bpq_app: false,
             cache: CacheSection::default(),
+            connection: ConnectionConfig::default(),
         }
     }
 }
@@ -124,6 +141,15 @@ impl FileConfig {
             .filter(|s| !s.trim().is_empty())
             .map(PathBuf::from);
 
+        let response_timeout_secs = ini
+            .get("connection", "response_timeout_secs")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+        let auto_reconnect = ini
+            .get("connection", "auto_reconnect")
+            .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes" | "on"))
+            .unwrap_or(true);
+
         Ok(Self {
             agwpe_host,
             agwpe_port,
@@ -136,6 +162,10 @@ impl FileConfig {
                 max_bytes: cache_max_bytes,
                 max_ttl_seconds: cache_max_ttl_seconds,
                 dir: cache_dir,
+            },
+            connection: ConnectionConfig {
+                response_timeout_secs,
+                auto_reconnect,
             },
         })
     }
@@ -160,6 +190,9 @@ impl FileConfig {
         if let Some(d) = &self.cache.dir {
             ini.set("cache", "dir", Some(d.to_string_lossy().into_owned()));
         }
+
+        ini.set("connection", "response_timeout_secs", Some(self.connection.response_timeout_secs.to_string()));
+        ini.set("connection", "auto_reconnect", Some(self.connection.auto_reconnect.to_string()));
 
         ini.write(path).map_err(|e| ConfigError::Parse(e.to_string()))?;
         Ok(())
@@ -285,6 +318,7 @@ mod tests {
             bpq_command: "BROWSE".to_string(),
             skip_bpq_app: false,
             cache: CacheSection::default(),
+            connection: ConnectionConfig::default(),
         };
 
         config.save(&path).unwrap();
@@ -376,5 +410,33 @@ mod tests {
             loaded.cache.dir.as_deref().map(|p| p.to_string_lossy().into_owned()),
             Some("/tmp/pb-cache".to_string())
         );
+    }
+
+    #[test]
+    fn test_connection_config_defaults() {
+        let cfg = FileConfig::default();
+        assert_eq!(cfg.connection.response_timeout_secs, 30);
+        assert!(cfg.connection.auto_reconnect);
+    }
+
+    #[test]
+    fn test_connection_config_overrides() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+
+        let mut ini = Ini::new();
+        ini.set("server", "agwpe_host", Some("127.0.0.1".to_string()));
+        ini.set("server", "agwpe_port", Some("8000".to_string()));
+        ini.set("session", "my_callsign", Some("W1TEST".to_string()));
+        ini.set("session", "target_callsign", Some("N0CALL".to_string()));
+        ini.set("session", "bpq_command", Some("WEB".to_string()));
+        ini.set("session", "skip_bpq_app", Some("false".to_string()));
+        ini.set("connection", "response_timeout_secs", Some("15".to_string()));
+        ini.set("connection", "auto_reconnect", Some("false".to_string()));
+        ini.write(&path).unwrap();
+
+        let loaded = FileConfig::load(&path).unwrap();
+        assert_eq!(loaded.connection.response_timeout_secs, 15);
+        assert!(!loaded.connection.auto_reconnect);
     }
 }

@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -24,6 +26,12 @@ pub enum AgwpeError {
     Timeout,
     #[error("Background task stopped")]
     TaskStopped,
+    #[error("Session died: {reason}")]
+    SessionDied { reason: String },
+    #[error("Session dropped and requires re-consent")]
+    NeedsReconsent,
+    #[error("Disconnected by operator")]
+    DisconnectedByOperator,
 }
 
 // Defensive caps against a hostile or buggy AGWPE peer sending oversized lengths.
@@ -212,6 +220,10 @@ pub enum AgwpeCommand {
         data: Vec<u8>,
         reply: oneshot::Sender<Result<Vec<u8>, AgwpeError>>,
     },
+    SendRequestWithReconnect {
+        data: Vec<u8>,
+        reply: oneshot::Sender<Result<Vec<u8>, AgwpeError>>,
+    },
 }
 
 #[derive(Clone)]
@@ -223,11 +235,12 @@ impl AgwpeManager {
     pub fn new(
         state: SharedState,
         log_tx: broadcast::Sender<DebugLogEntry>,
+        response_timeout_secs: u64,
     ) -> Self {
         let (command_tx, command_rx) = mpsc::channel(32);
 
         tokio::spawn(async move {
-            background_task(command_rx, state, log_tx).await;
+            background_task(command_rx, state, log_tx, response_timeout_secs).await;
         });
 
         Self { command_tx }
@@ -300,6 +313,15 @@ impl AgwpeManager {
             .map_err(|_| AgwpeError::TaskStopped)?;
         rx.await.map_err(|_| AgwpeError::TaskStopped)?
     }
+
+    pub async fn send_request_with_reconnect(&self, data: Vec<u8>) -> Result<Vec<u8>, AgwpeError> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(AgwpeCommand::SendRequestWithReconnect { data, reply: tx })
+            .await
+            .map_err(|_| AgwpeError::TaskStopped)?;
+        rx.await.map_err(|_| AgwpeError::TaskStopped)?
+    }
 }
 
 struct BackgroundState {
@@ -308,6 +330,8 @@ struct BackgroundState {
     remote_callsign: String,
     agwpe_port: u8,
     read_buf: Vec<u8>,
+    response_timeout_secs: u64,
+    abort_reconnect: Arc<AtomicBool>,
 }
 
 impl BackgroundState {
@@ -318,6 +342,8 @@ impl BackgroundState {
             remote_callsign: String::new(),
             agwpe_port: 0,
             read_buf: Vec::new(),
+            response_timeout_secs: 30,
+            abort_reconnect: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -406,8 +432,12 @@ async fn background_task(
     mut command_rx: mpsc::Receiver<AgwpeCommand>,
     state: SharedState,
     log_tx: broadcast::Sender<DebugLogEntry>,
+    response_timeout_secs: u64,
 ) {
     let mut bg = BackgroundState::new();
+    // Clamp to at least 1s: a zero-second timeout would fire on every read,
+    // instantly SessionDied-ing every request and looping through reconnects.
+    bg.response_timeout_secs = response_timeout_secs.max(1);
 
     while let Some(cmd) = command_rx.recv().await {
         match cmd {
@@ -442,6 +472,10 @@ async fn background_task(
             }
             AgwpeCommand::SendRequest { data, reply } => {
                 let result = handle_send_request(&mut bg, &state, &log_tx, data).await;
+                let _ = reply.send(result);
+            }
+            AgwpeCommand::SendRequestWithReconnect { data, reply } => {
+                let result = handle_send_request_with_reconnect(&mut bg, &state, &log_tx, data).await;
                 let _ = reply.send(result);
             }
         }
@@ -671,60 +705,59 @@ async fn handle_query_ports(
     Ok(())
 }
 
-async fn perform_bpq_handshake(
+/// Send the BPQ application command (e.g. "WEB\n") over the current AX.25
+/// session.  Called only when `skip_bpq_app` is false.
+async fn bpq_send_app_command(
     bg: &mut BackgroundState,
     state: &SharedState,
     log_tx: &broadcast::Sender<DebugLogEntry>,
 ) -> Result<(), AgwpeError> {
-    let (bpq_command, skip_bpq_app) = {
+    let bpq_command = {
         let s = state.lock_or_poisoned();
-        (s.config.bpq_command.clone(), s.config.skip_bpq_app)
+        s.config.bpq_command.clone()
     };
 
+    BackgroundState::push_log(
+        state,
+        log_tx,
+        DebugLogEntry::new(
+            LogLevel::Info,
+            "BPQ",
+            &format!("Starting BPQ handshake with command: {}", bpq_command),
+        ),
+    );
+
+    let cmd_data = format!("{}\n", bpq_command);
+
+    BackgroundState::push_log(
+        state,
+        log_tx,
+        DebugLogEntry::new(LogLevel::Debug, "BPQ", &format!("Sending BPQ command: {:?}", cmd_data))
+            .with_direction(Direction::Tx),
+    );
+
+    let cmd_frame = AgwpeFrame::new(
+        bg.agwpe_port,
+        FrameType::SendData,
+        &bg.local_callsign,
+        &bg.remote_callsign,
+        cmd_data.into_bytes(),
+    );
+
+    BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &cmd_frame).await?;
+    tracing::trace!("[BPQ] Sent BPQ command frame");
+    Ok(())
+}
+
+/// Wait for the server's callsign prompt and send our local callsign in
+/// response.  The prompt is identified by the presence of the word "callsign"
+/// (or "AGREE", which some deployments include in the same banner line).
+async fn bpq_await_callsign_prompt_and_send_callsign(
+    bg: &mut BackgroundState,
+    state: &SharedState,
+    log_tx: &broadcast::Sender<DebugLogEntry>,
+) -> Result<(), AgwpeError> {
     let callsign = bg.local_callsign.clone();
-
-    if skip_bpq_app {
-        BackgroundState::push_log(
-            state,
-            log_tx,
-            DebugLogEntry::new(
-                LogLevel::Info,
-                "BPQ",
-                "Skipping BPQ application command (direct connection mode)",
-            ),
-        );
-    } else {
-        BackgroundState::push_log(
-            state,
-            log_tx,
-            DebugLogEntry::new(
-                LogLevel::Info,
-                "BPQ",
-                &format!("Starting BPQ handshake with command: {}", bpq_command),
-            ),
-        );
-
-        // Send BPQ command immediately (e.g., "WEB\n")
-        let cmd_data = format!("{}\n", bpq_command);
-
-        BackgroundState::push_log(
-            state,
-            log_tx,
-            DebugLogEntry::new(LogLevel::Debug, "BPQ", &format!("Sending BPQ command: {:?}", cmd_data))
-                .with_direction(Direction::Tx),
-        );
-
-        let cmd_frame = AgwpeFrame::new(
-            bg.agwpe_port,
-            FrameType::SendData,
-            &bg.local_callsign,
-            &bg.remote_callsign,
-            cmd_data.into_bytes(),
-        );
-
-        BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &cmd_frame).await?;
-        tracing::trace!("[BPQ] Sent BPQ command frame");
-    }
 
     // The far side (packet-browser-server, via LinBPQ HOST 0) does NOT
     // auto-inject the callsign in this deployment — LinBPQ opens the TCP
@@ -809,10 +842,19 @@ async fn perform_bpq_handshake(
     );
     BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &call_frame).await?;
     tracing::trace!("[BPQ] Sent callsign frame");
+    Ok(())
+}
 
-    // Now wait for the AGREE prompt. Reuse received_text so any trailing
-    // bytes from the callsign frame are still available for the match.
-    received_text.clear();
+/// Wait for the server's logging-disclaimer / AGREE prompt and return the raw
+/// disclaimer text (byte-for-byte, no trim or normalisation).  The caller
+/// decides what to do with it — either surface it for operator consent or
+/// compare it against a stored value for auto-consent.
+async fn bpq_await_disclaimer(
+    bg: &mut BackgroundState,
+    state: &SharedState,
+    log_tx: &broadcast::Sender<DebugLogEntry>,
+) -> Result<String, AgwpeError> {
+    let mut received_text = String::new();
     let mut agree_prompt_found = false;
 
     BackgroundState::push_log(
@@ -826,8 +868,8 @@ async fn perform_bpq_handshake(
     loop {
         let frame = bg.read_frame_with_timeout(30).await?;
 
-        tracing::trace!("[BPQ] Received frame type {:?} (0x{:02X}), data_len={}, data={:?}", 
-            frame.frame_type, frame.frame_type as u8, frame.data_len, 
+        tracing::trace!("[BPQ] Received frame type {:?} (0x{:02X}), data_len={}, data={:?}",
+            frame.frame_type, frame.frame_type as u8, frame.data_len,
             String::from_utf8_lossy(&frame.data[..frame.data_len.min(100) as usize]));
 
         match frame.frame_type {
@@ -882,6 +924,37 @@ async fn perform_bpq_handshake(
             "AGREE prompt not received".to_string(),
         ));
     }
+
+    Ok(received_text)
+}
+
+async fn perform_bpq_handshake(
+    bg: &mut BackgroundState,
+    state: &SharedState,
+    log_tx: &broadcast::Sender<DebugLogEntry>,
+) -> Result<(), AgwpeError> {
+    let skip_bpq_app = {
+        let s = state.lock_or_poisoned();
+        s.config.skip_bpq_app
+    };
+
+    if skip_bpq_app {
+        BackgroundState::push_log(
+            state,
+            log_tx,
+            DebugLogEntry::new(
+                LogLevel::Info,
+                "BPQ",
+                "Skipping BPQ application command (direct connection mode)",
+            ),
+        );
+    } else {
+        bpq_send_app_command(bg, state, log_tx).await?;
+    }
+
+    bpq_await_callsign_prompt_and_send_callsign(bg, state, log_tx).await?;
+
+    let received_text = bpq_await_disclaimer(bg, state, log_tx).await?;
 
     // Park the handshake in `AwaitingConsent` and hand the disclaimer to the
     // UI. We do not send "AGREE\n" until the operator explicitly clicks
@@ -963,33 +1036,24 @@ async fn perform_bpq_handshake(
     Ok(())
 }
 
-async fn handle_ax25_connect(
+/// Send an AX.25 Connect frame and loop until the peer acknowledges the
+/// connection (either via a `Connected` frame or LinBPQ's `Connect` + `***
+/// CONNECTED` banner).  On success `bg.remote_callsign` and `bg.agwpe_port`
+/// are already set by the caller (`handle_ax25_connect`) or were preserved
+/// from the previous session (`handle_reconnect`).
+async fn ax25_open_and_await_connected(
     bg: &mut BackgroundState,
     state: &SharedState,
     log_tx: &broadcast::Sender<DebugLogEntry>,
-    target: &str,
-    port_num: u8,
 ) -> Result<(), AgwpeError> {
-    if !bg.is_connected() {
-        return Err(AgwpeError::NotConnected);
-    }
-
-    bg.remote_callsign = target.to_string();
-    bg.agwpe_port = port_num;
-
-    let state_entry = {
-        let mut s = state.lock_or_poisoned();
-        let entry = s.set_connection_state(ConnectionState::Connecting);
-        s.set_agwpe_port(port_num);
-        entry
-    };
-    let _ = log_tx.send(state_entry);
+    let target = bg.remote_callsign.clone();
+    let port_num = bg.agwpe_port;
 
     let connect_frame = AgwpeFrame::new(
         port_num,
         FrameType::Connect,
         &bg.local_callsign,
-        target,
+        &target,
         vec![],
     );
 
@@ -1009,8 +1073,8 @@ async fn handle_ax25_connect(
     loop {
         let frame = bg.read_frame_with_timeout(30).await?;
 
-        tracing::trace!("[AGWPE] AX.25 connect: received frame type {:?} (0x{:02X}), data_len={}, data={:?}", 
-            frame.frame_type, frame.frame_type as u8, frame.data_len, 
+        tracing::trace!("[AGWPE] AX.25 connect: received frame type {:?} (0x{:02X}), data_len={}, data={:?}",
+            frame.frame_type, frame.frame_type as u8, frame.data_len,
             String::from_utf8_lossy(&frame.data[..frame.data_len.min(50) as usize]));
 
         match frame.frame_type {
@@ -1025,32 +1089,10 @@ async fn handle_ax25_connect(
                     )
                     .with_direction(Direction::Rx),
                 );
-
-                {
-                    let mut s = state.lock_or_poisoned();
-                    s.config.update_target(target);
-                }
-
-                // Perform BPQ handshake
-                match perform_bpq_handshake(bg, state, log_tx).await {
-                    Ok(()) => {
-                        BackgroundState::set_state(state, log_tx, ConnectionState::Connected);
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        let msg = format!("BPQ handshake failed: {}", e);
-                        BackgroundState::push_log(
-                            state,
-                            log_tx,
-                            DebugLogEntry::new(LogLevel::Info, "ERROR", &msg),
-                        );
-                        BackgroundState::set_state(state, log_tx, ConnectionState::Error(msg.clone()));
-                        return Err(AgwpeError::ConnectionFailed(msg));
-                    }
-                }
+                return Ok(());
             }
-            // LinBPQ sends 0x43 ('C') for both connect request AND connected notification
-            // Check if this is actually a connected notification by looking at the data
+            // LinBPQ sends 0x43 ('C') for both connect request AND connected notification.
+            // Check if this is actually a connected notification by looking at the data.
             FrameType::Connect if frame.data.starts_with(b"***") => {
                 let text = String::from_utf8_lossy(&frame.data);
                 if text.contains("CONNECTED") {
@@ -1064,29 +1106,7 @@ async fn handle_ax25_connect(
                         )
                         .with_direction(Direction::Rx),
                     );
-
-                    {
-                        let mut s = state.lock_or_poisoned();
-                        s.config.update_target(target);
-                    }
-
-                    // Perform BPQ handshake
-                    match perform_bpq_handshake(bg, state, log_tx).await {
-                        Ok(()) => {
-                            BackgroundState::set_state(state, log_tx, ConnectionState::Connected);
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            let msg = format!("BPQ handshake failed: {}", e);
-                            BackgroundState::push_log(
-                                state,
-                                log_tx,
-                                DebugLogEntry::new(LogLevel::Info, "ERROR", &msg),
-                            );
-                            BackgroundState::set_state(state, log_tx, ConnectionState::Error(msg.clone()));
-                            return Err(AgwpeError::ConnectionFailed(msg));
-                        }
-                    }
+                    return Ok(());
                 } else {
                     BackgroundState::push_log(
                         state,
@@ -1107,7 +1127,6 @@ async fn handle_ax25_connect(
                     DebugLogEntry::new(LogLevel::Info, "ERROR", &msg)
                         .with_direction(Direction::Rx),
                 );
-                BackgroundState::set_state(state, log_tx, ConnectionState::Error(msg.clone()));
                 return Err(AgwpeError::ConnectionFailed(msg));
             }
             _ => {
@@ -1125,11 +1144,64 @@ async fn handle_ax25_connect(
     }
 }
 
+async fn handle_ax25_connect(
+    bg: &mut BackgroundState,
+    state: &SharedState,
+    log_tx: &broadcast::Sender<DebugLogEntry>,
+    target: &str,
+    port_num: u8,
+) -> Result<(), AgwpeError> {
+    bg.abort_reconnect.store(false, Ordering::SeqCst);
+
+    if !bg.is_connected() {
+        return Err(AgwpeError::NotConnected);
+    }
+
+    bg.remote_callsign = target.to_string();
+    bg.agwpe_port = port_num;
+
+    let state_entry = {
+        let mut s = state.lock_or_poisoned();
+        let entry = s.set_connection_state(ConnectionState::Connecting);
+        s.set_agwpe_port(port_num);
+        entry
+    };
+    let _ = log_tx.send(state_entry);
+
+    // Update stored target so subsequent reconnects know where to aim.
+    {
+        let mut s = state.lock_or_poisoned();
+        s.config.update_target(target);
+    }
+
+    ax25_open_and_await_connected(bg, state, log_tx).await?;
+
+    // Perform BPQ handshake
+    match perform_bpq_handshake(bg, state, log_tx).await {
+        Ok(()) => {
+            BackgroundState::set_state(state, log_tx, ConnectionState::Connected);
+            Ok(())
+        }
+        Err(e) => {
+            let msg = format!("BPQ handshake failed: {}", e);
+            BackgroundState::push_log(
+                state,
+                log_tx,
+                DebugLogEntry::new(LogLevel::Info, "ERROR", &msg),
+            );
+            BackgroundState::set_state(state, log_tx, ConnectionState::Error(msg.clone()));
+            Err(AgwpeError::ConnectionFailed(msg))
+        }
+    }
+}
+
 async fn handle_ax25_disconnect(
     bg: &mut BackgroundState,
     state: &SharedState,
     log_tx: &broadcast::Sender<DebugLogEntry>,
 ) -> Result<(), AgwpeError> {
+    bg.abort_reconnect.store(true, Ordering::SeqCst);
+
     if !bg.is_connected() {
         return Err(AgwpeError::NotConnected);
     }
@@ -1154,6 +1226,173 @@ async fn handle_ax25_disconnect(
     BackgroundState::set_state(state, log_tx, ConnectionState::AgwpeConnected);
 
     Ok(())
+}
+
+fn is_session_dead_payload(data: &[u8]) -> bool {
+    data.starts_with(b"*** DISCONNECTED")
+}
+
+/// Returns `true` iff `server_text` is byte-for-byte equal to the stored
+/// disclaimer. `None` stored means we have never seen a consent, so we always
+/// return `false` — the operator must consent explicitly.
+fn matches_stored_disclaimer(server_text: &str, stored: Option<&str>) -> bool {
+    match stored {
+        Some(s) => s == server_text,
+        None => false,
+    }
+}
+
+/// Re-run the full AX.25 + BPQ + AGREE handshake for a session that died
+/// unexpectedly.  Transitions to `Reconnecting` at entry and `Connected` on
+/// successful auto-consent.  Returns `Err(NeedsReconsent)` when the server's
+/// disclaimer text differs from the stored consent, leaving the state as
+/// `AwaitingConsent` so the UI can open the consent modal on the operator's
+/// next visit.
+async fn handle_reconnect(
+    bg: &mut BackgroundState,
+    state: &SharedState,
+    log_tx: &broadcast::Sender<DebugLogEntry>,
+    reason: String,
+) -> Result<(), AgwpeError> {
+    BackgroundState::set_state(
+        state,
+        log_tx,
+        ConnectionState::Reconnecting { reason: reason.clone() },
+    );
+    BackgroundState::push_log(
+        state,
+        log_tx,
+        DebugLogEntry::new(
+            LogLevel::Info,
+            "PROTOCOL",
+            &format!("Session lost ({}); attempting reconnect", reason),
+        ),
+    );
+
+    // Best-effort close of the client's AX.25 side before we re-open.  The
+    // session is already dead, so we ignore any send error here.
+    if bg.stream.is_some() {
+        let close_frame = AgwpeFrame::new(
+            bg.agwpe_port,
+            FrameType::SendData,
+            &bg.local_callsign,
+            &bg.remote_callsign,
+            vec![],
+        );
+        let _ = BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &close_frame).await;
+    }
+
+    // Run the full handshake in an inner block so we can intercept any error
+    // and transition to Error state before returning.  The NeedsReconsent path
+    // is the only exit that must NOT transition to Error — it sets
+    // AwaitingConsent explicitly and is handled via a dedicated early-return
+    // above the inner block.
+    let result: Result<(), AgwpeError> = async {
+        // Re-run the AX.25 handshake using the same helpers as handle_ax25_connect.
+        ax25_open_and_await_connected(bg, state, log_tx).await?;
+        if bg.abort_reconnect.load(Ordering::SeqCst) {
+            return Err(AgwpeError::DisconnectedByOperator);
+        }
+
+        let skip_bpq_app = {
+            let s = state.lock_or_poisoned();
+            s.config.skip_bpq_app
+        };
+        if !skip_bpq_app {
+            bpq_send_app_command(bg, state, log_tx).await?;
+            if bg.abort_reconnect.load(Ordering::SeqCst) {
+                return Err(AgwpeError::DisconnectedByOperator);
+            }
+        } else {
+            BackgroundState::push_log(
+                state,
+                log_tx,
+                DebugLogEntry::new(
+                    LogLevel::Info,
+                    "BPQ",
+                    "Skipping BPQ application command (direct connection mode)",
+                ),
+            );
+        }
+        bpq_await_callsign_prompt_and_send_callsign(bg, state, log_tx).await?;
+        if bg.abort_reconnect.load(Ordering::SeqCst) {
+            return Err(AgwpeError::DisconnectedByOperator);
+        }
+        let disclaimer = bpq_await_disclaimer(bg, state, log_tx).await?;
+        if bg.abort_reconnect.load(Ordering::SeqCst) {
+            return Err(AgwpeError::DisconnectedByOperator);
+        }
+
+        // Auto-consent check — exact-string equality only.
+        let stored = {
+            let s = state.lock_or_poisoned();
+            s.last_agreed_disclaimer.clone()
+        };
+        if !matches_stored_disclaimer(&disclaimer, stored.as_deref()) {
+            BackgroundState::push_log(
+                state,
+                log_tx,
+                DebugLogEntry::new(
+                    LogLevel::Info,
+                    "PROTOCOL",
+                    "Server disclaimer differs from stored consent; re-consent required",
+                ),
+            );
+            BackgroundState::set_state(
+                state,
+                log_tx,
+                ConnectionState::AwaitingConsent { disclaimer },
+            );
+            return Err(AgwpeError::NeedsReconsent);
+        }
+
+        // Disclaimer matches — send AGREE on the wire so the server logs it.
+        // Disclaimer suppression is purely UI; the wire protocol always requires AGREE.
+        if bg.abort_reconnect.load(Ordering::SeqCst) {
+            return Err(AgwpeError::DisconnectedByOperator);
+        }
+        let agree_frame = AgwpeFrame::new(
+            bg.agwpe_port,
+            FrameType::SendData,
+            &bg.local_callsign,
+            &bg.remote_callsign,
+            b"AGREE\n".to_vec(),
+        );
+        BackgroundState::push_log(
+            state,
+            log_tx,
+            DebugLogEntry::new(LogLevel::Info, "BPQ", "Auto-sending AGREE (matches stored consent)")
+                .with_direction(Direction::Tx),
+        );
+        BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &agree_frame).await?;
+
+        BackgroundState::set_state(state, log_tx, ConnectionState::Connected);
+        BackgroundState::push_log(
+            state,
+            log_tx,
+            DebugLogEntry::new(LogLevel::Info, "PROTOCOL", "Reconnect successful"),
+        );
+        Ok(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => Ok(()),
+        // NeedsReconsent already transitioned to AwaitingConsent — pass through.
+        Err(AgwpeError::NeedsReconsent) => Err(AgwpeError::NeedsReconsent),
+        // Any other error: transition to Error state so the UI shows a failure
+        // instead of a spinner stuck on Reconnecting.
+        Err(e) => {
+            let msg = format!("Reconnect failed: {}", e);
+            BackgroundState::push_log(
+                state,
+                log_tx,
+                DebugLogEntry::new(LogLevel::Info, "ERROR", &msg),
+            );
+            BackgroundState::set_state(state, log_tx, ConnectionState::Error(msg));
+            Err(e)
+        }
+    }
 }
 
 async fn handle_send_request(
@@ -1213,8 +1452,27 @@ async fn handle_send_request(
             .with_direction(Direction::Rx),
     );
 
+    let timeout_secs = bg.response_timeout_secs;
     loop {
-        let frame = bg.read_frame_with_timeout(120).await?;
+        let frame = match bg.read_frame_with_timeout(timeout_secs).await {
+            Ok(f) => f,
+            Err(AgwpeError::Timeout) => {
+                BackgroundState::push_log(
+                    state,
+                    log_tx,
+                    DebugLogEntry::new(
+                        LogLevel::Info,
+                        "PROTOCOL",
+                        &format!("Response timed out after {}s — treating as SessionDied", timeout_secs),
+                    )
+                    .with_direction(Direction::Rx),
+                );
+                return Err(AgwpeError::SessionDied {
+                    reason: format!("no response after {}s", timeout_secs),
+                });
+            }
+            Err(e) => return Err(e),
+        };
 
         match frame.frame_type {
             // Direwolf reports received data with frame type 'D' (0x44) — the
@@ -1227,6 +1485,22 @@ async fn handle_send_request(
                     )));
                 }
                 response_data.extend_from_slice(&frame.data);
+
+                if is_session_dead_payload(&response_data) {
+                    BackgroundState::push_log(
+                        state,
+                        log_tx,
+                        DebugLogEntry::new(
+                            LogLevel::Info,
+                            "PROTOCOL",
+                            "Received AX.25 disconnect notification — treating as SessionDied",
+                        )
+                        .with_direction(Direction::Rx),
+                    );
+                    return Err(AgwpeError::SessionDied {
+                        reason: "remote sent AX.25 disconnect notification".to_string(),
+                    });
+                }
 
                 BackgroundState::push_log(
                     state,
@@ -1288,18 +1562,19 @@ async fn handle_send_request(
                                 .any(|w| w == packet_browser_shared::protocol::Response::MAGIC);
                             if !has_magic && response_data.len() > 32 * 1024 {
                                 let preview = response_data.len().min(256);
-                                return Err(AgwpeError::InvalidFrame(format!(
-                                    "No RESP magic in first {} bytes. Text: {:?}",
-                                    response_data.len(),
-                                    String::from_utf8_lossy(&response_data[..preview]),
-                                )));
+                                return Err(AgwpeError::SessionDied {
+                                    reason: format!(
+                                        "malformed response ({} bytes with no RESP magic: {:?})",
+                                        response_data.len(),
+                                        String::from_utf8_lossy(&response_data[..preview]),
+                                    ),
+                                });
                             }
                         }
                         Err(e) => {
-                            return Err(AgwpeError::InvalidFrame(format!(
-                                "Malformed response header: {:?}",
-                                e,
-                            )));
+                            return Err(AgwpeError::SessionDied {
+                                reason: format!("malformed response header: {:?}", e),
+                            });
                         }
                     }
                 }
@@ -1336,6 +1611,25 @@ async fn handle_send_request(
                 );
             }
         }
+    }
+}
+
+async fn handle_send_request_with_reconnect(
+    bg: &mut BackgroundState,
+    state: &SharedState,
+    log_tx: &broadcast::Sender<DebugLogEntry>,
+    data: Vec<u8>,
+) -> Result<Vec<u8>, AgwpeError> {
+    match handle_send_request(bg, state, log_tx, data.clone()).await {
+        Ok(bytes) => Ok(bytes),
+        Err(AgwpeError::SessionDied { reason }) => {
+            // Auto-reconnect kill-switch is enforced by the caller (proxy.rs)
+            // choosing between send_request and send_request_with_reconnect,
+            // so if we're here, retry is authorized.
+            handle_reconnect(bg, state, log_tx, reason).await?;
+            handle_send_request(bg, state, log_tx, data).await
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -1425,5 +1719,53 @@ mod tests {
         assert_eq!(FrameType::try_from(0x47).unwrap(), FrameType::QueryPorts);
         assert_eq!(FrameType::try_from(0x67).unwrap(), FrameType::PortInfo);
         assert!(FrameType::try_from(0xFF).is_err());
+    }
+
+    #[test]
+    fn test_new_error_variants_display() {
+        let e = AgwpeError::SessionDied { reason: "no response after 30s".to_string() };
+        assert_eq!(e.to_string(), "Session died: no response after 30s");
+
+        let e = AgwpeError::NeedsReconsent;
+        assert_eq!(e.to_string(), "Session dropped and requires re-consent");
+
+        let e = AgwpeError::DisconnectedByOperator;
+        assert_eq!(e.to_string(), "Disconnected by operator");
+    }
+
+    #[test]
+    fn test_is_session_dead_payload() {
+        assert!(is_session_dead_payload(b"*** DISCONNECTED FROM Station N0CALL\r"));
+        assert!(is_session_dead_payload(b"*** DISCONNECTED"));
+        assert!(!is_session_dead_payload(b"RESP0 300 abc123 3600\r"));
+        assert!(!is_session_dead_payload(b""));
+        assert!(!is_session_dead_payload(b"*** CONNECTED WITH N0CALL"));
+    }
+
+    #[test]
+    fn test_disconnect_payload_short_circuits_before_resp_framer() {
+        // Simulate accumulated response bytes containing the disconnect marker.
+        let response_bytes: Vec<u8> = b"*** DISCONNECTED FROM Station N0CALL\r".to_vec();
+        // The helper should identify this immediately.
+        assert!(is_session_dead_payload(&response_bytes));
+        // And a normal RESP frame should not trip it.
+        let ok_bytes: Vec<u8> = b"RESP0 5 abcdef 3600\rhello".to_vec();
+        assert!(!is_session_dead_payload(&ok_bytes));
+    }
+
+    #[test]
+    fn test_matches_stored_disclaimer() {
+        let text = "All activity is logged including your callsign.\rType AGREE to proceed: ";
+        assert!(matches_stored_disclaimer(text, Some(text)));
+
+        // Different whitespace does NOT match.
+        let differs_by_space = "All activity is logged including your callsign. \rType AGREE to proceed: ";
+        assert!(!matches_stored_disclaimer(differs_by_space, Some(text)));
+
+        // None never matches.
+        assert!(!matches_stored_disclaimer(text, None));
+
+        // Empty strings compare equal.
+        assert!(matches_stored_disclaimer("", Some("")));
     }
 }

@@ -31,6 +31,7 @@ pub enum ConnectionState {
     /// consenting to.
     AwaitingConsent { disclaimer: String },
     Connected,
+    Reconnecting { reason: String },
     Error(String),
 }
 
@@ -44,6 +45,7 @@ impl std::fmt::Display for ConnectionState {
             // /api/consent, not through the state Display used for log lines.
             ConnectionState::AwaitingConsent { .. } => write!(f, "Awaiting consent"),
             ConnectionState::Connected => write!(f, "Connected"),
+            ConnectionState::Reconnecting { reason } => write!(f, "Reconnecting: {}", reason),
             ConnectionState::Error(msg) => write!(f, "Error: {}", msg),
         }
     }
@@ -131,6 +133,7 @@ pub struct AppState {
     /// operator's decision; if the connect is cancelled another way, dropping
     /// it wakes the handshake with `RecvError`, treated as a decline.
     pub pending_consent: Option<oneshot::Sender<bool>>,
+    pub last_agreed_disclaimer: Option<String>,
     log_capacity: usize,
 }
 
@@ -143,6 +146,7 @@ impl AppState {
             available_ports: Vec::new(),
             agwpe_port_num: None,
             pending_consent: None,
+            last_agreed_disclaimer: None,
             log_capacity: 1000,
         }
     }
@@ -207,6 +211,14 @@ impl AppState {
     pub fn clear_ports(&mut self) {
         self.available_ports.clear();
         self.agwpe_port_num = None;
+    }
+
+    pub fn record_agreed_disclaimer(&mut self, text: String) {
+        self.last_agreed_disclaimer = Some(text);
+    }
+
+    pub fn clear_agreed_disclaimer(&mut self) {
+        self.last_agreed_disclaimer = None;
     }
 }
 
@@ -319,5 +331,23 @@ mod tests {
 
         let guard = state.lock().unwrap();
         assert_eq!(guard.connection_state, ConnectionState::Connected);
+    }
+
+    #[test]
+    fn test_reconnecting_state_display() {
+        let s = ConnectionState::Reconnecting {
+            reason: "no response after 30s".to_string(),
+        };
+        assert_eq!(s.to_string(), "Reconnecting: no response after 30s");
+    }
+
+    #[test]
+    fn test_agreed_disclaimer_set_and_clear() {
+        let mut s = AppState::new(FileConfig::default());
+        assert!(s.last_agreed_disclaimer.is_none());
+        s.record_agreed_disclaimer("logging notice text".to_string());
+        assert_eq!(s.last_agreed_disclaimer.as_deref(), Some("logging notice text"));
+        s.clear_agreed_disclaimer();
+        assert!(s.last_agreed_disclaimer.is_none());
     }
 }
