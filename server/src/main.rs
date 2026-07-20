@@ -314,16 +314,13 @@ fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::io::Res
         session.touch();
 
         match &request {
-            Request::Get { url } => eprintln!("[CMD] {} GET {}", callsign, url),
+            Request::Get { url, .. } => eprintln!("[CMD] {} GET {}", callsign, url),
             Request::Post { url, body } => eprintln!("[CMD] {} POST {} ({} bytes)", callsign, url, body.len()),
         }
 
-        let url = match &request {
-            Request::Get { url } => url.clone(),
+        let (url, if_none_match) = match &request {
+            Request::Get { url, if_none_match } => (url.clone(), if_none_match.clone()),
             Request::Post { url, .. } => {
-                // We do not have a working POST path through the headless
-                // browser yet; silently fetching the URL as a GET would
-                // misrepresent the request, so reject explicitly.
                 eprintln!("[CMD] {} POST {} rejected (POST unsupported)", callsign, url);
                 if let Err(e) = send_error_response(&mut stream, "POST requests are not supported") {
                     eprintln!("[ERROR] Failed to send POST rejection to {}: {}", callsign, e);
@@ -333,7 +330,7 @@ fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::io::Res
             }
         };
 
-        if let Err(e) = handle_request(&mut session, &mut browser, &callsign, &config, &logger, &mut stream, &url) {
+        if let Err(e) = handle_request(&mut session, &mut browser, &callsign, Arc::clone(&config), &logger, &mut stream, &url, if_none_match.as_deref()) {
             eprintln!("[ERROR] Request error for {}: {}", callsign, e);
         }
     }
@@ -351,11 +348,20 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option<Req
     let trimmed = header_line.trim();
 
     if trimmed.starts_with("GET ") {
-        let url = trimmed[4..].to_string();
-        if url.is_empty() {
+        let rest = &trimmed[4..];
+        if rest.is_empty() {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Empty URL"));
         }
-        Ok(Some(Request::Get { url }))
+        // Sentinel split mirrors packet_browser_shared::protocol::Request::decode.
+        // We keep our own copy because read_request is BufReader-incremental (POST
+        // binary body follows) and can't call decode(), which requires the full
+        // byte slice buffered up-front.
+        let (url, if_none_match) = if let Some((u, e)) = rest.split_once(" IF-NONE-MATCH ") {
+            (u.to_string(), Some(e.to_string()))
+        } else {
+            (rest.to_string(), None)
+        };
+        Ok(Some(Request::Get { url, if_none_match }))
     } else if trimmed.starts_with("POST ") {
         let url = trimmed[5..].to_string();
         if url.is_empty() {
@@ -386,15 +392,17 @@ fn handle_request(
     session: &mut Session,
     browser: &mut Option<BrowserInstance>,
     callsign: &str,
-    config: &Config,
+    config: Arc<Config>,
     logger: &Logger,
     stream: &mut TcpStream,
     url: &str,
+    if_none_match: Option<&str>,
 ) -> std::io::Result<()> {
+    use packet_browser_shared::protocol::sanitized_html_etag;
+    use packet_browser_server::origin_cc::probe_origin_cc;
+
     if let Err(e) = validate_url(url, &config.blocked_ranges) {
         eprintln!("[FILTER] Rejected URL {} for {}: {}", url, callsign, e);
-        // Distinguish an actual policy block from an unreachable/invalid URL
-        // so the client can tell the operator apart from the network.
         let (status, log_status) = match e {
             UrlError::BlockedProtocol(_) | UrlError::BlockedHost(_) => {
                 (Status::Blocked, LogStatus::Blocked)
@@ -417,6 +425,11 @@ fn handle_request(
 
     eprintln!("[FETCH] Loading {} for {}", url, callsign);
 
+    // Kick off the origin cache-control probe concurrently with the Firefox fetch.
+    let probe_url = url.to_string();
+    let probe_config = Arc::clone(&config);
+    let probe_handle = std::thread::spawn(move || probe_origin_cc(&probe_url, &probe_config));
+
     let html = loop {
         let b = match browser.as_ref() {
             Some(b) => b,
@@ -430,7 +443,6 @@ fn handle_request(
                 continue;
             }
         };
-
         match b.fetch_page(url) {
             Ok(html) => break html,
             Err(BrowserError::BrowserCrashed) => {
@@ -457,6 +469,13 @@ fn handle_request(
         }
     };
 
+    let etag = sanitized_html_etag(&html);
+    let directives = probe_handle
+        .join()
+        .unwrap_or_else(|_| packet_browser_server::origin_cc::OriginDirectives {
+            max_age: config.default_max_age_seconds,
+        });
+
     let log_entry = LogEntry::new(
         session.callsign.clone(),
         url.to_string(),
@@ -467,6 +486,22 @@ fn handle_request(
 
     session.current_url = Some(url.to_string());
 
+    if if_none_match.map(|e| e == etag).unwrap_or(false) {
+        eprintln!(
+            "[CACHE] {} etag {} matched, sending NotModified for {}",
+            callsign, etag, url
+        );
+        let response = Response {
+            status: Status::NotModified,
+            etag: etag.clone(),
+            max_age: directives.max_age,
+            payload: Vec::new(),
+        };
+        stream.write_all(&response.encode())?;
+        stream.flush()?;
+        return Ok(());
+    }
+
     let compressed = match brotli_compress(html.as_bytes(), config.brotli_quality) {
         Ok(data) => data,
         Err(e) => {
@@ -476,13 +511,17 @@ fn handle_request(
         }
     };
 
-    eprintln!("[SEND] {} bytes -> {} bytes compressed for {}", html.len(), compressed.len(), callsign);
+    eprintln!(
+        "[SEND] {} bytes -> {} bytes compressed (etag={}, max_age={}) for {}",
+        html.len(), compressed.len(), etag, directives.max_age, callsign,
+    );
 
     let response = Response {
         status: Status::Ok,
+        etag,
+        max_age: directives.max_age,
         payload: compressed,
     };
-
     stream.write_all(&response.encode())?;
     stream.flush()?;
 
@@ -500,12 +539,12 @@ fn send_status_response(
 ) -> std::io::Result<()> {
     let compressed = brotli_compress(message.as_bytes(), 11)
         .unwrap_or_else(|_| message.as_bytes().to_vec());
-
     let response = Response {
         status,
+        etag: "-".to_string(),
+        max_age: -1,
         payload: compressed,
     };
-
     stream.write_all(&response.encode())?;
     stream.flush()?;
     Ok(())

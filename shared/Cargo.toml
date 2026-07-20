@@ -8,4 +8,5 @@ license = "GPL-3.0"
 [dependencies]
 base64 = "0.22"
 brotli = "8"
+sha2 = "0.10"
 thiserror = "1"

@@ -2,6 +2,12 @@
 
 [![Build and Publish](https://github.com/ben-kuhn/packet-browser/actions/workflows/build.yml/badge.svg)](https://github.com/ben-kuhn/packet-browser/actions/workflows/build.yml)
 
+> **Upgrade note (0.2.0):** The AX.25 wire format was extended in v0.2.0 to
+> carry per-URL cache directives. **Client and server must upgrade together** —
+> a 0.1.x endpoint talking to a 0.2.x endpoint will fail with `Invalid response
+> header`. See `docs/superpowers/specs/2026-07-13-local-cache-design.md` for
+> details.
+
 A client/server web browser for packet radio. The **server** (behind BPQ) fetches and sanitizes web pages using headless Firefox, compresses them with brotli, and sends them over AX.25 in a printable, telnet-transparent framing. The **client** connects via AGWPE and provides a local web proxy that users browse with their regular browser.
 
 All data crossing the air interface is public, unencrypted, and decodable with published algorithms (RFC 7932 brotli, RFC 4648 base64) — see [Wire Format & Part 97 Compliance](#wire-format--part-97-compliance) below.

@@ -14,6 +14,10 @@ pub fn set_proxy_port(port: u16) {
     let _ = PROXY_PORT.set(port);
 }
 
+pub fn current_proxy_port() -> Option<u16> {
+    PROXY_PORT.get().copied()
+}
+
 #[derive(Error, Debug)]
 pub enum BrowserError {
     #[error("Failed to launch browser: {0}")]

@@ -14,7 +14,9 @@ use std::collections::HashSet;
 use std::convert::Infallible;
 use std::net::IpAddr;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 use tokio::sync::broadcast;
+use crate::cache::Cache;
 
 static CALLSIGN_REGEX: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"^[a-zA-Z0-9]{1,3}[0-9][a-zA-Z0-9]{0,3}[a-zA-Z]$").unwrap()
@@ -22,17 +24,16 @@ static CALLSIGN_REGEX: LazyLock<regex::Regex> = LazyLock::new(|| {
 
 use crate::agwpe::AgwpeManager;
 use crate::config::FileConfig;
-use crate::rewrite::rewrite_html;
 use crate::state::{ConnectionState, DebugLogEntry, LockExt, SharedState};
 use crate::ui;
-use packet_browser_shared::compress::brotli_decompress;
-use packet_browser_shared::protocol::{Request, Response as ProtocolResponse, Status};
 
 pub struct AppContext {
     pub state: SharedState,
     pub agwpe: AgwpeManager,
     pub log_tx: broadcast::Sender<DebugLogEntry>,
     pub host_allowlist: HostAllowlist,
+    pub cache: Option<Arc<Cache>>,
+    pub cache_max_ttl: Duration,
 }
 
 /// A whitelist of hostnames we are prepared to serve on. Used to block DNS
@@ -132,6 +133,7 @@ pub fn create_router(ctx: Arc<AppContext>) -> Router {
         .route("/configuration", get(configuration_page_handler))
         .route("/browse", get(browse_get_handler))
         .route("/browse", post(browse_post_handler))
+        .route("/cache", get(cache_page_handler))
         .route("/api/agwpe-status", get(api_agwpe_status_get))
         .route("/api/agwpe-status", post(api_agwpe_status_post))
         .route("/api/connect", post(api_connect_handler))
@@ -140,6 +142,8 @@ pub fn create_router(ctx: Arc<AppContext>) -> Router {
         .route("/api/consent", post(api_consent_post))
         .route("/api/config", get(api_config_get))
         .route("/api/config", post(api_config_post))
+        .route("/api/cache/clear", post(api_cache_clear))
+        .route("/api/cache/delete", post(api_cache_delete))
         .route("/events", get(events_handler))
         .layer(middleware::from_fn_with_state(ctx.clone(), security_guard))
         .layer(Extension(ctx))
@@ -270,18 +274,18 @@ async fn configuration_page_handler(
 #[derive(Deserialize)]
 struct BrowseParams {
     url: Option<String>,
+    #[serde(default)]
+    nocache: Option<String>,
 }
 
 async fn browse_get_handler(
     Query(params): Query<BrowseParams>,
     Extension(ctx): Extension<Arc<AppContext>>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     let url = match params.url {
         Some(u) if !u.is_empty() => u,
         _ => {
-            // No URL yet — this is the landing form. Only serve it once the
-            // AX.25 link is up; otherwise send the user back to /connect so
-            // they can bring the session up first.
             {
                 let state = ctx.state.lock_or_poisoned();
                 if state.connection_state != ConnectionState::Connected {
@@ -292,7 +296,13 @@ async fn browse_get_handler(
         }
     };
 
-    handle_browse(&ctx, &url, None).await
+    let nocache = params.nocache.as_deref() == Some("1");
+    let browser_inm = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim_matches('"').to_string());
+
+    handle_browse(&ctx, &url, None, nocache, browser_inm).await
 }
 
 #[derive(Deserialize)]
@@ -309,15 +319,19 @@ async fn browse_post_handler(
         Some(u) if !u.is_empty() => u,
         _ => return Redirect::to("/connect").into_response(),
     };
-
-    handle_browse(&ctx, &url, Some(body.into_bytes())).await
+    handle_browse(&ctx, &url, Some(body.into_bytes()), true, None).await
 }
 
 async fn handle_browse(
     ctx: &AppContext,
     url: &str,
     post_body: Option<Vec<u8>>,
+    nocache: bool,
+    browser_if_none_match: Option<String>,
 ) -> Response {
+    use std::time::SystemTime;
+    use packet_browser_shared::protocol::Request;
+
     {
         let state = ctx.state.lock_or_poisoned();
         if state.connection_state != ConnectionState::Connected {
@@ -325,68 +339,182 @@ async fn handle_browse(
         }
     }
 
-    let request = match post_body {
-        Some(body) => Request::Post {
-            url: url.to_string(),
-            body,
-        },
-        None => Request::Get {
-            url: url.to_string(),
-        },
+    if let Some(body) = post_body {
+        let request = Request::Post { url: url.to_string(), body };
+        return dispatch_ax25(ctx, url, request, None).await;
+    }
+
+    let cache = ctx.cache.clone();
+
+    if !nocache {
+        if let Some(cache) = cache.as_ref() {
+            if let Some(hit) = cache.lookup(url) {
+                if hit.is_fresh(SystemTime::now()) {
+                    if browser_if_none_match.as_deref() == Some(&hit.etag) {
+                        cache.touch_last_used(url);
+                        return axum::http::Response::builder()
+                            .status(StatusCode::NOT_MODIFIED)
+                            .header("etag", format!("\"{}\"", hit.etag))
+                            .body(axum::body::Body::empty())
+                            .unwrap();
+                    }
+                    cache.touch_last_used(url);
+                    return serve_from_hit(&hit, url);
+                }
+            }
+        }
+    }
+
+    let cached_etag = if !nocache {
+        cache.as_ref().and_then(|c| c.lookup(url).map(|h| h.etag))
+    } else {
+        None
     };
 
+    let request = Request::Get {
+        url: url.to_string(),
+        if_none_match: cached_etag,
+    };
+    dispatch_ax25(ctx, url, request, cache).await
+}
+
+/// Send a request over AX.25 and render the response, optionally writing the
+/// result to the cache on `Status::Ok`.
+async fn dispatch_ax25(
+    ctx: &AppContext,
+    url: &str,
+    request: packet_browser_shared::protocol::Request,
+    cache_for_write: Option<Arc<crate::cache::Cache>>,
+) -> Response {
+    use packet_browser_shared::compress::brotli_decompress;
+    use packet_browser_shared::protocol::{Response as ProtocolResponse, Status};
+
     let encoded = request.encode();
+    let cached_etag = match &request {
+        packet_browser_shared::protocol::Request::Get { if_none_match, .. } => if_none_match.clone(),
+        _ => None,
+    };
 
     match ctx.agwpe.send_request(encoded).await {
         Ok(response_data) => {
-            let (status, b64_len, header_end) = match ProtocolResponse::decode_header(&response_data) {
-                Ok(Some(triple)) => triple,
-                Ok(None) => {
-                    return Html(ui::error_page("Incomplete response header")).into_response();
-                }
-                Err(e) => {
-                    return Html(ui::error_page(&format!("Invalid response header: {}", e))).into_response();
-                }
-            };
+            let (status, b64_len, etag, max_age, header_end) =
+                match ProtocolResponse::decode_header(&response_data) {
+                    Ok(Some(t)) => t,
+                    Ok(None) => return Html(ui::error_page("Incomplete response header")).into_response(),
+                    Err(e) => return Html(ui::error_page(&format!("Invalid response header: {}", e))).into_response(),
+                };
 
             let b64_end = header_end + b64_len as usize;
             if response_data.len() < b64_end {
                 return Html(ui::error_page("Incomplete response payload")).into_response();
             }
 
-            let compressed = match ProtocolResponse::decode_payload(&response_data[header_end..b64_end]) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    return Html(ui::error_page(&format!("Base64 decode failed: {}", e))).into_response();
-                }
-            };
-
-            let decompressed = match brotli_decompress(&compressed) {
-                Ok(d) => d,
-                Err(e) => {
-                    return Html(ui::error_page(&format!("Decompression failed: {}", e))).into_response();
-                }
-            };
-            let html = match String::from_utf8(decompressed) {
-                Ok(h) => h,
-                Err(_) => {
-                    return Html(ui::error_page("Invalid UTF-8 in response")).into_response();
-                }
-            };
             match status {
-                Status::Ok => match rewrite_html(&html, url) {
-                    Ok(rewritten) => Html(ui::browse_page(&rewritten, url)).into_response(),
-                    Err(e) => Html(ui::error_page(&format!("Failed to rewrite HTML: {}", e))).into_response(),
-                },
-                // The server now sends a self-describing message ("Host could
-                // not be resolved: X", "Blocked host: Y", ...) so pass it
-                // through verbatim rather than wrapping in a generic prefix
-                // that used to mask the actual cause.
-                Status::Err | Status::Blocked => Html(ui::error_page(&html)).into_response(),
+                Status::NotModified => {
+                    // Server confirms our cached etag is still valid. This only
+                    // makes sense when we actually had a cache entry.
+                    if let (Some(cache), Some(etag_sent)) = (cache_for_write.as_ref(), cached_etag) {
+                        if etag_sent == etag {
+                            cache.touch_fresh(url);
+                            if let Some(hit) = cache.lookup(url) {
+                                return serve_from_hit(&hit, url);
+                            }
+                        }
+                    }
+                    // No cache entry to serve — treat as an error.
+                    Html(ui::error_page("Server sent NotModified but no cache entry is available")).into_response()
+                }
+                Status::Ok => {
+                    let compressed = match ProtocolResponse::decode_payload(&response_data[header_end..b64_end]) {
+                        Ok(b) => b,
+                        Err(e) => return Html(ui::error_page(&format!("Base64 decode failed: {}", e))).into_response(),
+                    };
+                    if let Some(cache) = cache_for_write.as_ref() {
+                        cache.insert(url, &etag, &compressed, max_age);
+                    }
+                    let decompressed = match brotli_decompress(&compressed) {
+                        Ok(d) => d,
+                        Err(e) => return Html(ui::error_page(&format!("Decompression failed: {}", e))).into_response(),
+                    };
+                    let html = match String::from_utf8(decompressed) {
+                        Ok(h) => h,
+                        Err(_) => return Html(ui::error_page("Invalid UTF-8 in response")).into_response(),
+                    };
+                    match crate::rewrite::rewrite_html(&html, url) {
+                        Ok(rewritten) => {
+                            let body = ui::browse_page(&rewritten, url);
+                            build_cached_html_response(body, &etag, effective_ttl_secs(max_age, ctx.cache_max_ttl.as_secs()))
+                        }
+                        Err(e) => Html(ui::error_page(&format!("Failed to rewrite HTML: {}", e))).into_response(),
+                    }
+                }
+                Status::Err | Status::Blocked => {
+                    let compressed = match ProtocolResponse::decode_payload(&response_data[header_end..b64_end]) {
+                        Ok(b) => b,
+                        Err(e) => return Html(ui::error_page(&format!("Base64 decode failed: {}", e))).into_response(),
+                    };
+                    let decompressed = match brotli_decompress(&compressed) {
+                        Ok(d) => d,
+                        Err(e) => return Html(ui::error_page(&format!("Decompression failed: {}", e))).into_response(),
+                    };
+                    let text = String::from_utf8(decompressed).unwrap_or_else(|_| "Invalid UTF-8".to_string());
+                    Html(ui::error_page(&text)).into_response()
+                }
             }
         }
         Err(e) => Html(ui::error_page(&format!("Request failed: {}", e))).into_response(),
     }
+}
+
+pub(crate) fn effective_ttl_secs(server_max_age: i32, config_cap_secs: u64) -> u64 {
+    if server_max_age <= 0 {
+        return 0;
+    }
+    (server_max_age as u64).min(config_cap_secs)
+}
+
+fn serve_from_hit(hit: &crate::cache::Hit, url: &str) -> Response {
+    use packet_browser_shared::compress::brotli_decompress;
+    let decompressed = match brotli_decompress(&hit.brotli_body) {
+        Ok(d) => d,
+        Err(e) => return Html(ui::error_page(&format!("Decompression failed: {}", e))).into_response(),
+    };
+    let html = match String::from_utf8(decompressed) {
+        Ok(h) => h,
+        Err(_) => return Html(ui::error_page("Invalid UTF-8 in cached response")).into_response(),
+    };
+    let rewritten = match crate::rewrite::rewrite_html(&html, url) {
+        Ok(r) => r,
+        Err(e) => return Html(ui::error_page(&format!("Failed to rewrite HTML: {}", e))).into_response(),
+    };
+    let body = ui::browse_page(&rewritten, url);
+    let remaining = std::time::SystemTime::now()
+        .duration_since(hit.fetched_at)
+        .map(|age| hit.max_age.checked_sub(age).unwrap_or_default().as_secs())
+        .unwrap_or(0);
+    build_cached_html_response(body, &hit.etag, remaining)
+}
+
+pub(crate) fn build_cached_html_response(body: String, etag: &str, ttl_secs: u64) -> Response {
+    let mut resp = Html(body).into_response();
+    let headers = resp.headers_mut();
+    match axum::http::HeaderValue::from_str(&format!("private, max-age={}", ttl_secs)) {
+        Ok(value) => {
+            headers.insert(axum::http::header::CACHE_CONTROL, value);
+        }
+        Err(e) => {
+            tracing::error!("cache-control value rejected by HeaderValue::from_str: {} — omitting Cache-Control header", e);
+        }
+    }
+    match axum::http::HeaderValue::from_str(&format!("\"{}\"", etag)) {
+        Ok(value) => {
+            headers.insert(axum::http::header::ETAG, value);
+        }
+        Err(e) => {
+            tracing::error!("etag {:?} rejected by HeaderValue::from_str: {} — omitting ETag header", etag, e);
+        }
+    }
+    resp
 }
 
 #[derive(Serialize)]
@@ -758,6 +886,62 @@ async fn events_handler(
     Sse::new(stream)
 }
 
+async fn cache_page_handler(Extension(ctx): Extension<Arc<AppContext>>) -> impl IntoResponse {
+    let now = std::time::SystemTime::now();
+    let mut rows = Vec::new();
+    let (total, cap) = match ctx.cache.as_ref() {
+        Some(cache) => {
+            let entries = cache.list();
+            let total: u64 = entries.iter().map(|e| e.size).sum();
+            for e in entries {
+                let remaining = now
+                    .duration_since(e.fetched_at)
+                    .map(|age| e.max_age.checked_sub(age).unwrap_or_default().as_secs() as i64)
+                    .unwrap_or(0);
+                rows.push(ui::CachePageRow {
+                    url: e.url,
+                    size_bytes: e.size,
+                    fetched_at_iso: iso_from_system_time(e.fetched_at),
+                    last_used_iso: iso_from_system_time(e.last_used),
+                    ttl_remaining_secs: remaining,
+                    etag: e.etag,
+                });
+            }
+            (total, cache.cap_bytes())
+        }
+        None => (0, 0),
+    };
+    Html(ui::cache_page(&rows, total, cap))
+}
+
+fn iso_from_system_time(t: std::time::SystemTime) -> String {
+    use chrono::{DateTime, Utc};
+    let dt: DateTime<Utc> = t.into();
+    dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+#[derive(Deserialize)]
+struct CacheDeleteRequest {
+    url: String,
+}
+
+async fn api_cache_delete(
+    Extension(ctx): Extension<Arc<AppContext>>,
+    axum::extract::Form(req): axum::extract::Form<CacheDeleteRequest>,
+) -> Redirect {
+    if let Some(cache) = ctx.cache.as_ref() {
+        cache.delete(&req.url);
+    }
+    Redirect::to("/cache")
+}
+
+async fn api_cache_clear(Extension(ctx): Extension<Arc<AppContext>>) -> Redirect {
+    if let Some(cache) = ctx.cache.as_ref() {
+        cache.clear();
+    }
+    Redirect::to("/cache")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -871,5 +1055,26 @@ mod tests {
         assert!(!origin_matches_host("http://evil.com", "127.0.0.1:8080"));
         // Missing scheme -> not a valid Origin header.
         assert!(!origin_matches_host("127.0.0.1:8080", "127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn build_cached_html_response_sets_etag_and_cache_control() {
+        let resp = super::build_cached_html_response(
+            "<p>hi</p>".to_string(),
+            "aBcDeFgHiJkLmNoP",
+            1800,
+        );
+        let etag = resp.headers().get("etag").unwrap().to_str().unwrap().to_string();
+        assert_eq!(etag, "\"aBcDeFgHiJkLmNoP\"");
+        let cc = resp.headers().get("cache-control").unwrap().to_str().unwrap().to_string();
+        assert_eq!(cc, "private, max-age=1800");
+    }
+
+    #[test]
+    fn effective_ttl_clamps_to_config_cap() {
+        assert_eq!(super::effective_ttl_secs(600, 300), 300);
+        assert_eq!(super::effective_ttl_secs(60, 300), 60);
+        assert_eq!(super::effective_ttl_secs(0, 300), 0);
+        assert_eq!(super::effective_ttl_secs(-1, 300), 0);
     }
 }

@@ -97,28 +97,13 @@ find_free_port() {
 }
 
 # Tune PipeWire clock settings for reliable AFSK audio and disconnect
-# the direwolfs from real hardware. Original settings are saved to
-# $DEMO_DIR/pw-original.json so restore_pipewire can put them back.
-# Mirrors pw_configure_for_test() in e2e/helpers.py.
+# the direwolfs from real hardware. restore_pipewire() resets these to
+# the system defaults on exit. Mirrors pw_configure_for_test() in
+# e2e/helpers.py.
 configure_pipewire() {
     log "Tuning PipeWire clock settings for AFSK audio"
-    python3 - "$DEMO_DIR/pw-original.json" << 'PYTHON'
-import json, re, subprocess, sys
-
-result = subprocess.run(
-    ["pw-metadata", "-n", "settings"],
-    capture_output=True, text=True, timeout=5,
-)
-original = {}
-for line in result.stdout.splitlines():
-    for key in ("clock.allowed-rates", "clock.quantum",
-                "clock.min-quantum", "clock.max-quantum"):
-        if f"key:'{key}'" in line:
-            m = re.search(r"value:'(.+?)'\s+type:", line)
-            if m:
-                original[key] = m.group(1)
-with open(sys.argv[1], "w") as f:
-    json.dump(original, f)
+    python3 - << 'PYTHON'
+import subprocess
 
 settings = {
     "clock.allowed-rates": "[ 44100, 48000, 192000 ]",
@@ -134,18 +119,16 @@ for key, value in settings.items():
 PYTHON
 }
 
+# Reset PipeWire clock settings to the system defaults by deleting the
+# runtime overrides configure_pipewire() applied, so PipeWire falls back
+# to its configured default.clock.* values. We deliberately do NOT replay
+# a captured snapshot: if the graph was already in a bad state when it was
+# captured, replaying it would re-break audio.
 restore_pipewire() {
-    [[ -f "$DEMO_DIR/pw-original.json" ]] || return 0
-    python3 - "$DEMO_DIR/pw-original.json" << 'PYTHON'
-import json, subprocess, sys
-with open(sys.argv[1]) as f:
-    original = json.load(f)
-for key, value in original.items():
-    subprocess.run(
-        ["pw-metadata", "-n", "settings", "0", key, value],
-        capture_output=True, timeout=5,
-    )
-PYTHON
+    local key
+    for key in clock.allowed-rates clock.quantum clock.min-quantum clock.max-quantum; do
+        pw-metadata -n settings -d 0 "$key" >/dev/null 2>&1 || true
+    done
 }
 
 start_direwolf() {

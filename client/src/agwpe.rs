@@ -1245,7 +1245,7 @@ async fn handle_send_request(
                 // the RESP magic.
                 if expected_len.is_none() {
                     match packet_browser_shared::protocol::Response::decode_header(&response_data) {
-                        Ok(Some((_status, b64_len, header_end))) => {
+                        Ok(Some((_status, b64_len, _etag, _max_age, header_end))) => {
                             if header_end > 0 {
                                 let preview_len = header_end.min(128);
                                 BackgroundState::push_log(
