@@ -330,7 +330,7 @@ fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::io::Res
             }
         };
 
-        if let Err(e) = handle_request(&mut session, &mut browser, &callsign, &config, &logger, &mut stream, &url, if_none_match.as_deref()) {
+        if let Err(e) = handle_request(&mut session, &mut browser, &callsign, Arc::clone(&config), &logger, &mut stream, &url, if_none_match.as_deref()) {
             eprintln!("[ERROR] Request error for {}: {}", callsign, e);
         }
     }
@@ -352,6 +352,10 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option<Req
         if rest.is_empty() {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Empty URL"));
         }
+        // Sentinel split mirrors packet_browser_shared::protocol::Request::decode.
+        // We keep our own copy because read_request is BufReader-incremental (POST
+        // binary body follows) and can't call decode(), which requires the full
+        // byte slice buffered up-front.
         let (url, if_none_match) = if let Some((u, e)) = rest.split_once(" IF-NONE-MATCH ") {
             (u.to_string(), Some(e.to_string()))
         } else {
@@ -388,7 +392,7 @@ fn handle_request(
     session: &mut Session,
     browser: &mut Option<BrowserInstance>,
     callsign: &str,
-    config: &Config,
+    config: Arc<Config>,
     logger: &Logger,
     stream: &mut TcpStream,
     url: &str,
@@ -420,6 +424,11 @@ fn handle_request(
     }
 
     eprintln!("[FETCH] Loading {} for {}", url, callsign);
+
+    // Kick off the origin cache-control probe concurrently with the Firefox fetch.
+    let probe_url = url.to_string();
+    let probe_config = Arc::clone(&config);
+    let probe_handle = std::thread::spawn(move || probe_origin_cc(&probe_url, &probe_config));
 
     let html = loop {
         let b = match browser.as_ref() {
@@ -461,7 +470,11 @@ fn handle_request(
     };
 
     let etag = sanitized_html_etag(&html);
-    let directives = probe_origin_cc(url, config);
+    let directives = probe_handle
+        .join()
+        .unwrap_or_else(|_| packet_browser_server::origin_cc::OriginDirectives {
+            max_age: config.default_max_age_seconds,
+        });
 
     let log_entry = LogEntry::new(
         session.callsign.clone(),
