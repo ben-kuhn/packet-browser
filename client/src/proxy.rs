@@ -1049,4 +1049,25 @@ mod tests {
         // Missing scheme -> not a valid Origin header.
         assert!(!origin_matches_host("127.0.0.1:8080", "127.0.0.1:8080"));
     }
+
+    #[test]
+    fn build_cached_html_response_sets_etag_and_cache_control() {
+        let resp = super::build_cached_html_response(
+            "<p>hi</p>".to_string(),
+            "aBcDeFgHiJkLmNoP",
+            1800,
+        );
+        let etag = resp.headers().get("etag").unwrap().to_str().unwrap().to_string();
+        assert_eq!(etag, "\"aBcDeFgHiJkLmNoP\"");
+        let cc = resp.headers().get("cache-control").unwrap().to_str().unwrap().to_string();
+        assert_eq!(cc, "private, max-age=1800");
+    }
+
+    #[test]
+    fn effective_ttl_clamps_to_config_cap() {
+        assert_eq!(super::effective_ttl_secs(600, 300), 300);
+        assert_eq!(super::effective_ttl_secs(60, 300), 60);
+        assert_eq!(super::effective_ttl_secs(0, 300), 0);
+        assert_eq!(super::effective_ttl_secs(-1, 300), 0);
+    }
 }

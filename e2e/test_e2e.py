@@ -365,3 +365,58 @@ class TestFullE2E:
             json={"agwpe_host": original["agwpe_host"], "agwpe_port": original["agwpe_port"]},
             timeout=10
         )
+
+    @needs_chromium
+    @needs_linbpq
+    def test_repeat_fetch_carries_cache_headers(
+        self, direwolf_pair, pb_server, pb_client, linbpq_instance, test_http_server
+    ):
+        """A URL fetched twice through the demo stack emits ETag + Cache-Control on both hits."""
+        web_port = pb_client["web_port"]
+
+        # Bring AGWPE up.
+        post(f"http://127.0.0.1:{web_port}/api/agwpe-status", timeout=10)
+
+        # Initiate the AX.25 connection through the API.
+        post(
+            f"http://127.0.0.1:{web_port}/api/connect",
+            json={"target_callsign": "N0CALL-7", "port_num": 1},
+            timeout=10,
+        )
+        # Accept the logging disclaimer.
+        post(f"http://127.0.0.1:{web_port}/api/consent", json={"accepted": True}, timeout=10)
+
+        # Wait until Connected.
+        for _ in range(60):
+            data = requests.get(f"http://127.0.0.1:{web_port}/api/agwpe-status", timeout=5).json()
+            if data.get("state") == "Connected":
+                break
+            time.sleep(0.5)
+        else:
+            pytest.fail("Client never reached Connected state")
+
+        target = test_http_server["url"] + "/portal"
+
+        first = requests.get(
+            f"http://127.0.0.1:{web_port}/browse",
+            params={"url": target},
+            timeout=120,
+        )
+        assert first.status_code == 200
+        assert first.headers.get("ETag", "").startswith('"'), first.headers
+        first_cc = first.headers.get("Cache-Control", "")
+        assert "private" in first_cc and "max-age" in first_cc, first_cc
+
+        second = requests.get(
+            f"http://127.0.0.1:{web_port}/browse",
+            params={"url": target},
+            timeout=120,
+        )
+        assert second.status_code == 200
+        assert second.headers.get("ETag", "") == first.headers.get("ETag", ""), (
+            "Second fetch should have same ETag as first",
+            first.headers.get("ETag"),
+            second.headers.get("ETag"),
+        )
+        second_cc = second.headers.get("Cache-Control", "")
+        assert "private" in second_cc and "max-age" in second_cc, second_cc
