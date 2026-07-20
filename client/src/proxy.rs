@@ -34,6 +34,7 @@ pub struct AppContext {
     pub host_allowlist: HostAllowlist,
     pub cache: Option<Arc<Cache>>,
     pub cache_max_ttl: Duration,
+    pub config: FileConfig,
 }
 
 /// A whitelist of hostnames we are prepared to serve on. Used to block DNS
@@ -396,7 +397,12 @@ async fn dispatch_ax25(
         _ => None,
     };
 
-    match ctx.agwpe.send_request(encoded).await {
+    let send_result = if ctx.config.connection.auto_reconnect {
+        ctx.agwpe.send_request_with_reconnect(encoded).await
+    } else {
+        ctx.agwpe.send_request(encoded).await
+    };
+    match send_result {
         Ok(response_data) => {
             let (status, b64_len, etag, max_age, header_end) =
                 match ProtocolResponse::decode_header(&response_data) {
@@ -462,6 +468,26 @@ async fn dispatch_ax25(
                     Html(ui::error_page(&text)).into_response()
                 }
             }
+        }
+        Err(crate::agwpe::AgwpeError::NeedsReconsent) => {
+            Html(ui::render_session_error_page(
+                "Session dropped and the disclaimer text changed. Please reconnect and re-consent.",
+                true,
+            )).into_response()
+        }
+        Err(crate::agwpe::AgwpeError::SessionDied { reason }) => {
+            // Auto-reconnect already ran and this is the second failure, OR
+            // auto-reconnect was disabled. Either way, surface the error.
+            Html(ui::render_session_error_page(
+                &format!("Session lost: {}. Please reconnect.", reason),
+                true,
+            )).into_response()
+        }
+        Err(crate::agwpe::AgwpeError::DisconnectedByOperator) => {
+            Html(ui::render_session_error_page(
+                "Request cancelled by operator disconnect.",
+                true,
+            )).into_response()
         }
         Err(e) => Html(ui::error_page(&format!("Request failed: {}", e))).into_response(),
     }

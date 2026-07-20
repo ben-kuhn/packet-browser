@@ -105,6 +105,7 @@ async fn main() -> Result<(), ClientError> {
         host_allowlist,
         cache,
         cache_max_ttl,
+        config: config.clone(),
     });
 
     let app = proxy::create_router(ctx);

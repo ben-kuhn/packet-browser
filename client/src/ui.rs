@@ -724,6 +724,26 @@ pub fn error_page(message: &str) -> String {
     )
 }
 
+pub fn render_session_error_page(message: &str, show_reconnect_link: bool) -> String {
+    let reconnect_link = if show_reconnect_link {
+        r#"<p><a href="/connect">Reconnect</a></p>"#
+    } else {
+        ""
+    };
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Session error</title><style>{css}</style></head>
+<body style="font-family: sans-serif; max-width: 600px; margin: 4em auto; padding: 1em;">
+<h1>Session error</h1>
+<p>{message}</p>
+{reconnect_link}
+</body></html>"#,
+        css = CSS,
+        message = h(message),
+        reconnect_link = reconnect_link,
+    )
+}
+
 pub fn browse_page(html_content: &str, url: &str) -> String {
     let escaped_url = h(url);
 
@@ -869,4 +889,27 @@ pub fn cache_page(rows: &[CachePageRow], total_bytes: u64, cap_bytes: u64) -> St
         css = CSS,
         body = body,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_session_error_page_shows_message_and_link() {
+        let html = render_session_error_page("test message", true);
+        assert!(html.contains("test message"));
+        assert!(html.contains("href=\"/connect\""));
+
+        let html_no_link = render_session_error_page("no link message", false);
+        assert!(html_no_link.contains("no link message"));
+        assert!(!html_no_link.contains("href=\"/connect\""));
+    }
+
+    #[test]
+    fn test_session_error_page_escapes_html() {
+        let html = render_session_error_page("bad <script>alert(1)</script> input", false);
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("&lt;script&gt;"));
+    }
 }
