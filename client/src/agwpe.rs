@@ -24,6 +24,12 @@ pub enum AgwpeError {
     Timeout,
     #[error("Background task stopped")]
     TaskStopped,
+    #[error("Session died: {reason}")]
+    SessionDied { reason: String },
+    #[error("Session dropped and requires re-consent")]
+    NeedsReconsent,
+    #[error("Disconnected by operator")]
+    DisconnectedByOperator,
 }
 
 // Defensive caps against a hostile or buggy AGWPE peer sending oversized lengths.
@@ -1425,5 +1431,17 @@ mod tests {
         assert_eq!(FrameType::try_from(0x47).unwrap(), FrameType::QueryPorts);
         assert_eq!(FrameType::try_from(0x67).unwrap(), FrameType::PortInfo);
         assert!(FrameType::try_from(0xFF).is_err());
+    }
+
+    #[test]
+    fn test_new_error_variants_display() {
+        let e = AgwpeError::SessionDied { reason: "no response after 30s".to_string() };
+        assert_eq!(e.to_string(), "Session died: no response after 30s");
+
+        let e = AgwpeError::NeedsReconsent;
+        assert_eq!(e.to_string(), "Session dropped and requires re-consent");
+
+        let e = AgwpeError::DisconnectedByOperator;
+        assert_eq!(e.to_string(), "Disconnected by operator");
     }
 }
