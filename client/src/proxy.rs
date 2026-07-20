@@ -235,6 +235,7 @@ async fn connect_page_handler(
         ConnectionState::Connecting => "status-connecting",
         ConnectionState::AwaitingConsent { .. } => "status-connecting",
         ConnectionState::Connected => "status-connected",
+        ConnectionState::Reconnecting { .. } => "status-reconnecting",
         ConnectionState::Error(_) => "status-error",
     };
     let ports_json = serde_json::to_string(&state.available_ports).unwrap_or_else(|_| "[]".to_string());

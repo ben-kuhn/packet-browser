@@ -31,6 +31,7 @@ pub enum ConnectionState {
     /// consenting to.
     AwaitingConsent { disclaimer: String },
     Connected,
+    Reconnecting { reason: String },
     Error(String),
 }
 
@@ -44,6 +45,7 @@ impl std::fmt::Display for ConnectionState {
             // /api/consent, not through the state Display used for log lines.
             ConnectionState::AwaitingConsent { .. } => write!(f, "Awaiting consent"),
             ConnectionState::Connected => write!(f, "Connected"),
+            ConnectionState::Reconnecting { reason } => write!(f, "Reconnecting: {}", reason),
             ConnectionState::Error(msg) => write!(f, "Error: {}", msg),
         }
     }
@@ -319,5 +321,13 @@ mod tests {
 
         let guard = state.lock().unwrap();
         assert_eq!(guard.connection_state, ConnectionState::Connected);
+    }
+
+    #[test]
+    fn test_reconnecting_state_display() {
+        let s = ConnectionState::Reconnecting {
+            reason: "no response after 30s".to_string(),
+        };
+        assert_eq!(s.to_string(), "Reconnecting: no response after 30s");
     }
 }

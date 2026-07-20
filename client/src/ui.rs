@@ -126,6 +126,7 @@ button.danger:hover { background: #ef4444; }
 .status-disconnected { background: #450a0a; color: #ef4444; }
 .status-agwpe-connected { background: #052e16; color: #22c55e; }
 .status-connecting { background: #422006; color: #fbbf24; }
+.status-reconnecting { background: #422006; color: #fbbf24; }
 .status-connected { background: #052e16; color: #22c55e; }
 .status-error { background: #450a0a; color: #ef4444; }
 .btn-row {
