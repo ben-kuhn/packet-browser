@@ -314,6 +314,7 @@ struct BackgroundState {
     remote_callsign: String,
     agwpe_port: u8,
     read_buf: Vec<u8>,
+    response_timeout_secs: u64,
 }
 
 impl BackgroundState {
@@ -324,6 +325,7 @@ impl BackgroundState {
             remote_callsign: String::new(),
             agwpe_port: 0,
             read_buf: Vec::new(),
+            response_timeout_secs: 30,
         }
     }
 
@@ -1162,6 +1164,10 @@ async fn handle_ax25_disconnect(
     Ok(())
 }
 
+fn is_session_dead_payload(data: &[u8]) -> bool {
+    data.starts_with(b"*** DISCONNECTED")
+}
+
 async fn handle_send_request(
     bg: &mut BackgroundState,
     state: &SharedState,
@@ -1219,8 +1225,27 @@ async fn handle_send_request(
             .with_direction(Direction::Rx),
     );
 
+    let timeout_secs = bg.response_timeout_secs;
     loop {
-        let frame = bg.read_frame_with_timeout(120).await?;
+        let frame = match bg.read_frame_with_timeout(timeout_secs).await {
+            Ok(f) => f,
+            Err(AgwpeError::Timeout) => {
+                BackgroundState::push_log(
+                    state,
+                    log_tx,
+                    DebugLogEntry::new(
+                        LogLevel::Info,
+                        "PROTOCOL",
+                        &format!("Response timed out after {}s — treating as SessionDied", timeout_secs),
+                    )
+                    .with_direction(Direction::Rx),
+                );
+                return Err(AgwpeError::SessionDied {
+                    reason: format!("no response after {}s", timeout_secs),
+                });
+            }
+            Err(e) => return Err(e),
+        };
 
         match frame.frame_type {
             // Direwolf reports received data with frame type 'D' (0x44) — the
@@ -1233,6 +1258,22 @@ async fn handle_send_request(
                     )));
                 }
                 response_data.extend_from_slice(&frame.data);
+
+                if is_session_dead_payload(&response_data) {
+                    BackgroundState::push_log(
+                        state,
+                        log_tx,
+                        DebugLogEntry::new(
+                            LogLevel::Info,
+                            "PROTOCOL",
+                            "Received AX.25 disconnect notification — treating as SessionDied",
+                        )
+                        .with_direction(Direction::Rx),
+                    );
+                    return Err(AgwpeError::SessionDied {
+                        reason: "remote sent AX.25 disconnect notification".to_string(),
+                    });
+                }
 
                 BackgroundState::push_log(
                     state,
@@ -1294,18 +1335,19 @@ async fn handle_send_request(
                                 .any(|w| w == packet_browser_shared::protocol::Response::MAGIC);
                             if !has_magic && response_data.len() > 32 * 1024 {
                                 let preview = response_data.len().min(256);
-                                return Err(AgwpeError::InvalidFrame(format!(
-                                    "No RESP magic in first {} bytes. Text: {:?}",
-                                    response_data.len(),
-                                    String::from_utf8_lossy(&response_data[..preview]),
-                                )));
+                                return Err(AgwpeError::SessionDied {
+                                    reason: format!(
+                                        "malformed response ({} bytes with no RESP magic: {:?})",
+                                        response_data.len(),
+                                        String::from_utf8_lossy(&response_data[..preview]),
+                                    ),
+                                });
                             }
                         }
                         Err(e) => {
-                            return Err(AgwpeError::InvalidFrame(format!(
-                                "Malformed response header: {:?}",
-                                e,
-                            )));
+                            return Err(AgwpeError::SessionDied {
+                                reason: format!("malformed response header: {:?}", e),
+                            });
                         }
                     }
                 }
@@ -1443,5 +1485,25 @@ mod tests {
 
         let e = AgwpeError::DisconnectedByOperator;
         assert_eq!(e.to_string(), "Disconnected by operator");
+    }
+
+    #[test]
+    fn test_is_session_dead_payload() {
+        assert!(is_session_dead_payload(b"*** DISCONNECTED FROM Station N0CALL\r"));
+        assert!(is_session_dead_payload(b"*** DISCONNECTED"));
+        assert!(!is_session_dead_payload(b"RESP0 300 abc123 3600\r"));
+        assert!(!is_session_dead_payload(b""));
+        assert!(!is_session_dead_payload(b"*** CONNECTED WITH N0CALL"));
+    }
+
+    #[test]
+    fn test_disconnect_payload_short_circuits_before_resp_framer() {
+        // Simulate accumulated response bytes containing the disconnect marker.
+        let response_bytes: Vec<u8> = b"*** DISCONNECTED FROM Station N0CALL\r".to_vec();
+        // The helper should identify this immediately.
+        assert!(is_session_dead_payload(&response_bytes));
+        // And a normal RESP frame should not trip it.
+        let ok_bytes: Vec<u8> = b"RESP0 5 abcdef 3600\rhello".to_vec();
+        assert!(!is_session_dead_payload(&ok_bytes));
     }
 }
