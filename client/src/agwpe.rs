@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -218,6 +220,10 @@ pub enum AgwpeCommand {
         data: Vec<u8>,
         reply: oneshot::Sender<Result<Vec<u8>, AgwpeError>>,
     },
+    SendRequestWithReconnect {
+        data: Vec<u8>,
+        reply: oneshot::Sender<Result<Vec<u8>, AgwpeError>>,
+    },
 }
 
 #[derive(Clone)]
@@ -229,11 +235,12 @@ impl AgwpeManager {
     pub fn new(
         state: SharedState,
         log_tx: broadcast::Sender<DebugLogEntry>,
+        response_timeout_secs: u64,
     ) -> Self {
         let (command_tx, command_rx) = mpsc::channel(32);
 
         tokio::spawn(async move {
-            background_task(command_rx, state, log_tx).await;
+            background_task(command_rx, state, log_tx, response_timeout_secs).await;
         });
 
         Self { command_tx }
@@ -306,6 +313,15 @@ impl AgwpeManager {
             .map_err(|_| AgwpeError::TaskStopped)?;
         rx.await.map_err(|_| AgwpeError::TaskStopped)?
     }
+
+    pub async fn send_request_with_reconnect(&self, data: Vec<u8>) -> Result<Vec<u8>, AgwpeError> {
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(AgwpeCommand::SendRequestWithReconnect { data, reply: tx })
+            .await
+            .map_err(|_| AgwpeError::TaskStopped)?;
+        rx.await.map_err(|_| AgwpeError::TaskStopped)?
+    }
 }
 
 struct BackgroundState {
@@ -315,6 +331,7 @@ struct BackgroundState {
     agwpe_port: u8,
     read_buf: Vec<u8>,
     response_timeout_secs: u64,
+    abort_reconnect: Arc<AtomicBool>,
 }
 
 impl BackgroundState {
@@ -326,6 +343,7 @@ impl BackgroundState {
             agwpe_port: 0,
             read_buf: Vec::new(),
             response_timeout_secs: 30,
+            abort_reconnect: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -414,8 +432,10 @@ async fn background_task(
     mut command_rx: mpsc::Receiver<AgwpeCommand>,
     state: SharedState,
     log_tx: broadcast::Sender<DebugLogEntry>,
+    response_timeout_secs: u64,
 ) {
     let mut bg = BackgroundState::new();
+    bg.response_timeout_secs = response_timeout_secs;
 
     while let Some(cmd) = command_rx.recv().await {
         match cmd {
@@ -450,6 +470,10 @@ async fn background_task(
             }
             AgwpeCommand::SendRequest { data, reply } => {
                 let result = handle_send_request(&mut bg, &state, &log_tx, data).await;
+                let _ = reply.send(result);
+            }
+            AgwpeCommand::SendRequestWithReconnect { data, reply } => {
+                let result = handle_send_request_with_reconnect(&mut bg, &state, &log_tx, data).await;
                 let _ = reply.send(result);
             }
         }
@@ -1125,6 +1149,8 @@ async fn handle_ax25_connect(
     target: &str,
     port_num: u8,
 ) -> Result<(), AgwpeError> {
+    bg.abort_reconnect.store(false, Ordering::SeqCst);
+
     if !bg.is_connected() {
         return Err(AgwpeError::NotConnected);
     }
@@ -1172,6 +1198,8 @@ async fn handle_ax25_disconnect(
     state: &SharedState,
     log_tx: &broadcast::Sender<DebugLogEntry>,
 ) -> Result<(), AgwpeError> {
+    bg.abort_reconnect.store(true, Ordering::SeqCst);
+
     if !bg.is_connected() {
         return Err(AgwpeError::NotConnected);
     }
@@ -1260,6 +1288,9 @@ async fn handle_reconnect(
     let result: Result<(), AgwpeError> = async {
         // Re-run the AX.25 handshake using the same helpers as handle_ax25_connect.
         ax25_open_and_await_connected(bg, state, log_tx).await?;
+        if bg.abort_reconnect.load(Ordering::SeqCst) {
+            return Err(AgwpeError::DisconnectedByOperator);
+        }
 
         let skip_bpq_app = {
             let s = state.lock_or_poisoned();
@@ -1267,6 +1298,9 @@ async fn handle_reconnect(
         };
         if !skip_bpq_app {
             bpq_send_app_command(bg, state, log_tx).await?;
+            if bg.abort_reconnect.load(Ordering::SeqCst) {
+                return Err(AgwpeError::DisconnectedByOperator);
+            }
         } else {
             BackgroundState::push_log(
                 state,
@@ -1279,7 +1313,13 @@ async fn handle_reconnect(
             );
         }
         bpq_await_callsign_prompt_and_send_callsign(bg, state, log_tx).await?;
+        if bg.abort_reconnect.load(Ordering::SeqCst) {
+            return Err(AgwpeError::DisconnectedByOperator);
+        }
         let disclaimer = bpq_await_disclaimer(bg, state, log_tx).await?;
+        if bg.abort_reconnect.load(Ordering::SeqCst) {
+            return Err(AgwpeError::DisconnectedByOperator);
+        }
 
         // Auto-consent check — exact-string equality only.
         let stored = {
@@ -1306,6 +1346,9 @@ async fn handle_reconnect(
 
         // Disclaimer matches — send AGREE on the wire so the server logs it.
         // Disclaimer suppression is purely UI; the wire protocol always requires AGREE.
+        if bg.abort_reconnect.load(Ordering::SeqCst) {
+            return Err(AgwpeError::DisconnectedByOperator);
+        }
         let agree_frame = AgwpeFrame::new(
             bg.agwpe_port,
             FrameType::SendData,
@@ -1566,6 +1609,25 @@ async fn handle_send_request(
                 );
             }
         }
+    }
+}
+
+async fn handle_send_request_with_reconnect(
+    bg: &mut BackgroundState,
+    state: &SharedState,
+    log_tx: &broadcast::Sender<DebugLogEntry>,
+    data: Vec<u8>,
+) -> Result<Vec<u8>, AgwpeError> {
+    match handle_send_request(bg, state, log_tx, data.clone()).await {
+        Ok(bytes) => Ok(bytes),
+        Err(AgwpeError::SessionDied { reason }) => {
+            // Auto-reconnect kill-switch is enforced by the caller (proxy.rs)
+            // choosing between send_request and send_request_with_reconnect,
+            // so if we're here, retry is authorized.
+            handle_reconnect(bg, state, log_tx, reason).await?;
+            handle_send_request(bg, state, log_tx, data).await
+        }
+        Err(e) => Err(e),
     }
 }
 
