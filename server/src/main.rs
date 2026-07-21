@@ -336,24 +336,35 @@ fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::io::Res
 
     // LinBPQ's TELNET driver in HOST 0 S mode delivers the very first line of
     // AX.25 input to the server TWICE: once with telnet-style CRLF conversion
-    // and again as the raw payload. That means what should be the AGREE line
-    // is often a duplicate of the callsign line. Skip any line that matches
-    // the just-validated callsign before checking for AGREE, so the operator
-    // consent step doesn't spuriously fail on the demo/off-air setup.
+    // and again as the raw payload, so what should be the AGREE line is often
+    // a duplicate of the callsign line. LinBPQ also prefixes new sessions
+    // with node-status text such as `*** Disconnected from Stream N` — the
+    // trailing housekeeping notice from a prior session's teardown — before
+    // the real user input arrives. Skip both classes of noise before we
+    // decide whether the next line is AGREE.
     let input = loop {
         let line = match read_bounded_line_until(&mut reader, pre_auth_deadline)? {
             Some(s) => s,
             None => return Ok(()),
         };
-        let trimmed = line.trim().to_uppercase();
-        if trimmed == callsign {
-            eprintln!(
-                "[AUTH] Discarding duplicate callsign line delivered by LinBPQ for {}",
-                callsign,
-            );
-            continue;
+        match classify_preauth_line(&line, &callsign) {
+            PreAuthLine::DuplicateCallsign => {
+                eprintln!(
+                    "[AUTH] Discarding duplicate callsign line delivered by LinBPQ for {}",
+                    callsign,
+                );
+                continue;
+            }
+            PreAuthLine::LinbpqStatus => {
+                eprintln!(
+                    "[AUTH] Discarding LinBPQ status line while awaiting AGREE from {}: {:?}",
+                    callsign,
+                    line.trim(),
+                );
+                continue;
+            }
+            PreAuthLine::Candidate => break line,
         }
-        break line;
     };
 
     if input.trim().to_uppercase() != "AGREE" {
@@ -656,6 +667,27 @@ fn send_error_response(stream: &mut TcpStream, message: &str) -> std::io::Result
     send_status_response(stream, Status::Err, message)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PreAuthLine {
+    DuplicateCallsign,
+    LinbpqStatus,
+    Candidate,
+}
+
+// Decide whether a line delivered by LinBPQ during the pre-AGREE window is
+// housekeeping noise we should silently skip or a genuine input candidate
+// (which the caller will then compare against the literal "AGREE").
+fn classify_preauth_line(line: &str, callsign: &str) -> PreAuthLine {
+    let trimmed = line.trim().to_uppercase();
+    if trimmed == callsign {
+        return PreAuthLine::DuplicateCallsign;
+    }
+    if trimmed.starts_with("***") {
+        return PreAuthLine::LinbpqStatus;
+    }
+    PreAuthLine::Candidate
+}
+
 fn send_status_response(
     stream: &mut TcpStream,
     status: Status,
@@ -774,5 +806,52 @@ mod tests {
         let mut buf = [0u8; 4];
         let err = read_exact_until(&mut reader, &mut buf, deadline).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn preauth_classifier_treats_duplicate_callsign_as_skippable() {
+        assert_eq!(
+            classify_preauth_line("W1TEST\n", "W1TEST"),
+            PreAuthLine::DuplicateCallsign,
+        );
+        assert_eq!(
+            classify_preauth_line("  w1test\r\n", "W1TEST"),
+            PreAuthLine::DuplicateCallsign,
+        );
+    }
+
+    // Regression: after graceful-reconnect, LinBPQ prefixes the freshly-spawned
+    // WEB session's input stream with a housekeeping line like
+    // "*** Disconnected from Stream N" from the prior session's teardown. The
+    // server previously took that as the AGREE reply and rejected the session
+    // — and the AX.25 client's auto-reconnect then bounced against the closed
+    // TCP forever. Any line beginning with `***` must be treated as LinBPQ
+    // noise and skipped.
+    #[test]
+    fn preauth_classifier_skips_linbpq_status_lines() {
+        assert_eq!(
+            classify_preauth_line("*** Disconnected from Stream 10\r\n", "W1TEST"),
+            PreAuthLine::LinbpqStatus,
+        );
+        assert_eq!(
+            classify_preauth_line("*** Connected to WEB         \r\n", "W1TEST"),
+            PreAuthLine::LinbpqStatus,
+        );
+    }
+
+    #[test]
+    fn preauth_classifier_passes_real_input_through() {
+        assert_eq!(
+            classify_preauth_line("AGREE\n", "W1TEST"),
+            PreAuthLine::Candidate,
+        );
+        assert_eq!(
+            classify_preauth_line("DENY\n", "W1TEST"),
+            PreAuthLine::Candidate,
+        );
+        assert_eq!(
+            classify_preauth_line("\n", "W1TEST"),
+            PreAuthLine::Candidate,
+        );
     }
 }
