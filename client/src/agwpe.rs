@@ -45,7 +45,13 @@ pub enum FrameType {
     RegistrationResponse = 0x78,
     Connect = 0x43,
     Connected = 0x63,
-    DataReceived = 0x64,
+    // AGWPE-P 'd' 0x64. Bidirectional:
+    //   client→server: "please disconnect from the remote station"
+    //   server→client: "we have been disconnected", payload starts with `*** DISCONNECTED FROM ...`
+    // The name matches the AGWPE-P spec; the payload check at
+    // `is_session_dead_payload` distinguishes disconnect-notification bytes
+    // from any other data that lands here.
+    Disconnect = 0x64,
     SendData = 0x44,
     ConnectionRejected = 0x52,
     QueryPorts = 0x47,
@@ -61,7 +67,7 @@ impl TryFrom<u8> for FrameType {
             0x78 => Ok(FrameType::RegistrationResponse),
             0x43 => Ok(FrameType::Connect),
             0x63 => Ok(FrameType::Connected),
-            0x64 => Ok(FrameType::DataReceived),
+            0x64 => Ok(FrameType::Disconnect),
             0x44 => Ok(FrameType::SendData),
             0x52 => Ok(FrameType::ConnectionRejected),
             0x47 => Ok(FrameType::QueryPorts),
@@ -787,7 +793,7 @@ async fn bpq_await_callsign_prompt_and_send_callsign(
         );
 
         match frame.frame_type {
-            FrameType::DataReceived | FrameType::SendData => {
+            FrameType::Disconnect | FrameType::SendData => {
                 let text = String::from_utf8_lossy(&frame.data).to_string();
                 if received_text.len() + text.len() > MAX_HANDSHAKE_TEXT {
                     return Err(AgwpeError::ConnectionFailed(
@@ -875,7 +881,7 @@ async fn bpq_await_disclaimer(
         match frame.frame_type {
             // Direwolf reports received data with frame type 'D' (0x44) — the
             // same byte we use to send data — so we accept both here.
-            FrameType::DataReceived | FrameType::SendData => {
+            FrameType::Disconnect | FrameType::SendData => {
                 let text = String::from_utf8_lossy(&frame.data).to_string();
                 if received_text.len() + text.len() > MAX_HANDSHAKE_TEXT {
                     return Err(AgwpeError::ConnectionFailed(
@@ -1206,26 +1212,68 @@ async fn handle_ax25_disconnect(
         return Err(AgwpeError::NotConnected);
     }
 
-    let disconnect_frame = AgwpeFrame::new(
-        bg.agwpe_port,
-        FrameType::SendData,
-        &bg.local_callsign,
-        &bg.remote_callsign,
-        vec![],
-    );
-
-    BackgroundState::push_log(
-        state,
-        log_tx,
-        DebugLogEntry::new(LogLevel::Info, "PROTOCOL", "AX.25 disconnect")
-            .with_direction(Direction::Tx),
-    );
-
-    let _ = BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &disconnect_frame).await;
+    send_agwpe_disconnect_and_drain(bg, state, log_tx).await;
 
     BackgroundState::set_state(state, log_tx, ConnectionState::AgwpeConnected);
 
     Ok(())
+}
+
+// Send an AGWPE-P 'd' (0x64) Disconnect and wait briefly for the peer's
+// "*** DISCONNECTED FROM ..." confirmation frame so the AX.25 link tears
+// down cleanly.  Without this, LinBPQ keeps the layer-2 link up and treats
+// a subsequent Connect as a sequence-number reset on the *existing*
+// session — so it never spawns a fresh application instance and any
+// reconnect attempt hangs waiting for a callsign prompt that will never
+// come.  A missing confirmation must not stall the caller, so the drain
+// has a hard 3s deadline.
+async fn send_agwpe_disconnect_and_drain(
+    bg: &mut BackgroundState,
+    state: &SharedState,
+    log_tx: &broadcast::Sender<DebugLogEntry>,
+) {
+    let disc = AgwpeFrame::new(
+        bg.agwpe_port,
+        FrameType::Disconnect,
+        &bg.local_callsign,
+        &bg.remote_callsign,
+        Vec::new(),
+    );
+    BackgroundState::push_log(
+        state,
+        log_tx,
+        DebugLogEntry::new(LogLevel::Info, "PROTOCOL", "AX.25 disconnect (AGWPE 'd')")
+            .with_direction(Direction::Tx),
+    );
+    if let Some(stream) = bg.stream.as_mut() {
+        let _ = BackgroundState::send_frame(stream, &disc).await;
+    } else {
+        return;
+    }
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match tokio::time::timeout_at(deadline, bg.read_frame_from_stream()).await {
+            Ok(Ok(frame)) if matches!(frame.frame_type, FrameType::Disconnect) => {
+                BackgroundState::push_log(
+                    state,
+                    log_tx,
+                    DebugLogEntry::new(
+                        LogLevel::Debug,
+                        "PROTOCOL",
+                        "Received AX.25 disconnect confirmation",
+                    )
+                    .with_direction(Direction::Rx),
+                );
+                break;
+            }
+            // Any other frame is stale in-flight traffic from the dying
+            // session — discard and keep draining until the confirmation
+            // or the deadline.
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
 }
 
 fn is_session_dead_payload(data: &[u8]) -> bool {
@@ -1269,17 +1317,13 @@ async fn handle_reconnect(
         ),
     );
 
-    // Best-effort close of the client's AX.25 side before we re-open.  The
-    // session is already dead, so we ignore any send error here.
+    // Tear down the AX.25 link on our side before re-opening so the peer
+    // (e.g. LinBPQ) actually closes the dead application session and will
+    // spawn a fresh one on our next Connect.  See
+    // `send_agwpe_disconnect_and_drain` for why an empty SendData frame is
+    // insufficient.
     if bg.stream.is_some() {
-        let close_frame = AgwpeFrame::new(
-            bg.agwpe_port,
-            FrameType::SendData,
-            &bg.local_callsign,
-            &bg.remote_callsign,
-            vec![],
-        );
-        let _ = BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &close_frame).await;
+        send_agwpe_disconnect_and_drain(bg, state, log_tx).await;
     }
 
     // Run the full handshake in an inner block so we can intercept any error
@@ -1477,7 +1521,7 @@ async fn handle_send_request(
         match frame.frame_type {
             // Direwolf reports received data with frame type 'D' (0x44) — the
             // same byte we use to send data — so we accept both here.
-            FrameType::DataReceived | FrameType::SendData => {
+            FrameType::Disconnect | FrameType::SendData => {
                 if response_data.len() + frame.data.len() > MAX_RESPONSE_SIZE {
                     return Err(AgwpeError::InvalidFrame(format!(
                         "Response exceeded maximum size of {} bytes",
@@ -1700,7 +1744,7 @@ mod tests {
     fn test_decode_rejects_oversized_data_len() {
         // Hand-build a header that claims a data_len far above MAX_FRAME_DATA_SIZE.
         let mut buf = vec![0u8; AgwpeFrame::HEADER_SIZE];
-        buf[4] = FrameType::DataReceived as u8;
+        buf[4] = FrameType::Disconnect as u8;
         let huge = (MAX_FRAME_DATA_SIZE as u32 + 1).to_le_bytes();
         buf[28..32].copy_from_slice(&huge);
         let result = AgwpeFrame::decode(&buf);
@@ -1713,7 +1757,7 @@ mod tests {
         assert_eq!(FrameType::try_from(0x78).unwrap(), FrameType::RegistrationResponse);
         assert_eq!(FrameType::try_from(0x43).unwrap(), FrameType::Connect);
         assert_eq!(FrameType::try_from(0x63).unwrap(), FrameType::Connected);
-        assert_eq!(FrameType::try_from(0x64).unwrap(), FrameType::DataReceived);
+        assert_eq!(FrameType::try_from(0x64).unwrap(), FrameType::Disconnect);
         assert_eq!(FrameType::try_from(0x44).unwrap(), FrameType::SendData);
         assert_eq!(FrameType::try_from(0x52).unwrap(), FrameType::ConnectionRejected);
         assert_eq!(FrameType::try_from(0x47).unwrap(), FrameType::QueryPorts);
