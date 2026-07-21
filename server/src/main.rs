@@ -15,13 +15,22 @@ use std::net::{IpAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 const VERSION: &str = "0.3.0";
 const MAX_CONNECTIONS: usize = 50;
 const MAX_CONNECTIONS_PER_IP: usize = 5;
 const MAX_LINE_LENGTH: usize = 1024;
 const MAX_BODY_SIZE: usize = 1024 * 1024;
-const REQUEST_TIMEOUT_SECS: u64 = 300;
+// Ambient socket write timeout. Applied to the whole session; guards against
+// a stalled peer refusing to drain the kernel send buffer.
+const WRITE_TIMEOUT_SECS: u64 = 300;
+// Ambient socket read timeout. Deliberately short so a stalled read wakes up
+// often enough to re-check the wall-clock idle deadline; NOT itself the
+// session-death cutoff.
+const READ_POLL_SECS: u64 = 30;
+// Wall-clock deadline for the pre-AGREE handshake reads.
+const PRE_AUTH_TIMEOUT_SECS: u64 = 300;
 
 type PeerCounts = Arc<Mutex<HashMap<IpAddr, usize>>>;
 
@@ -77,12 +86,12 @@ fn main() {
                 let peer = peer_addr.map(|a| a.to_string()).unwrap_or_else(|| "unknown".to_string());
                 eprintln!("[CONNECT] New connection from {}", peer);
 
-                if let Err(e) = stream.set_read_timeout(Some(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))) {
+                if let Err(e) = stream.set_read_timeout(Some(Duration::from_secs(READ_POLL_SECS))) {
                     eprintln!("[ERROR] Failed to set read timeout: {}", e);
                     continue;
                 }
 
-                if let Err(e) = stream.set_write_timeout(Some(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS))) {
+                if let Err(e) = stream.set_write_timeout(Some(Duration::from_secs(WRITE_TIMEOUT_SECS))) {
                     eprintln!("[ERROR] Failed to set write timeout: {}", e);
                     continue;
                 }
@@ -174,24 +183,114 @@ fn main() {
 // Read up to one line, capped at MAX_LINE_LENGTH bytes including the newline.
 // Returns Ok(None) on clean EOF and an InvalidData error if no newline arrives
 // before the cap (so a slow attacker cannot stream gigabytes into the buffer).
-fn read_bounded_line(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option<String>> {
-    let mut buf = Vec::new();
-    let n = reader
-        .by_ref()
-        .take((MAX_LINE_LENGTH as u64) + 1)
-        .read_until(b'\n', &mut buf)?;
-    if n == 0 {
-        return Ok(None);
+//
+// The ambient socket read timeout (READ_POLL_SECS) is used only as a wakeup
+// tick: WouldBlock/TimedOut errors are retried until the caller-supplied
+// wall-clock `deadline` expires, at which point TimedOut is returned. This
+// lets the session-level idle timeout — not the SO_RCVTIMEO knob — decide
+// when to close an idle connection.
+fn read_bounded_line_until(
+    reader: &mut BufReader<TcpStream>,
+    deadline: Instant,
+) -> std::io::Result<Option<String>> {
+    let mut buf: Vec<u8> = Vec::new();
+    let cap = (MAX_LINE_LENGTH as u64) + 1;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Idle deadline exceeded",
+            ));
+        }
+        let remaining = cap.saturating_sub(buf.len() as u64);
+        if remaining == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Line exceeded maximum length",
+            ));
+        }
+        match reader.by_ref().take(remaining).read_until(b'\n', &mut buf) {
+            Ok(0) if buf.is_empty() => return Ok(None),
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "EOF mid-line",
+                ))
+            }
+            Ok(_) => {
+                if buf.last() == Some(&b'\n') {
+                    return String::from_utf8(buf).map(Some).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Invalid UTF-8 in line",
+                        )
+                    });
+                }
+                if buf.len() as u64 >= cap {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Line exceeded maximum length",
+                    ));
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                // read_until may have appended bytes before the timeout;
+                // if that included the delimiter we're already done.
+                if buf.last() == Some(&b'\n') {
+                    return String::from_utf8(buf).map(Some).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Invalid UTF-8 in line",
+                        )
+                    });
+                }
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
     }
-    if buf.last() != Some(&b'\n') {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Line exceeded maximum length",
-        ));
+}
+
+// Read exactly `buf.len()` bytes, retrying WouldBlock/TimedOut from the
+// ambient socket read timeout until the caller-supplied deadline expires.
+fn read_exact_until(
+    reader: &mut BufReader<TcpStream>,
+    buf: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Body read deadline exceeded",
+            ));
+        }
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Short body",
+                ))
+            }
+            Ok(n) => filled += n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue
+            }
+            Err(e) => return Err(e),
+        }
     }
-    String::from_utf8(buf)
-        .map(Some)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid UTF-8 in line"))
+    Ok(())
 }
 
 fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::io::Result<()> {
@@ -208,7 +307,9 @@ fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::io::Res
     write!(stream, "Enter your callsign: ")?;
     stream.flush()?;
 
-    let callsign = match read_bounded_line(&mut reader)? {
+    let pre_auth_deadline = Instant::now() + Duration::from_secs(PRE_AUTH_TIMEOUT_SECS);
+
+    let callsign = match read_bounded_line_until(&mut reader, pre_auth_deadline)? {
         Some(s) => s.trim().to_string(),
         None => return Ok(()),
     };
@@ -240,7 +341,7 @@ fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::io::Res
     // the just-validated callsign before checking for AGREE, so the operator
     // consent step doesn't spuriously fail on the demo/off-air setup.
     let input = loop {
-        let line = match read_bounded_line(&mut reader)? {
+        let line = match read_bounded_line_until(&mut reader, pre_auth_deadline)? {
             Some(s) => s,
             None => return Ok(()),
         };
@@ -297,14 +398,24 @@ fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::io::Res
     };
 
     loop {
-        if session.is_timed_out(config.idle_timeout_minutes) {
-            writeln!(stream, "\nSession timed out due to inactivity.")?;
-            break;
-        }
+        // Wall-clock idle deadline, measured from the last time we heard from
+        // or sent to this peer. The socket read timeout fires every
+        // READ_POLL_SECS but is not itself the session-death cutoff; it only
+        // wakes us to re-check this deadline.
+        let idle_deadline = session.last_activity
+            + Duration::from_secs(config.idle_timeout_minutes * 60);
 
-        let request = match read_request(&mut reader) {
+        let request = match read_request(&mut reader, idle_deadline) {
             Ok(Some(req)) => req,
             Ok(None) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                eprintln!(
+                    "[IDLE] {} idle > {} min, closing session",
+                    callsign, config.idle_timeout_minutes
+                );
+                let _ = writeln!(stream, "\nSession timed out due to inactivity.");
+                break;
+            }
             Err(e) => {
                 eprintln!("[PROTO] Read error from {}: {}", callsign, e);
                 break;
@@ -326,6 +437,10 @@ fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::io::Res
                     eprintln!("[ERROR] Failed to send POST rejection to {}: {}", callsign, e);
                     break;
                 }
+                // Reset the idle clock: we successfully sent a response and
+                // any delivery latency on that response should not eat into
+                // the operator's think time.
+                session.touch();
                 continue;
             }
         };
@@ -333,14 +448,23 @@ fn handle_connection(mut stream: TcpStream, config: Arc<Config>) -> std::io::Res
         if let Err(e) = handle_request(&mut session, &mut browser, &callsign, Arc::clone(&config), &logger, &mut stream, &url, if_none_match.as_deref()) {
             eprintln!("[ERROR] Request error for {}: {}", callsign, e);
         }
+
+        // Start the idle countdown from response-send time, not from when
+        // the request arrived. A slow AX.25 downlink can take minutes to
+        // deliver even a small page, and the operator still needs a full
+        // idle window to read and click.
+        session.touch();
     }
 
     eprintln!("[CONNECT] Session ended for {}", callsign);
     Ok(())
 }
 
-fn read_request(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option<Request>> {
-    let header_line = match read_bounded_line(reader)? {
+fn read_request(
+    reader: &mut BufReader<TcpStream>,
+    deadline: Instant,
+) -> std::io::Result<Option<Request>> {
+    let header_line = match read_bounded_line_until(reader, deadline)? {
         Some(s) => s,
         None => return Ok(None),
     };
@@ -369,7 +493,7 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option<Req
         }
 
         let mut len_buf = [0u8; 4];
-        reader.read_exact(&mut len_buf)?;
+        read_exact_until(reader, &mut len_buf, deadline)?;
         let body_len = u32::from_be_bytes(len_buf) as usize;
 
         if body_len > MAX_BODY_SIZE {
@@ -380,7 +504,7 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option<Req
         }
 
         let mut body = vec![0u8; body_len];
-        reader.read_exact(&mut body)?;
+        read_exact_until(reader, &mut body, deadline)?;
 
         Ok(Some(Request::Post { url, body }))
     } else {
@@ -548,4 +672,107 @@ fn send_status_response(
     stream.write_all(&response.encode())?;
     stream.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    // Pair a client socket with a server-side BufReader whose SO_RCVTIMEO is
+    // deliberately short — mirrors production wiring so tests exercise the
+    // real WouldBlock/TimedOut retry path.
+    fn socket_pair(read_poll: Duration) -> (TcpStream, BufReader<TcpStream>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server.set_read_timeout(Some(read_poll)).unwrap();
+        (client, BufReader::new(server))
+    }
+
+    // Regression: before the fix, a socket-level read timeout firing while
+    // we waited between requests was surfaced as a fatal WouldBlock error
+    // and killed the browsing session. The new helper must retry across
+    // several SO_RCVTIMEO wakeups and successfully assemble the line once
+    // the peer eventually writes.
+    #[test]
+    fn read_bounded_line_survives_socket_timeouts_before_first_byte() {
+        let (mut client, mut reader) = socket_pair(Duration::from_millis(50));
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        let writer = thread::spawn(move || {
+            // Sleep long enough that the server-side read_until fires
+            // WouldBlock several times before any bytes arrive.
+            thread::sleep(Duration::from_millis(300));
+            client.write_all(b"HELLO\n").unwrap();
+            client.flush().unwrap();
+            client
+        });
+
+        let line = read_bounded_line_until(&mut reader, deadline).unwrap();
+        assert_eq!(line.as_deref(), Some("HELLO\n"));
+        drop(writer.join().unwrap());
+    }
+
+    // The wall-clock deadline is the only thing that terminates an idle
+    // wait; the loop must eventually give up with TimedOut when the peer
+    // never speaks, and it must not falsely report a protocol error.
+    #[test]
+    fn read_bounded_line_returns_timed_out_at_deadline() {
+        let (_client, mut reader) = socket_pair(Duration::from_millis(50));
+        let deadline = Instant::now() + Duration::from_millis(250);
+
+        let err = read_bounded_line_until(&mut reader, deadline).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    // Byte-order-preserving: a slow line delivered a chunk at a time across
+    // multiple SO_RCVTIMEO wakeups must still reassemble correctly.
+    #[test]
+    fn read_bounded_line_reassembles_across_partial_reads() {
+        let (mut client, mut reader) = socket_pair(Duration::from_millis(50));
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        let writer = thread::spawn(move || {
+            for chunk in ["GET ", "https://exa", "mple.com\n"] {
+                thread::sleep(Duration::from_millis(120));
+                client.write_all(chunk.as_bytes()).unwrap();
+                client.flush().unwrap();
+            }
+            client
+        });
+
+        let line = read_bounded_line_until(&mut reader, deadline).unwrap();
+        assert_eq!(line.as_deref(), Some("GET https://example.com\n"));
+        drop(writer.join().unwrap());
+    }
+
+    #[test]
+    fn read_exact_until_survives_socket_timeouts() {
+        let (mut client, mut reader) = socket_pair(Duration::from_millis(50));
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            client.write_all(&[1u8, 2, 3, 4]).unwrap();
+            client.flush().unwrap();
+            client
+        });
+
+        let mut buf = [0u8; 4];
+        read_exact_until(&mut reader, &mut buf, deadline).unwrap();
+        assert_eq!(buf, [1, 2, 3, 4]);
+        drop(writer.join().unwrap());
+    }
+
+    #[test]
+    fn read_exact_until_returns_timed_out_at_deadline() {
+        let (_client, mut reader) = socket_pair(Duration::from_millis(50));
+        let deadline = Instant::now() + Duration::from_millis(250);
+
+        let mut buf = [0u8; 4];
+        let err = read_exact_until(&mut reader, &mut buf, deadline).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
 }
