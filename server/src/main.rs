@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const VERSION: &str = "0.3.0";
+const VERSION: &str = "0.4.0";
 const MAX_CONNECTIONS: usize = 50;
 const MAX_CONNECTIONS_PER_IP: usize = 5;
 const MAX_LINE_LENGTH: usize = 1024;
