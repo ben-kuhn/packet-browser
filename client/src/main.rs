@@ -1,5 +1,8 @@
-mod agwpe;
-mod transport;
+pub mod transport;
+
+pub mod agwpe {
+    pub use crate::transport::agwpe::*;
+}
 mod cache;
 mod config;
 mod proxy;
