@@ -1,9 +1,6 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
 use tokio::sync::broadcast;
 
 use crate::state::{
@@ -35,9 +32,7 @@ pub enum AgwpeError {
 }
 
 // Defensive caps against a hostile or buggy AGWPE peer sending oversized lengths.
-const MAX_FRAME_DATA_SIZE: usize = 64 * 1024;
-const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
-const MAX_HANDSHAKE_TEXT: usize = 64 * 1024;
+pub(crate) const MAX_FRAME_DATA_SIZE: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FrameType {
@@ -201,185 +196,106 @@ impl AgwpeFrame {
     }
 }
 
-pub enum AgwpeCommand {
-    ConnectToAgwpe {
-        host: String,
-        port: u16,
-        callsign: String,
-        reply: oneshot::Sender<Result<(), AgwpeError>>,
-    },
-    DisconnectAgwpe {
-        reply: oneshot::Sender<Result<(), AgwpeError>>,
-    },
-    QueryPorts {
-        reply: oneshot::Sender<Result<(), AgwpeError>>,
-    },
-    Ax25Connect {
-        target: String,
-        port_num: u8,
-        reply: oneshot::Sender<Result<(), AgwpeError>>,
-    },
-    Ax25Disconnect {
-        reply: oneshot::Sender<Result<(), AgwpeError>>,
-    },
-    SendRequest {
-        data: Vec<u8>,
-        reply: oneshot::Sender<Result<Vec<u8>, AgwpeError>>,
-    },
-    SendRequestWithReconnect {
-        data: Vec<u8>,
-        reply: oneshot::Sender<Result<Vec<u8>, AgwpeError>>,
-    },
+/// Detects control-plane text that signals the AX.25 session is dead.
+///
+/// Different node stacks emit different tear-down text:
+///   Direwolf / AGWPE convention: `*** DISCONNECTED FROM Station <call>`
+///   LinBPQ WEB-app exit:         `Returned to Node <alias>:<call>`
+///
+/// The markers may arrive in the first frame OR appear mid-buffer after a
+/// prior in-flight response has already accumulated bytes, so we scan the
+/// whole accumulated buffer, not just its prefix. False positives inside a
+/// legitimate RESP body are impossible because the payload is base64
+/// (`[A-Za-z0-9+/=]`) and can't contain spaces or asterisks.
+pub(crate) fn is_session_dead_payload(data: &[u8]) -> bool {
+    contains_slice(data, b"*** DISCONNECTED") || contains_slice(data, b"Returned to Node")
 }
 
-#[derive(Clone)]
-pub struct AgwpeManager {
-    command_tx: mpsc::Sender<AgwpeCommand>,
+fn contains_slice(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-impl AgwpeManager {
-    pub fn new(
-        state: SharedState,
-        log_tx: broadcast::Sender<DebugLogEntry>,
-        response_timeout_secs: u64,
-    ) -> Self {
-        let (command_tx, command_rx) = mpsc::channel(32);
+// ---------------------------------------------------------------------------
+// AgwpeTransport – owns the TCP stream + read buffer and implements the
+// Transport trait against the AGWPE-P wire protocol.
+// ---------------------------------------------------------------------------
 
-        tokio::spawn(async move {
-            background_task(command_rx, state, log_tx, response_timeout_secs).await;
-        });
-
-        Self { command_tx }
-    }
-
-    pub async fn connect_to_agwpe(
-        &self,
-        host: String,
-        port: u16,
-        callsign: String,
-    ) -> Result<(), AgwpeError> {
-        let (tx, rx) = oneshot::channel();
-        self.command_tx
-            .send(AgwpeCommand::ConnectToAgwpe {
-                host,
-                port,
-                callsign,
-                reply: tx,
-            })
-            .await
-            .map_err(|_| AgwpeError::TaskStopped)?;
-        rx.await.map_err(|_| AgwpeError::TaskStopped)?
-    }
-
-    pub async fn disconnect_agwpe(&self) -> Result<(), AgwpeError> {
-        let (tx, rx) = oneshot::channel();
-        self.command_tx
-            .send(AgwpeCommand::DisconnectAgwpe { reply: tx })
-            .await
-            .map_err(|_| AgwpeError::TaskStopped)?;
-        rx.await.map_err(|_| AgwpeError::TaskStopped)?
-    }
-
-    pub async fn query_ports(&self) -> Result<(), AgwpeError> {
-        let (tx, rx) = oneshot::channel();
-        self.command_tx
-            .send(AgwpeCommand::QueryPorts { reply: tx })
-            .await
-            .map_err(|_| AgwpeError::TaskStopped)?;
-        rx.await.map_err(|_| AgwpeError::TaskStopped)?
-    }
-
-    pub async fn ax25_connect(&self, target: String, port_num: u8) -> Result<(), AgwpeError> {
-        let (tx, rx) = oneshot::channel();
-        self.command_tx
-            .send(AgwpeCommand::Ax25Connect {
-                target,
-                port_num,
-                reply: tx,
-            })
-            .await
-            .map_err(|_| AgwpeError::TaskStopped)?;
-        rx.await.map_err(|_| AgwpeError::TaskStopped)?
-    }
-
-    pub async fn ax25_disconnect(&self) -> Result<(), AgwpeError> {
-        let (tx, rx) = oneshot::channel();
-        self.command_tx
-            .send(AgwpeCommand::Ax25Disconnect { reply: tx })
-            .await
-            .map_err(|_| AgwpeError::TaskStopped)?;
-        rx.await.map_err(|_| AgwpeError::TaskStopped)?
-    }
-
-    pub async fn send_request(&self, data: Vec<u8>) -> Result<Vec<u8>, AgwpeError> {
-        let (tx, rx) = oneshot::channel();
-        self.command_tx
-            .send(AgwpeCommand::SendRequest { data, reply: tx })
-            .await
-            .map_err(|_| AgwpeError::TaskStopped)?;
-        rx.await.map_err(|_| AgwpeError::TaskStopped)?
-    }
-
-    pub async fn send_request_with_reconnect(&self, data: Vec<u8>) -> Result<Vec<u8>, AgwpeError> {
-        let (tx, rx) = oneshot::channel();
-        self.command_tx
-            .send(AgwpeCommand::SendRequestWithReconnect { data, reply: tx })
-            .await
-            .map_err(|_| AgwpeError::TaskStopped)?;
-        rx.await.map_err(|_| AgwpeError::TaskStopped)?
-    }
+pub struct AgwpeTransport {
+    pub(crate) stream: Option<TcpStream>,
+    pub(crate) read_buf: Vec<u8>,
+    pub local_callsign: String,
+    pub remote_callsign: String,
+    pub agwpe_port: u8,
+    // SharedState + log channel are held so trait methods can log/state-mutate
+    // without threading them through every call. Set via `attach_state`.
+    pub(crate) state: Option<SharedState>,
+    pub(crate) log_tx: Option<broadcast::Sender<DebugLogEntry>>,
 }
 
-struct BackgroundState {
-    stream: Option<TcpStream>,
-    local_callsign: String,
-    remote_callsign: String,
-    agwpe_port: u8,
-    read_buf: Vec<u8>,
-    response_timeout_secs: u64,
-    abort_reconnect: Arc<AtomicBool>,
-}
-
-impl BackgroundState {
-    fn new() -> Self {
+impl AgwpeTransport {
+    pub fn new() -> Self {
         Self {
             stream: None,
+            read_buf: Vec::new(),
             local_callsign: String::new(),
             remote_callsign: String::new(),
             agwpe_port: 0,
-            read_buf: Vec::new(),
-            response_timeout_secs: 30,
-            abort_reconnect: Arc::new(AtomicBool::new(false)),
+            state: None,
+            log_tx: None,
         }
     }
 
-    fn is_connected(&self) -> bool {
+    /// Attach the shared state + log broadcaster. Called once by the
+    /// TransportManager background task before driving any commands.
+    pub fn attach_state(
+        &mut self,
+        state: SharedState,
+        log_tx: broadcast::Sender<DebugLogEntry>,
+    ) {
+        self.state = Some(state);
+        self.log_tx = Some(log_tx);
+    }
+
+    pub fn is_connected(&self) -> bool {
         self.stream.is_some()
     }
 
-    fn push_log(state: &SharedState, log_tx: &broadcast::Sender<DebugLogEntry>, entry: DebugLogEntry) {
-        {
+    fn push_log(&self, entry: DebugLogEntry) {
+        if let Some(state) = &self.state {
             let mut s = state.lock_or_poisoned();
             s.add_log(entry.clone());
         }
-        let _ = log_tx.send(entry);
+        if let Some(tx) = &self.log_tx {
+            let _ = tx.send(entry);
+        }
     }
 
-    fn set_state(state: &SharedState, log_tx: &broadcast::Sender<DebugLogEntry>, cs: ConnectionState) {
-        let entry = {
+    fn set_state(&self, cs: ConnectionState) {
+        let entry = if let Some(state) = &self.state {
             let mut s = state.lock_or_poisoned();
-            s.set_connection_state(cs)
+            Some(s.set_connection_state(cs))
+        } else {
+            None
         };
-        let _ = log_tx.send(entry);
+        if let (Some(tx), Some(e)) = (&self.log_tx, entry) {
+            let _ = tx.send(e);
+        }
     }
 
-    async fn send_frame(stream: &mut TcpStream, frame: &AgwpeFrame) -> Result<(), AgwpeError> {
+    pub(crate) async fn send_frame_internal(
+        &mut self,
+        frame: &AgwpeFrame,
+    ) -> Result<(), AgwpeError> {
+        let stream = self.stream.as_mut().ok_or(AgwpeError::NotConnected)?;
         stream.write_all(&frame.encode()).await?;
         stream.flush().await?;
         Ok(())
     }
 
-    async fn read_frame_from_stream(&mut self) -> Result<AgwpeFrame, AgwpeError> {
+    pub(crate) async fn read_frame_from_stream(&mut self) -> Result<AgwpeFrame, AgwpeError> {
         loop {
             if self.read_buf.len() >= AgwpeFrame::HEADER_SIZE {
                 let data_len = u32::from_le_bytes([
@@ -396,10 +312,9 @@ impl BackgroundState {
                 }
                 let total = AgwpeFrame::HEADER_SIZE + data_len;
                 if self.read_buf.len() >= total {
-                    // Debug: print raw bytes
                     tracing::trace!("[AGWPE] Raw frame bytes (first 36): {:?}", &self.read_buf[..36.min(self.read_buf.len())]);
-                    tracing::trace!("[AGWPE] Frame type byte at offset 4: 0x{:02X} ('{}')", 
-                        self.read_buf[4], 
+                    tracing::trace!("[AGWPE] Frame type byte at offset 4: 0x{:02X} ('{}')",
+                        self.read_buf[4],
                         if self.read_buf[4] >= 32 && self.read_buf[4] < 127 { self.read_buf[4] as char } else { '?' });
                     if data_len > 0 {
                         tracing::trace!("[AGWPE] Frame data ({} bytes): {:?}", data_len, &self.read_buf[36..36+data_len.min(self.read_buf.len()-36)]);
@@ -409,7 +324,6 @@ impl BackgroundState {
                     return Ok(frame);
                 }
             }
-
             let mut tmp = [0u8; 4096];
             let stream = self.stream.as_mut().ok_or(AgwpeError::NotConnected)?;
             let n = stream.read(&mut tmp).await?;
@@ -418,6 +332,21 @@ impl BackgroundState {
             }
             tracing::trace!("[AGWPE] Read {} bytes from stream", n);
             self.read_buf.extend_from_slice(&tmp[..n]);
+        }
+    }
+
+    pub(crate) async fn read_frame_with_timeout_deadline(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<AgwpeFrame, AgwpeError> {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err(AgwpeError::Timeout);
+        }
+        let duration = deadline - now;
+        match tokio::time::timeout(duration, self.read_frame_from_stream()).await {
+            Ok(result) => result,
+            Err(_) => Err(AgwpeError::Timeout),
         }
     }
 
@@ -432,1304 +361,478 @@ impl BackgroundState {
             Err(_) => Err(AgwpeError::Timeout),
         }
     }
-}
 
-async fn background_task(
-    mut command_rx: mpsc::Receiver<AgwpeCommand>,
-    state: SharedState,
-    log_tx: broadcast::Sender<DebugLogEntry>,
-    response_timeout_secs: u64,
-) {
-    let mut bg = BackgroundState::new();
-    // Clamp to at least 1s: a zero-second timeout would fire on every read,
-    // instantly SessionDied-ing every request and looping through reconnects.
-    bg.response_timeout_secs = response_timeout_secs.max(1);
-
-    while let Some(cmd) = command_rx.recv().await {
-        match cmd {
-            AgwpeCommand::ConnectToAgwpe {
-                host,
-                port,
-                callsign,
-                reply,
-            } => {
-                let result = handle_connect_to_agwpe(&mut bg, &state, &log_tx, &host, port, &callsign).await;
-                let _ = reply.send(result);
-            }
-            AgwpeCommand::DisconnectAgwpe { reply } => {
-                let result = handle_disconnect_agwpe(&mut bg, &state, &log_tx).await;
-                let _ = reply.send(result);
-            }
-            AgwpeCommand::QueryPorts { reply } => {
-                let result = handle_query_ports(&mut bg, &state, &log_tx).await;
-                let _ = reply.send(result);
-            }
-            AgwpeCommand::Ax25Connect {
-                target,
-                port_num,
-                reply,
-            } => {
-                let result = handle_ax25_connect(&mut bg, &state, &log_tx, &target, port_num).await;
-                let _ = reply.send(result);
-            }
-            AgwpeCommand::Ax25Disconnect { reply } => {
-                let result = handle_ax25_disconnect(&mut bg, &state, &log_tx).await;
-                let _ = reply.send(result);
-            }
-            AgwpeCommand::SendRequest { data, reply } => {
-                let result = handle_send_request(&mut bg, &state, &log_tx, data).await;
-                let _ = reply.send(result);
-            }
-            AgwpeCommand::SendRequestWithReconnect { data, reply } => {
-                let result = handle_send_request_with_reconnect(&mut bg, &state, &log_tx, data).await;
-                let _ = reply.send(result);
-            }
-        }
-    }
-
-    BackgroundState::push_log(
-        &state,
-        &log_tx,
-        DebugLogEntry::new(LogLevel::Info, "STATE", "Background task shutting down"),
-    );
-}
-
-async fn handle_connect_to_agwpe(
-    bg: &mut BackgroundState,
-    state: &SharedState,
-    log_tx: &broadcast::Sender<DebugLogEntry>,
-    host: &str,
-    port: u16,
-    callsign: &str,
-) -> Result<(), AgwpeError> {
-    BackgroundState::push_log(
-        state,
-        log_tx,
-        DebugLogEntry::new(
+    /// Perform the AGWPE TCP connect + callsign registration.  On success the
+    /// modem is in `AgwpeConnected`; on failure `stream` is cleared.
+    pub(crate) async fn connect_modem_internal(
+        &mut self,
+        host: &str,
+        port: u16,
+        callsign: &str,
+    ) -> Result<(), AgwpeError> {
+        self.push_log(DebugLogEntry::new(
             LogLevel::Info,
             "AGWPE",
             &format!("Connecting to AGWPE at {}:{}", host, port),
-        ),
-    );
+        ));
 
-    let stream = match TcpStream::connect(format!("{}:{}", host, port)).await {
-        Ok(s) => {
-            BackgroundState::push_log(
-                state,
-                log_tx,
-                DebugLogEntry::new(LogLevel::Info, "AGWPE", "TCP connection established"),
-            );
-            s
-        }
-        Err(e) => {
-            let msg = format!("TCP connection failed: {}", e);
-            BackgroundState::push_log(
-                state,
-                log_tx,
-                DebugLogEntry::new(LogLevel::Info, "ERROR", &msg),
-            );
-            BackgroundState::set_state(state, log_tx, ConnectionState::Error(msg.clone()));
-            return Err(AgwpeError::ConnectionFailed(msg));
-        }
-    };
+        let stream = match TcpStream::connect(format!("{}:{}", host, port)).await {
+            Ok(s) => {
+                self.push_log(DebugLogEntry::new(
+                    LogLevel::Info,
+                    "AGWPE",
+                    "TCP connection established",
+                ));
+                s
+            }
+            Err(e) => {
+                let msg = format!("TCP connection failed: {}", e);
+                self.push_log(DebugLogEntry::new(LogLevel::Info, "ERROR", &msg));
+                self.set_state(ConnectionState::Error(msg.clone()));
+                return Err(AgwpeError::ConnectionFailed(msg));
+            }
+        };
 
-    bg.stream = Some(stream);
-    bg.local_callsign = callsign.to_string();
-    bg.read_buf.clear();
+        self.stream = Some(stream);
+        self.local_callsign = callsign.to_string();
+        self.read_buf.clear();
 
-    let reg_frame = AgwpeFrame::new(
-        0,
-        FrameType::RegisterCallsign,
-        callsign,
-        "",
-        vec![],
-    );
+        let reg_frame = AgwpeFrame::new(
+            0,
+            FrameType::RegisterCallsign,
+            callsign,
+            "",
+            vec![],
+        );
 
-    BackgroundState::push_log(
-        state,
-        log_tx,
-        DebugLogEntry::new(LogLevel::Debug, "AGWPE", &format!("Sending registration for {}", callsign))
-            .with_direction(Direction::Tx),
-    );
-
-    if let Err(e) = bg.stream.as_mut().unwrap().write_all(&reg_frame.encode()).await {
-        bg.stream = None;
-        let msg = format!("Registration send failed: {}", e);
-        BackgroundState::set_state(state, log_tx, ConnectionState::Error(msg.clone()));
-        return Err(AgwpeError::RegistrationFailed(msg));
-    }
-    let _ = bg.stream.as_mut().unwrap().flush().await;
-
-    match bg.read_frame_with_timeout(5).await {
-        Ok(frame) if frame.frame_type == FrameType::RegisterCallsign && frame.data == vec![0x01] => {
-            BackgroundState::push_log(
-                state,
-                log_tx,
-                DebugLogEntry::new(LogLevel::Debug, "AGWPE", "Registration successful")
-                    .with_direction(Direction::Rx),
-            );
-            BackgroundState::set_state(state, log_tx, ConnectionState::AgwpeConnected);
-            Ok(())
-        }
-        Ok(frame) => {
-            bg.stream = None;
-            let msg = format!("Unexpected response to registration: {:?} (port={}, call_from={}, call_to={}, data={:?})", 
-                frame.frame_type, frame.port, frame.call_from, frame.call_to, frame.data);
-            BackgroundState::push_log(
-                state,
-                log_tx,
-                DebugLogEntry::new(LogLevel::Debug, "AGWPE", &msg),
-            );
-            BackgroundState::set_state(state, log_tx, ConnectionState::Error(msg.clone()));
-            Err(AgwpeError::RegistrationFailed(msg))
-        }
-        Err(e) => {
-            bg.stream = None;
-            let msg = format!("Registration timeout: {}", e);
-            BackgroundState::set_state(state, log_tx, ConnectionState::Error(msg.clone()));
-            Err(AgwpeError::RegistrationFailed(msg))
-        }
-    }
-}
-
-async fn handle_disconnect_agwpe(
-    bg: &mut BackgroundState,
-    state: &SharedState,
-    log_tx: &broadcast::Sender<DebugLogEntry>,
-) -> Result<(), AgwpeError> {
-    bg.stream = None;
-    bg.read_buf.clear();
-
-    let state_entry = {
-        let mut s = state.lock_or_poisoned();
-        s.clear_ports();
-        s.set_connection_state(ConnectionState::Disconnected)
-    };
-    let _ = log_tx.send(state_entry);
-
-    BackgroundState::push_log(
-        state,
-        log_tx,
-        DebugLogEntry::new(LogLevel::Info, "AGWPE", "Disconnected from AGWPE"),
-    );
-
-    Ok(())
-}
-
-async fn handle_query_ports(
-    bg: &mut BackgroundState,
-    state: &SharedState,
-    log_tx: &broadcast::Sender<DebugLogEntry>,
-) -> Result<(), AgwpeError> {
-    if !bg.is_connected() {
-        return Err(AgwpeError::NotConnected);
-    }
-
-    let query_frame = AgwpeFrame::new(0, FrameType::QueryPorts, &bg.local_callsign, "", vec![]);
-
-    BackgroundState::push_log(
-        state,
-        log_tx,
-        DebugLogEntry::new(LogLevel::Debug, "AGWPE", "Querying ports")
-            .with_direction(Direction::Tx),
-    );
-
-    BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &query_frame).await?;
-
-    let mut ports = Vec::new();
-
-    loop {
-        let frame = bg.read_frame_with_timeout(5).await?;
-
-        BackgroundState::push_log(
-            state,
-            log_tx,
+        self.push_log(
             DebugLogEntry::new(
                 LogLevel::Debug,
                 "AGWPE",
-                &format!("Port query response: frame_type={:?}, data_len={}, data={:?}", 
-                    frame.frame_type, frame.data_len, frame.data),
+                &format!("Sending registration for {}", callsign),
             )
-            .with_direction(Direction::Rx),
+            .with_direction(Direction::Tx),
         );
 
-        // Port info response can be either 'G' (0x47) or 'g' (0x67) depending on implementation
-        if frame.frame_type == FrameType::QueryPorts || frame.frame_type == FrameType::PortInfo {
-            if frame.data_len == 0 {
-                break;
+        if let Err(e) = self.stream.as_mut().unwrap().write_all(&reg_frame.encode()).await {
+            self.stream = None;
+            let msg = format!("Registration send failed: {}", e);
+            self.set_state(ConnectionState::Error(msg.clone()));
+            return Err(AgwpeError::RegistrationFailed(msg));
+        }
+        let _ = self.stream.as_mut().unwrap().flush().await;
+
+        match self.read_frame_with_timeout(5).await {
+            Ok(frame) if frame.frame_type == FrameType::RegisterCallsign && frame.data == vec![0x01] => {
+                self.push_log(
+                    DebugLogEntry::new(LogLevel::Debug, "AGWPE", "Registration successful")
+                        .with_direction(Direction::Rx),
+                );
+                self.set_state(ConnectionState::AgwpeConnected);
+                Ok(())
             }
-            if !frame.data.is_empty() {
-                // Parse format: "count;name1;name2;...;"
-                let data_str = String::from_utf8_lossy(&frame.data);
-                let data_str = data_str.trim_end_matches('\0');
-                let parts: Vec<&str> = data_str.split(';').collect();
-                
-                if parts.len() >= 2 {
-                    // First part is count, rest are port names
-                    if let Ok(_count) = parts[0].parse::<usize>() {
-                        for (i, name) in parts[1..].iter().enumerate() {
-                            if !name.is_empty() {
-                                BackgroundState::push_log(
-                                    state,
-                                    log_tx,
-                                    DebugLogEntry::new(
-                                        LogLevel::Debug,
-                                        "AGWPE",
-                                        &format!("Port {}: {}", i, name),
-                                    )
-                                    .with_direction(Direction::Rx),
-                                );
-                                ports.push(PortInfo {
-                                    port_num: i as u8,
-                                    description: name.to_string(),
-                                });
+            Ok(frame) => {
+                self.stream = None;
+                let msg = format!(
+                    "Unexpected response to registration: {:?} (port={}, call_from={}, call_to={}, data={:?})",
+                    frame.frame_type, frame.port, frame.call_from, frame.call_to, frame.data
+                );
+                self.push_log(DebugLogEntry::new(LogLevel::Debug, "AGWPE", &msg));
+                self.set_state(ConnectionState::Error(msg.clone()));
+                Err(AgwpeError::RegistrationFailed(msg))
+            }
+            Err(e) => {
+                self.stream = None;
+                let msg = format!("Registration timeout: {}", e);
+                self.set_state(ConnectionState::Error(msg.clone()));
+                Err(AgwpeError::RegistrationFailed(msg))
+            }
+        }
+    }
+
+    /// Send the AGWPE-P Query-Ports frame and populate SharedState with the
+    /// returned port list.  Requires the modem to be connected.
+    pub(crate) async fn query_ports_internal(&mut self) -> Result<(), AgwpeError> {
+        if !self.is_connected() {
+            return Err(AgwpeError::NotConnected);
+        }
+
+        let query_frame = AgwpeFrame::new(0, FrameType::QueryPorts, &self.local_callsign, "", vec![]);
+
+        self.push_log(
+            DebugLogEntry::new(LogLevel::Debug, "AGWPE", "Querying ports")
+                .with_direction(Direction::Tx),
+        );
+
+        self.send_frame_internal(&query_frame).await?;
+
+        let mut ports = Vec::new();
+
+        loop {
+            let frame = self.read_frame_with_timeout(5).await?;
+
+            self.push_log(
+                DebugLogEntry::new(
+                    LogLevel::Debug,
+                    "AGWPE",
+                    &format!(
+                        "Port query response: frame_type={:?}, data_len={}, data={:?}",
+                        frame.frame_type, frame.data_len, frame.data
+                    ),
+                )
+                .with_direction(Direction::Rx),
+            );
+
+            if frame.frame_type == FrameType::QueryPorts || frame.frame_type == FrameType::PortInfo {
+                if frame.data_len == 0 {
+                    break;
+                }
+                if !frame.data.is_empty() {
+                    let data_str = String::from_utf8_lossy(&frame.data);
+                    let data_str = data_str.trim_end_matches('\0');
+                    let parts: Vec<&str> = data_str.split(';').collect();
+
+                    if parts.len() >= 2 {
+                        if let Ok(_count) = parts[0].parse::<usize>() {
+                            for (i, name) in parts[1..].iter().enumerate() {
+                                if !name.is_empty() {
+                                    self.push_log(
+                                        DebugLogEntry::new(
+                                            LogLevel::Debug,
+                                            "AGWPE",
+                                            &format!("Port {}: {}", i, name),
+                                        )
+                                        .with_direction(Direction::Rx),
+                                    );
+                                    ports.push(PortInfo {
+                                        port_num: i as u8,
+                                        description: name.to_string(),
+                                    });
+                                }
                             }
                         }
                     }
                 }
+                break;
             }
-            // After receiving port info, we're done
-            break;
         }
-    }
 
-    BackgroundState::push_log(
-        state,
-        log_tx,
-        DebugLogEntry::new(
+        self.push_log(DebugLogEntry::new(
             LogLevel::Info,
             "AGWPE",
             &format!("Discovered {} port(s)", ports.len()),
-        ),
-    );
-
-    {
-        let mut s = state.lock_or_poisoned();
-        s.set_ports(ports);
-    }
-
-    Ok(())
-}
-
-/// Send the BPQ application command (e.g. "WEB\n") over the current AX.25
-/// session.  Called only when `skip_bpq_app` is false.
-async fn bpq_send_app_command(
-    bg: &mut BackgroundState,
-    state: &SharedState,
-    log_tx: &broadcast::Sender<DebugLogEntry>,
-) -> Result<(), AgwpeError> {
-    let bpq_command = {
-        let s = state.lock_or_poisoned();
-        s.config.bpq_command.clone()
-    };
-
-    BackgroundState::push_log(
-        state,
-        log_tx,
-        DebugLogEntry::new(
-            LogLevel::Info,
-            "BPQ",
-            &format!("Starting BPQ handshake with command: {}", bpq_command),
-        ),
-    );
-
-    let cmd_data = format!("{}\n", bpq_command);
-
-    BackgroundState::push_log(
-        state,
-        log_tx,
-        DebugLogEntry::new(LogLevel::Debug, "BPQ", &format!("Sending BPQ command: {:?}", cmd_data))
-            .with_direction(Direction::Tx),
-    );
-
-    let cmd_frame = AgwpeFrame::new(
-        bg.agwpe_port,
-        FrameType::SendData,
-        &bg.local_callsign,
-        &bg.remote_callsign,
-        cmd_data.into_bytes(),
-    );
-
-    BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &cmd_frame).await?;
-    tracing::trace!("[BPQ] Sent BPQ command frame");
-    Ok(())
-}
-
-/// Wait for the server's callsign prompt and send our local callsign in
-/// response.  The prompt is identified by the presence of the word "callsign"
-/// (or "AGREE", which some deployments include in the same banner line).
-async fn bpq_await_callsign_prompt_and_send_callsign(
-    bg: &mut BackgroundState,
-    state: &SharedState,
-    log_tx: &broadcast::Sender<DebugLogEntry>,
-) -> Result<(), AgwpeError> {
-    let callsign = bg.local_callsign.clone();
-
-    // The far side (packet-browser-server, via LinBPQ HOST 0) does NOT
-    // auto-inject the callsign in this deployment — LinBPQ opens the TCP
-    // bridge silently and waits for actual data to flow. The server prompts
-    // for the callsign, and we send ours in response. Match the prompt on
-    // "callsign" (or "AGREE", which some pre-existing setups fold into a
-    // single banner) and send once we see it.
-    let mut received_text = String::new();
-    let mut callsign_prompt_found = false;
-
-    BackgroundState::push_log(
-        state,
-        log_tx,
-        DebugLogEntry::new(LogLevel::Debug, "BPQ", "Waiting for callsign prompt...")
-            .with_direction(Direction::Rx),
-    );
-    tracing::trace!("[BPQ] Waiting for callsign prompt...");
-
-    loop {
-        let frame = bg.read_frame_with_timeout(30).await?;
-        tracing::trace!(
-            "[BPQ] Received frame type {:?} (0x{:02X}), data_len={}, data={:?}",
-            frame.frame_type,
-            frame.frame_type as u8,
-            frame.data_len,
-            String::from_utf8_lossy(&frame.data[..frame.data_len.min(100) as usize])
-        );
-
-        match frame.frame_type {
-            FrameType::Disconnect | FrameType::SendData => {
-                let text = String::from_utf8_lossy(&frame.data).to_string();
-                if received_text.len() + text.len() > MAX_HANDSHAKE_TEXT {
-                    return Err(AgwpeError::ConnectionFailed(
-                        "Handshake text exceeded maximum size".to_string(),
-                    ));
-                }
-                received_text.push_str(&text);
-                if received_text.contains("callsign") || received_text.contains("AGREE") {
-                    callsign_prompt_found = true;
-                    break;
-                }
-            }
-            FrameType::ConnectionRejected => {
-                return Err(AgwpeError::ConnectionFailed(
-                    "Connection rejected during BPQ handshake".to_string(),
-                ));
-            }
-            _ => {
-                BackgroundState::push_log(
-                    state,
-                    log_tx,
-                    DebugLogEntry::new(
-                        LogLevel::Debug,
-                        "BPQ",
-                        &format!("Ignoring frame during handshake: {:?}", frame.frame_type),
-                    ),
-                );
-            }
-        }
-    }
-
-    if !callsign_prompt_found {
-        return Err(AgwpeError::ConnectionFailed(
-            "Callsign prompt not received".to_string(),
         ));
-    }
 
-    // Send our callsign.
-    let call_data = format!("{}\n", callsign);
-    BackgroundState::push_log(
-        state,
-        log_tx,
-        DebugLogEntry::new(LogLevel::Debug, "BPQ", &format!("Sending callsign: {:?}", call_data))
-            .with_direction(Direction::Tx),
-    );
-    let call_frame = AgwpeFrame::new(
-        bg.agwpe_port,
-        FrameType::SendData,
-        &bg.local_callsign,
-        &bg.remote_callsign,
-        call_data.into_bytes(),
-    );
-    BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &call_frame).await?;
-    tracing::trace!("[BPQ] Sent callsign frame");
-    Ok(())
-}
-
-/// Wait for the server's logging-disclaimer / AGREE prompt and return the raw
-/// disclaimer text (byte-for-byte, no trim or normalisation).  The caller
-/// decides what to do with it — either surface it for operator consent or
-/// compare it against a stored value for auto-consent.
-async fn bpq_await_disclaimer(
-    bg: &mut BackgroundState,
-    state: &SharedState,
-    log_tx: &broadcast::Sender<DebugLogEntry>,
-) -> Result<String, AgwpeError> {
-    let mut received_text = String::new();
-    let mut agree_prompt_found = false;
-
-    BackgroundState::push_log(
-        state,
-        log_tx,
-        DebugLogEntry::new(LogLevel::Debug, "BPQ", "Waiting for AGREE prompt...")
-            .with_direction(Direction::Rx),
-    );
-    tracing::trace!("[BPQ] Waiting for AGREE prompt...");
-
-    loop {
-        let frame = bg.read_frame_with_timeout(30).await?;
-
-        tracing::trace!("[BPQ] Received frame type {:?} (0x{:02X}), data_len={}, data={:?}",
-            frame.frame_type, frame.frame_type as u8, frame.data_len,
-            String::from_utf8_lossy(&frame.data[..frame.data_len.min(100) as usize]));
-
-        match frame.frame_type {
-            // Direwolf reports received data with frame type 'D' (0x44) — the
-            // same byte we use to send data — so we accept both here.
-            FrameType::Disconnect | FrameType::SendData => {
-                let text = String::from_utf8_lossy(&frame.data).to_string();
-                if received_text.len() + text.len() > MAX_HANDSHAKE_TEXT {
-                    return Err(AgwpeError::ConnectionFailed(
-                        "Handshake text exceeded maximum size".to_string(),
-                    ));
-                }
-                received_text.push_str(&text);
-
-                BackgroundState::push_log(
-                    state,
-                    log_tx,
-                    DebugLogEntry::new(
-                        LogLevel::Trace,
-                        "BPQ",
-                        &format!("Received text: {:?}", text),
-                    )
-                    .with_direction(Direction::Rx),
-                );
-
-                if received_text.to_uppercase().contains("AGREE") {
-                    agree_prompt_found = true;
-                    break;
-                }
-            }
-            FrameType::ConnectionRejected => {
-                return Err(AgwpeError::ConnectionFailed(
-                    "Connection rejected during BPQ handshake".to_string(),
-                ));
-            }
-            _ => {
-                BackgroundState::push_log(
-                    state,
-                    log_tx,
-                    DebugLogEntry::new(
-                        LogLevel::Debug,
-                        "BPQ",
-                        &format!("Ignoring frame during handshake: {:?}", frame.frame_type),
-                    ),
-                );
-            }
-        }
-    }
-
-    if !agree_prompt_found {
-        return Err(AgwpeError::ConnectionFailed(
-            "AGREE prompt not received".to_string(),
-        ));
-    }
-
-    Ok(received_text)
-}
-
-async fn perform_bpq_handshake(
-    bg: &mut BackgroundState,
-    state: &SharedState,
-    log_tx: &broadcast::Sender<DebugLogEntry>,
-) -> Result<(), AgwpeError> {
-    let skip_bpq_app = {
-        let s = state.lock_or_poisoned();
-        s.config.skip_bpq_app
-    };
-
-    if skip_bpq_app {
-        BackgroundState::push_log(
-            state,
-            log_tx,
-            DebugLogEntry::new(
-                LogLevel::Info,
-                "BPQ",
-                "Skipping BPQ application command (direct connection mode)",
-            ),
-        );
-    } else {
-        bpq_send_app_command(bg, state, log_tx).await?;
-    }
-
-    bpq_await_callsign_prompt_and_send_callsign(bg, state, log_tx).await?;
-
-    let received_text = bpq_await_disclaimer(bg, state, log_tx).await?;
-
-    // Park the handshake in `AwaitingConsent` and hand the disclaimer to the
-    // UI. We do not send "AGREE\n" until the operator explicitly clicks
-    // through /api/consent. This is the real consent step — auto-sending
-    // "AGREE" from code would sign a logging disclaimer no human ever saw.
-    let (consent_tx, consent_rx) = oneshot::channel::<bool>();
-    let state_entry = {
-        let mut s = state.lock_or_poisoned();
-        s.pending_consent = Some(consent_tx);
-        s.set_connection_state(ConnectionState::AwaitingConsent {
-            disclaimer: received_text.clone(),
-        })
-    };
-    // Broadcast the STATE transition so the browser's SSE listener flips the
-    // UI into "Awaiting consent" and opens the consent modal. Without this
-    // the handshake blocks on `consent_rx` with no way for the operator to
-    // reply.
-    let _ = log_tx.send(state_entry);
-    let _ = log_tx.send(DebugLogEntry::new(
-        LogLevel::Info,
-        "BPQ",
-        "Waiting for operator consent",
-    ));
-    tracing::trace!("[BPQ] Waiting for operator consent");
-
-    // Long timeout so a user who wanders off doesn't wedge the handshake
-    // forever, but generous enough for a real consent read.
-    let accepted = match tokio::time::timeout(
-        std::time::Duration::from_secs(300),
-        consent_rx,
-    )
-    .await
-    {
-        Ok(Ok(accepted)) => accepted,
-        // Sender dropped (e.g. new connect started, or explicit disconnect).
-        Ok(Err(_)) => false,
-        Err(_) => {
-            // Best-effort: clear the pending slot so a stale sender doesn't
-            // linger and mislead a later /api/consent call.
+        if let Some(state) = &self.state {
             let mut s = state.lock_or_poisoned();
-            s.pending_consent = None;
-            return Err(AgwpeError::ConnectionFailed(
-                "Consent timeout: operator did not respond".to_string(),
-            ));
+            s.set_ports(ports);
         }
-    };
 
-    if !accepted {
-        return Err(AgwpeError::ConnectionFailed(
-            "Operator declined the logging disclaimer".to_string(),
-        ));
+        Ok(())
     }
 
-    // Consent granted — now send "AGREE\n".
-    let agree_data = b"AGREE\n".to_vec();
-    let agree_frame = AgwpeFrame::new(
-        bg.agwpe_port,
-        FrameType::SendData,
-        &bg.local_callsign,
-        &bg.remote_callsign,
-        agree_data,
-    );
+    // Send an AGWPE-P 'd' (0x64) Disconnect and wait briefly for the peer's
+    // "*** DISCONNECTED FROM ..." confirmation frame so the AX.25 link tears
+    // down cleanly.  Without this, LinBPQ keeps the layer-2 link up and treats
+    // a subsequent Connect as a sequence-number reset on the *existing*
+    // session — so it never spawns a fresh application instance and any
+    // reconnect attempt hangs waiting for a callsign prompt that will never
+    // come.  A missing confirmation must not stall the caller, so the drain
+    // has a hard 3s deadline.
+    pub(crate) async fn send_disconnect_and_drain(&mut self) {
+        let disc = AgwpeFrame::new(
+            self.agwpe_port,
+            FrameType::Disconnect,
+            &self.local_callsign,
+            &self.remote_callsign,
+            Vec::new(),
+        );
+        self.push_log(
+            DebugLogEntry::new(LogLevel::Info, "PROTOCOL", "AX.25 disconnect (AGWPE 'd')")
+                .with_direction(Direction::Tx),
+        );
+        if self.stream.is_none() {
+            return;
+        }
+        let _ = self.send_frame_internal(&disc).await;
 
-    BackgroundState::push_log(
-        state,
-        log_tx,
-        DebugLogEntry::new(LogLevel::Debug, "BPQ", "Sending AGREE")
-            .with_direction(Direction::Tx),
-    );
-
-    BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &agree_frame).await?;
-
-    BackgroundState::push_log(
-        state,
-        log_tx,
-        DebugLogEntry::new(LogLevel::Info, "BPQ", "BPQ handshake completed successfully"),
-    );
-
-    Ok(())
-}
-
-/// Send an AX.25 Connect frame and loop until the peer acknowledges the
-/// connection (either via a `Connected` frame or LinBPQ's `Connect` + `***
-/// CONNECTED` banner).  On success `bg.remote_callsign` and `bg.agwpe_port`
-/// are already set by the caller (`handle_ax25_connect`) or were preserved
-/// from the previous session (`handle_reconnect`).
-async fn ax25_open_and_await_connected(
-    bg: &mut BackgroundState,
-    state: &SharedState,
-    log_tx: &broadcast::Sender<DebugLogEntry>,
-) -> Result<(), AgwpeError> {
-    let target = bg.remote_callsign.clone();
-    let port_num = bg.agwpe_port;
-
-    let connect_frame = AgwpeFrame::new(
-        port_num,
-        FrameType::Connect,
-        &bg.local_callsign,
-        &target,
-        vec![],
-    );
-
-    BackgroundState::push_log(
-        state,
-        log_tx,
-        DebugLogEntry::new(
-            LogLevel::Info,
-            "PROTOCOL",
-            &format!("AX.25 connect to {} on port {}", target, port_num),
-        )
-        .with_direction(Direction::Tx),
-    );
-
-    BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &connect_frame).await?;
-
-    loop {
-        let frame = bg.read_frame_with_timeout(30).await?;
-
-        tracing::trace!("[AGWPE] AX.25 connect: received frame type {:?} (0x{:02X}), data_len={}, data={:?}",
-            frame.frame_type, frame.frame_type as u8, frame.data_len,
-            String::from_utf8_lossy(&frame.data[..frame.data_len.min(50) as usize]));
-
-        match frame.frame_type {
-            FrameType::Connected => {
-                BackgroundState::push_log(
-                    state,
-                    log_tx,
-                    DebugLogEntry::new(
-                        LogLevel::Info,
-                        "PROTOCOL",
-                        &format!("AX.25 connected to {}", target),
-                    )
-                    .with_direction(Direction::Rx),
-                );
-                return Ok(());
-            }
-            // LinBPQ sends 0x43 ('C') for both connect request AND connected notification.
-            // Check if this is actually a connected notification by looking at the data.
-            FrameType::Connect if frame.data.starts_with(b"***") => {
-                let text = String::from_utf8_lossy(&frame.data);
-                if text.contains("CONNECTED") {
-                    BackgroundState::push_log(
-                        state,
-                        log_tx,
-                        DebugLogEntry::new(
-                            LogLevel::Info,
-                            "PROTOCOL",
-                            &format!("AX.25 connected to {} (LinBPQ style)", target),
-                        )
-                        .with_direction(Direction::Rx),
-                    );
-                    return Ok(());
-                } else {
-                    BackgroundState::push_log(
-                        state,
-                        log_tx,
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            match tokio::time::timeout_at(deadline, self.read_frame_from_stream()).await {
+                Ok(Ok(frame)) if matches!(frame.frame_type, FrameType::Disconnect) => {
+                    self.push_log(
                         DebugLogEntry::new(
                             LogLevel::Debug,
                             "PROTOCOL",
-                            &format!("Ignoring frame while connecting: {:?}", frame.frame_type),
-                        ),
-                    );
-                }
-            }
-            FrameType::ConnectionRejected => {
-                let msg = format!("AX.25 connection to {} rejected", target);
-                BackgroundState::push_log(
-                    state,
-                    log_tx,
-                    DebugLogEntry::new(LogLevel::Info, "ERROR", &msg)
-                        .with_direction(Direction::Rx),
-                );
-                return Err(AgwpeError::ConnectionFailed(msg));
-            }
-            _ => {
-                BackgroundState::push_log(
-                    state,
-                    log_tx,
-                    DebugLogEntry::new(
-                        LogLevel::Debug,
-                        "PROTOCOL",
-                        &format!("Ignoring frame while connecting: {:?}", frame.frame_type),
-                    ),
-                );
-            }
-        }
-    }
-}
-
-async fn handle_ax25_connect(
-    bg: &mut BackgroundState,
-    state: &SharedState,
-    log_tx: &broadcast::Sender<DebugLogEntry>,
-    target: &str,
-    port_num: u8,
-) -> Result<(), AgwpeError> {
-    bg.abort_reconnect.store(false, Ordering::SeqCst);
-
-    if !bg.is_connected() {
-        return Err(AgwpeError::NotConnected);
-    }
-
-    bg.remote_callsign = target.to_string();
-    bg.agwpe_port = port_num;
-
-    let state_entry = {
-        let mut s = state.lock_or_poisoned();
-        let entry = s.set_connection_state(ConnectionState::Connecting);
-        s.set_agwpe_port(port_num);
-        entry
-    };
-    let _ = log_tx.send(state_entry);
-
-    // Update stored target so subsequent reconnects know where to aim.
-    {
-        let mut s = state.lock_or_poisoned();
-        s.config.update_target(target);
-    }
-
-    ax25_open_and_await_connected(bg, state, log_tx).await?;
-
-    // Perform BPQ handshake
-    match perform_bpq_handshake(bg, state, log_tx).await {
-        Ok(()) => {
-            BackgroundState::set_state(state, log_tx, ConnectionState::Connected);
-            Ok(())
-        }
-        Err(e) => {
-            let msg = format!("BPQ handshake failed: {}", e);
-            BackgroundState::push_log(
-                state,
-                log_tx,
-                DebugLogEntry::new(LogLevel::Info, "ERROR", &msg),
-            );
-            BackgroundState::set_state(state, log_tx, ConnectionState::Error(msg.clone()));
-            Err(AgwpeError::ConnectionFailed(msg))
-        }
-    }
-}
-
-async fn handle_ax25_disconnect(
-    bg: &mut BackgroundState,
-    state: &SharedState,
-    log_tx: &broadcast::Sender<DebugLogEntry>,
-) -> Result<(), AgwpeError> {
-    bg.abort_reconnect.store(true, Ordering::SeqCst);
-
-    if !bg.is_connected() {
-        return Err(AgwpeError::NotConnected);
-    }
-
-    send_agwpe_disconnect_and_drain(bg, state, log_tx).await;
-
-    BackgroundState::set_state(state, log_tx, ConnectionState::AgwpeConnected);
-
-    Ok(())
-}
-
-// Send an AGWPE-P 'd' (0x64) Disconnect and wait briefly for the peer's
-// "*** DISCONNECTED FROM ..." confirmation frame so the AX.25 link tears
-// down cleanly.  Without this, LinBPQ keeps the layer-2 link up and treats
-// a subsequent Connect as a sequence-number reset on the *existing*
-// session — so it never spawns a fresh application instance and any
-// reconnect attempt hangs waiting for a callsign prompt that will never
-// come.  A missing confirmation must not stall the caller, so the drain
-// has a hard 3s deadline.
-async fn send_agwpe_disconnect_and_drain(
-    bg: &mut BackgroundState,
-    state: &SharedState,
-    log_tx: &broadcast::Sender<DebugLogEntry>,
-) {
-    let disc = AgwpeFrame::new(
-        bg.agwpe_port,
-        FrameType::Disconnect,
-        &bg.local_callsign,
-        &bg.remote_callsign,
-        Vec::new(),
-    );
-    BackgroundState::push_log(
-        state,
-        log_tx,
-        DebugLogEntry::new(LogLevel::Info, "PROTOCOL", "AX.25 disconnect (AGWPE 'd')")
-            .with_direction(Direction::Tx),
-    );
-    if let Some(stream) = bg.stream.as_mut() {
-        let _ = BackgroundState::send_frame(stream, &disc).await;
-    } else {
-        return;
-    }
-
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-    loop {
-        match tokio::time::timeout_at(deadline, bg.read_frame_from_stream()).await {
-            Ok(Ok(frame)) if matches!(frame.frame_type, FrameType::Disconnect) => {
-                BackgroundState::push_log(
-                    state,
-                    log_tx,
-                    DebugLogEntry::new(
-                        LogLevel::Debug,
-                        "PROTOCOL",
-                        "Received AX.25 disconnect confirmation",
-                    )
-                    .with_direction(Direction::Rx),
-                );
-                break;
-            }
-            // Any other frame is stale in-flight traffic from the dying
-            // session — discard and keep draining until the confirmation
-            // or the deadline.
-            Ok(Ok(_)) => continue,
-            _ => break,
-        }
-    }
-}
-
-/// Detects control-plane text that signals the AX.25 session is dead.
-///
-/// Different node stacks emit different tear-down text:
-///   Direwolf / AGWPE convention: `*** DISCONNECTED FROM Station <call>`
-///   LinBPQ WEB-app exit:         `Returned to Node <alias>:<call>`
-///
-/// The markers may arrive in the first frame OR appear mid-buffer after a
-/// prior in-flight response has already accumulated bytes, so we scan the
-/// whole accumulated buffer, not just its prefix. False positives inside a
-/// legitimate RESP body are impossible because the payload is base64
-/// (`[A-Za-z0-9+/=]`) and can't contain spaces or asterisks.
-fn is_session_dead_payload(data: &[u8]) -> bool {
-    contains_slice(data, b"*** DISCONNECTED") || contains_slice(data, b"Returned to Node")
-}
-
-fn contains_slice(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return false;
-    }
-    haystack.windows(needle.len()).any(|w| w == needle)
-}
-
-/// Returns `true` iff `server_text` is byte-for-byte equal to the stored
-/// disclaimer. `None` stored means we have never seen a consent, so we always
-/// return `false` — the operator must consent explicitly.
-fn matches_stored_disclaimer(server_text: &str, stored: Option<&str>) -> bool {
-    match stored {
-        Some(s) => s == server_text,
-        None => false,
-    }
-}
-
-/// Re-run the full AX.25 + BPQ + AGREE handshake for a session that died
-/// unexpectedly.  Transitions to `Reconnecting` at entry and `Connected` on
-/// successful auto-consent.  Returns `Err(NeedsReconsent)` when the server's
-/// disclaimer text differs from the stored consent, leaving the state as
-/// `AwaitingConsent` so the UI can open the consent modal on the operator's
-/// next visit.
-async fn handle_reconnect(
-    bg: &mut BackgroundState,
-    state: &SharedState,
-    log_tx: &broadcast::Sender<DebugLogEntry>,
-    reason: String,
-) -> Result<(), AgwpeError> {
-    BackgroundState::set_state(
-        state,
-        log_tx,
-        ConnectionState::Reconnecting { reason: reason.clone() },
-    );
-    BackgroundState::push_log(
-        state,
-        log_tx,
-        DebugLogEntry::new(
-            LogLevel::Info,
-            "PROTOCOL",
-            &format!("Session lost ({}); attempting reconnect", reason),
-        ),
-    );
-
-    // Tear down the AX.25 link on our side before re-opening so the peer
-    // (e.g. LinBPQ) actually closes the dead application session and will
-    // spawn a fresh one on our next Connect.  See
-    // `send_agwpe_disconnect_and_drain` for why an empty SendData frame is
-    // insufficient.
-    if bg.stream.is_some() {
-        send_agwpe_disconnect_and_drain(bg, state, log_tx).await;
-    }
-
-    // Snapshot AGWPE endpoint + our callsign before we drop the socket so
-    // we can reopen with the same identity below.
-    let (agwpe_host, agwpe_tcp_port, callsign) = {
-        let s = state.lock_or_poisoned();
-        (
-            s.config.agwpe_host.clone(),
-            s.config.agwpe_port,
-            bg.local_callsign.clone(),
-        )
-    };
-
-    // Drop and re-establish the AGWPE TCP session.  Direwolf's AX.25 reader
-    // thread can freeze when the PipeWire audio pipeline stalls — observed
-    // as "Received frame queue is out of control. Length=N. Reader thread
-    // is probably frozen" in direwolf.log — after which Direwolf silently
-    // drops all subsequent AGWPE frames from us, including Connect.  A
-    // fresh TCP session forces Direwolf to reset the per-client state on
-    // our side of the pipe; combined with the proper AX.25 Disconnect we
-    // just drained, this is the strongest recovery the client can do
-    // without operator intervention.  If Direwolf's audio-side is still
-    // stuck, the subsequent Connect will time out and surface a clean
-    // Error via the outer catch below.
-    bg.stream = None;
-    bg.read_buf.clear();
-
-    // Run the full handshake in an inner block so we can intercept any error
-    // and transition to Error state before returning.  The NeedsReconsent path
-    // is the only exit that must NOT transition to Error — it sets
-    // AwaitingConsent explicitly and is handled via a dedicated early-return
-    // above the inner block.
-    let result: Result<(), AgwpeError> = async {
-        handle_connect_to_agwpe(bg, state, log_tx, &agwpe_host, agwpe_tcp_port, &callsign).await?;
-        // handle_connect_to_agwpe flips state to AgwpeConnected on success;
-        // put us back in Reconnecting so the UI doesn't flicker while we
-        // drive the rest of the handshake.
-        BackgroundState::set_state(
-            state,
-            log_tx,
-            ConnectionState::Reconnecting { reason: reason.clone() },
-        );
-        if bg.abort_reconnect.load(Ordering::SeqCst) {
-            return Err(AgwpeError::DisconnectedByOperator);
-        }
-
-        // Re-run the AX.25 handshake using the same helpers as handle_ax25_connect.
-        ax25_open_and_await_connected(bg, state, log_tx).await?;
-        if bg.abort_reconnect.load(Ordering::SeqCst) {
-            return Err(AgwpeError::DisconnectedByOperator);
-        }
-
-        let skip_bpq_app = {
-            let s = state.lock_or_poisoned();
-            s.config.skip_bpq_app
-        };
-        if !skip_bpq_app {
-            bpq_send_app_command(bg, state, log_tx).await?;
-            if bg.abort_reconnect.load(Ordering::SeqCst) {
-                return Err(AgwpeError::DisconnectedByOperator);
-            }
-        } else {
-            BackgroundState::push_log(
-                state,
-                log_tx,
-                DebugLogEntry::new(
-                    LogLevel::Info,
-                    "BPQ",
-                    "Skipping BPQ application command (direct connection mode)",
-                ),
-            );
-        }
-        bpq_await_callsign_prompt_and_send_callsign(bg, state, log_tx).await?;
-        if bg.abort_reconnect.load(Ordering::SeqCst) {
-            return Err(AgwpeError::DisconnectedByOperator);
-        }
-        let disclaimer = bpq_await_disclaimer(bg, state, log_tx).await?;
-        if bg.abort_reconnect.load(Ordering::SeqCst) {
-            return Err(AgwpeError::DisconnectedByOperator);
-        }
-
-        // Auto-consent check — exact-string equality only.
-        let stored = {
-            let s = state.lock_or_poisoned();
-            s.last_agreed_disclaimer.clone()
-        };
-        if !matches_stored_disclaimer(&disclaimer, stored.as_deref()) {
-            BackgroundState::push_log(
-                state,
-                log_tx,
-                DebugLogEntry::new(
-                    LogLevel::Info,
-                    "PROTOCOL",
-                    "Server disclaimer differs from stored consent; re-consent required",
-                ),
-            );
-            BackgroundState::set_state(
-                state,
-                log_tx,
-                ConnectionState::AwaitingConsent { disclaimer },
-            );
-            return Err(AgwpeError::NeedsReconsent);
-        }
-
-        // Disclaimer matches — send AGREE on the wire so the server logs it.
-        // Disclaimer suppression is purely UI; the wire protocol always requires AGREE.
-        if bg.abort_reconnect.load(Ordering::SeqCst) {
-            return Err(AgwpeError::DisconnectedByOperator);
-        }
-        let agree_frame = AgwpeFrame::new(
-            bg.agwpe_port,
-            FrameType::SendData,
-            &bg.local_callsign,
-            &bg.remote_callsign,
-            b"AGREE\n".to_vec(),
-        );
-        BackgroundState::push_log(
-            state,
-            log_tx,
-            DebugLogEntry::new(LogLevel::Info, "BPQ", "Auto-sending AGREE (matches stored consent)")
-                .with_direction(Direction::Tx),
-        );
-        BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &agree_frame).await?;
-
-        BackgroundState::set_state(state, log_tx, ConnectionState::Connected);
-        BackgroundState::push_log(
-            state,
-            log_tx,
-            DebugLogEntry::new(LogLevel::Info, "PROTOCOL", "Reconnect successful"),
-        );
-        Ok(())
-    }
-    .await;
-
-    match result {
-        Ok(()) => Ok(()),
-        // NeedsReconsent already transitioned to AwaitingConsent — pass through.
-        Err(AgwpeError::NeedsReconsent) => Err(AgwpeError::NeedsReconsent),
-        // Any other error: transition to Error state so the UI shows a failure
-        // instead of a spinner stuck on Reconnecting.
-        Err(e) => {
-            let msg = format!("Reconnect failed: {}", e);
-            BackgroundState::push_log(
-                state,
-                log_tx,
-                DebugLogEntry::new(LogLevel::Info, "ERROR", &msg),
-            );
-            BackgroundState::set_state(state, log_tx, ConnectionState::Error(msg));
-            Err(e)
-        }
-    }
-}
-
-async fn handle_send_request(
-    bg: &mut BackgroundState,
-    state: &SharedState,
-    log_tx: &broadcast::Sender<DebugLogEntry>,
-    data: Vec<u8>,
-) -> Result<Vec<u8>, AgwpeError> {
-    if !bg.is_connected() {
-        return Err(AgwpeError::NotConnected);
-    }
-
-    let chunk_size = 256;
-
-    BackgroundState::push_log(
-        state,
-        log_tx,
-        DebugLogEntry::new(
-            LogLevel::Debug,
-            "PROTOCOL",
-            &format!("Sending {} bytes in {} byte chunks", data.len(), chunk_size),
-        )
-        .with_direction(Direction::Tx),
-    );
-
-    for (i, chunk) in data.chunks(chunk_size).enumerate() {
-        let frame = AgwpeFrame::new(
-            bg.agwpe_port,
-            FrameType::SendData,
-            &bg.local_callsign,
-            &bg.remote_callsign,
-            chunk.to_vec(),
-        );
-
-        BackgroundState::push_log(
-            state,
-            log_tx,
-            DebugLogEntry::new(
-                LogLevel::Trace,
-                "PROTOCOL",
-                &format!("Chunk {}/{}: {} bytes", i + 1, (data.len() + chunk_size - 1) / chunk_size, chunk.len()),
-            )
-            .with_direction(Direction::Tx),
-        );
-
-        BackgroundState::send_frame(bg.stream.as_mut().unwrap(), &frame).await?;
-    }
-
-    let mut response_data = Vec::new();
-    let mut expected_len: Option<u32> = None;
-    let mut frame_start: usize = 0;
-
-    BackgroundState::push_log(
-        state,
-        log_tx,
-        DebugLogEntry::new(LogLevel::Debug, "PROTOCOL", "Waiting for response...")
-            .with_direction(Direction::Rx),
-    );
-
-    let timeout_secs = bg.response_timeout_secs;
-    loop {
-        let frame = match bg.read_frame_with_timeout(timeout_secs).await {
-            Ok(f) => f,
-            Err(AgwpeError::Timeout) => {
-                BackgroundState::push_log(
-                    state,
-                    log_tx,
-                    DebugLogEntry::new(
-                        LogLevel::Info,
-                        "PROTOCOL",
-                        &format!("Response timed out after {}s — treating as SessionDied", timeout_secs),
-                    )
-                    .with_direction(Direction::Rx),
-                );
-                return Err(AgwpeError::SessionDied {
-                    reason: format!("no response after {}s", timeout_secs),
-                });
-            }
-            Err(e) => return Err(e),
-        };
-
-        match frame.frame_type {
-            // Direwolf reports received data with frame type 'D' (0x44) — the
-            // same byte we use to send data — so we accept both here.
-            FrameType::Disconnect | FrameType::SendData => {
-                if response_data.len() + frame.data.len() > MAX_RESPONSE_SIZE {
-                    return Err(AgwpeError::InvalidFrame(format!(
-                        "Response exceeded maximum size of {} bytes",
-                        MAX_RESPONSE_SIZE
-                    )));
-                }
-                response_data.extend_from_slice(&frame.data);
-
-                if is_session_dead_payload(&response_data) {
-                    BackgroundState::push_log(
-                        state,
-                        log_tx,
-                        DebugLogEntry::new(
-                            LogLevel::Info,
-                            "PROTOCOL",
-                            "Received AX.25 disconnect notification — treating as SessionDied",
+                            "Received AX.25 disconnect confirmation",
                         )
                         .with_direction(Direction::Rx),
                     );
-                    return Err(AgwpeError::SessionDied {
-                        reason: "remote sent AX.25 disconnect notification".to_string(),
-                    });
+                    break;
                 }
-
-                BackgroundState::push_log(
-                    state,
-                    log_tx,
-                    DebugLogEntry::new(
-                        LogLevel::Trace,
-                        "PROTOCOL",
-                        &format!("Received {} bytes (total: {})", frame.data_len, response_data.len()),
-                    )
-                    .with_direction(Direction::Rx),
-                );
-
-                // Look for the text-framed response header ("RESP<digit>
-                // <base64_len>\n"). The Response::decode_header scans past
-                // any leading garbage (banner text, echoed prompts) to find
-                // the RESP magic.
-                if expected_len.is_none() {
-                    match packet_browser_shared::protocol::Response::decode_header(&response_data) {
-                        Ok(Some((_status, b64_len, _etag, _max_age, header_end))) => {
-                            if header_end > 0 {
-                                let preview_len = header_end.min(128);
-                                BackgroundState::push_log(
-                                    state,
-                                    log_tx,
-                                    DebugLogEntry::new(
-                                        LogLevel::Info,
-                                        "PROTOCOL",
-                                        &format!(
-                                            "Framed header found at offset {}. Preceding bytes: {:?}",
-                                            header_end,
-                                            String::from_utf8_lossy(&response_data[..preview_len]),
-                                        ),
-                                    ),
-                                );
-                            }
-                            expected_len = Some(b64_len);
-                            frame_start = header_end;
-                            BackgroundState::push_log(
-                                state,
-                                log_tx,
-                                DebugLogEntry::new(
-                                    LogLevel::Debug,
-                                    "PROTOCOL",
-                                    &format!(
-                                        "Response header: base64_payload_size={}",
-                                        b64_len,
-                                    ),
-                                ),
-                            );
-                        }
-                        Ok(None) => {
-                            // No complete header yet. If we've already seen
-                            // the RESP magic, keep reading (the header
-                            // terminator or length just hasn't arrived). If
-                            // there's no magic and the buffer is huge, bail
-                            // with a diagnostic dump.
-                            let has_magic = response_data
-                                .windows(packet_browser_shared::protocol::Response::MAGIC.len())
-                                .any(|w| w == packet_browser_shared::protocol::Response::MAGIC);
-                            if !has_magic && response_data.len() > 32 * 1024 {
-                                let preview = response_data.len().min(256);
-                                return Err(AgwpeError::SessionDied {
-                                    reason: format!(
-                                        "malformed response ({} bytes with no RESP magic: {:?})",
-                                        response_data.len(),
-                                        String::from_utf8_lossy(&response_data[..preview]),
-                                    ),
-                                });
-                            }
-                        }
-                        Err(e) => {
-                            return Err(AgwpeError::SessionDied {
-                                reason: format!("malformed response header: {:?}", e),
-                            });
-                        }
-                    }
-                }
-
-                if let Some(len) = expected_len {
-                    if response_data.len() >= frame_start + len as usize {
-                        BackgroundState::push_log(
-                            state,
-                            log_tx,
-                            DebugLogEntry::new(
-                                LogLevel::Debug,
-                                "PROTOCOL",
-                                &format!("Response complete: {} bytes", response_data.len()),
-                            ),
-                        );
-                        return Ok(response_data);
-                    }
-                }
-            }
-            FrameType::ConnectionRejected => {
-                return Err(AgwpeError::ConnectionFailed(
-                    "Connection rejected during request".to_string(),
-                ));
-            }
-            _ => {
-                BackgroundState::push_log(
-                    state,
-                    log_tx,
-                    DebugLogEntry::new(
-                        LogLevel::Debug,
-                        "PROTOCOL",
-                        &format!("Ignoring frame during request: {:?}", frame.frame_type),
-                    ),
-                );
+                // Any other frame is stale in-flight traffic from the dying
+                // session — discard and keep draining until the confirmation
+                // or the deadline.
+                Ok(Ok(_)) => continue,
+                _ => break,
             }
         }
     }
 }
 
-async fn handle_send_request_with_reconnect(
-    bg: &mut BackgroundState,
-    state: &SharedState,
-    log_tx: &broadcast::Sender<DebugLogEntry>,
-    data: Vec<u8>,
-) -> Result<Vec<u8>, AgwpeError> {
-    match handle_send_request(bg, state, log_tx, data.clone()).await {
-        Ok(bytes) => Ok(bytes),
-        Err(AgwpeError::SessionDied { reason }) => {
-            // Auto-reconnect kill-switch is enforced by the caller (proxy.rs)
-            // choosing between send_request and send_request_with_reconnect,
-            // so if we're here, retry is authorized.
-            handle_reconnect(bg, state, log_tx, reason).await?;
-            handle_send_request(bg, state, log_tx, data).await
+#[async_trait::async_trait]
+impl crate::transport::Transport for AgwpeTransport {
+    async fn connect_modem(
+        &mut self,
+        cfg: &crate::transport::TransportConfig,
+    ) -> Result<(), crate::transport::TransportError> {
+        self.connect_modem_internal(&cfg.agwpe.host, cfg.agwpe.port, &cfg.local_callsign)
+            .await
+            .map_err(agwpe_to_transport_err)
+    }
+
+    async fn disconnect_modem(&mut self) -> Result<(), crate::transport::TransportError> {
+        self.stream = None;
+        self.read_buf.clear();
+
+        if let Some(state) = &self.state {
+            let entry = {
+                let mut s = state.lock_or_poisoned();
+                s.clear_ports();
+                s.set_connection_state(ConnectionState::Disconnected)
+            };
+            if let Some(tx) = &self.log_tx {
+                let _ = tx.send(entry);
+            }
         }
-        Err(e) => Err(e),
+        self.push_log(DebugLogEntry::new(
+            LogLevel::Info,
+            "AGWPE",
+            "Disconnected from AGWPE",
+        ));
+
+        Ok(())
+    }
+
+    async fn open_session(
+        &mut self,
+        cfg: &crate::transport::SessionConfig,
+    ) -> Result<(), crate::transport::TransportError> {
+        // The manager owns the connect+handshake state machine (via
+        // session::ax25_open_and_await_connected + perform_bpq_handshake);
+        // this method just records the target so subsequent Transport calls
+        // (send/recv/open_ax25_link) address the right peer.
+        self.remote_callsign = cfg.remote_callsign.clone();
+        self.agwpe_port = cfg.agwpe_port;
+        self.local_callsign = cfg.local_callsign.clone();
+        Ok(())
+    }
+
+    async fn close_session(&mut self) -> Result<(), crate::transport::TransportError> {
+        if !self.is_connected() {
+            return Err(crate::transport::TransportError::NotConnected);
+        }
+        self.send_disconnect_and_drain().await;
+        Ok(())
+    }
+
+    async fn send(&mut self, data: &[u8]) -> Result<(), crate::transport::TransportError> {
+        if self.stream.is_none() {
+            return Err(crate::transport::TransportError::NotConnected);
+        }
+        let chunk_size = 256;
+        for chunk in data.chunks(chunk_size) {
+            let frame = AgwpeFrame::new(
+                self.agwpe_port,
+                FrameType::SendData,
+                &self.local_callsign,
+                &self.remote_callsign,
+                chunk.to_vec(),
+            );
+            let stream = self.stream.as_mut().unwrap();
+            stream
+                .write_all(&frame.encode())
+                .await
+                .map_err(crate::transport::TransportError::Io)?;
+        }
+        if let Some(stream) = self.stream.as_mut() {
+            stream
+                .flush()
+                .await
+                .map_err(crate::transport::TransportError::Io)?;
+        }
+        Ok(())
+    }
+
+    async fn recv(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<crate::transport::TransportEvent, crate::transport::TransportError> {
+        let frame = self
+            .read_frame_with_timeout_deadline(deadline)
+            .await
+            .map_err(|e| match e {
+                AgwpeError::Timeout => crate::transport::TransportError::Timeout,
+                AgwpeError::NotConnected => crate::transport::TransportError::NotConnected,
+                AgwpeError::Io(e) => crate::transport::TransportError::Io(e),
+                other => crate::transport::TransportError::ModemError(other.to_string()),
+            })?;
+
+        match frame.frame_type {
+            FrameType::Disconnect => {
+                let reason = String::from_utf8_lossy(&frame.data).to_string();
+                Ok(crate::transport::TransportEvent::Disconnected { reason })
+            }
+            FrameType::SendData => {
+                if is_session_dead_payload(&frame.data) {
+                    let reason = String::from_utf8_lossy(&frame.data).to_string();
+                    Ok(crate::transport::TransportEvent::Disconnected { reason })
+                } else {
+                    Ok(crate::transport::TransportEvent::Data(frame.data))
+                }
+            }
+            // AGWPE-standard 'c' 0x63 is the connected notification.
+            FrameType::Connected => Ok(crate::transport::TransportEvent::LinkOpened),
+            // LinBPQ sends 0x43 ('C') for both connect request AND connected
+            // notification.  If the payload starts with "***" and contains
+            // "CONNECTED", treat it as a link-open signal; otherwise it's
+            // in-band data.
+            FrameType::Connect => {
+                if frame.data.starts_with(b"***")
+                    && frame.data.windows(b"CONNECTED".len()).any(|w| w == b"CONNECTED")
+                {
+                    Ok(crate::transport::TransportEvent::LinkOpened)
+                } else {
+                    Ok(crate::transport::TransportEvent::Data(frame.data))
+                }
+            }
+            FrameType::ConnectionRejected => {
+                let reason = format!(
+                    "connection rejected by peer: {}",
+                    String::from_utf8_lossy(&frame.data)
+                );
+                Ok(crate::transport::TransportEvent::LinkRejected { reason })
+            }
+            _ => Ok(crate::transport::TransportEvent::Data(vec![])),
+        }
+    }
+
+    fn port_query_supported(&self) -> bool {
+        true
+    }
+
+    async fn open_ax25_link(&mut self) -> Result<(), crate::transport::TransportError> {
+        if !self.is_connected() {
+            return Err(crate::transport::TransportError::NotConnected);
+        }
+        let connect_frame = AgwpeFrame::new(
+            self.agwpe_port,
+            FrameType::Connect,
+            &self.local_callsign,
+            &self.remote_callsign,
+            vec![],
+        );
+        self.push_log(
+            DebugLogEntry::new(
+                LogLevel::Info,
+                "PROTOCOL",
+                &format!(
+                    "AX.25 connect to {} on port {}",
+                    self.remote_callsign, self.agwpe_port
+                ),
+            )
+            .with_direction(Direction::Tx),
+        );
+        self.send_frame_internal(&connect_frame)
+            .await
+            .map_err(agwpe_to_transport_err)?;
+        Ok(())
+    }
+
+    async fn reopen_modem_connection(&mut self) -> Result<(), crate::transport::TransportError> {
+        // Snapshot AGWPE endpoint + our callsign before we drop the socket so
+        // we can reopen with the same identity below.
+        let (agwpe_host, agwpe_tcp_port) = if let Some(state) = &self.state {
+            let s = state.lock_or_poisoned();
+            (s.config.agwpe_host.clone(), s.config.agwpe_port)
+        } else {
+            return Err(crate::transport::TransportError::ModemError(
+                "reopen_modem_connection called without attached state".to_string(),
+            ));
+        };
+        let callsign = self.local_callsign.clone();
+
+        // Tear down the AX.25 link on our side before re-opening so the peer
+        // (e.g. LinBPQ) actually closes the dead application session and will
+        // spawn a fresh one on our next Connect.  See
+        // `send_disconnect_and_drain` for why an empty SendData frame is
+        // insufficient.
+        if self.stream.is_some() {
+            self.send_disconnect_and_drain().await;
+        }
+
+        // Drop and re-establish the AGWPE TCP session.  Direwolf's AX.25 reader
+        // thread can freeze when the PipeWire audio pipeline stalls — a fresh
+        // TCP session forces Direwolf to reset per-client state on our side of
+        // the pipe.  If Direwolf's audio-side is still stuck, the subsequent
+        // Connect will time out and surface a clean Error via the outer catch.
+        self.stream = None;
+        self.read_buf.clear();
+
+        self.connect_modem_internal(&agwpe_host, agwpe_tcp_port, &callsign)
+            .await
+            .map_err(agwpe_to_transport_err)
+    }
+
+    async fn query_ports(&mut self) -> Result<(), crate::transport::TransportError> {
+        self.query_ports_internal()
+            .await
+            .map_err(agwpe_to_transport_err)
+    }
+}
+
+fn agwpe_to_transport_err(e: AgwpeError) -> crate::transport::TransportError {
+    match e {
+        AgwpeError::Timeout => crate::transport::TransportError::Timeout,
+        AgwpeError::NotConnected => crate::transport::TransportError::NotConnected,
+        AgwpeError::Io(e) => crate::transport::TransportError::Io(e),
+        other => crate::transport::TransportError::ModemError(other.to_string()),
+    }
+}
+
+/// Test helpers – not gated by `#[cfg(test)]` so that `mod.rs` integration
+/// tests (which live in a different compilation unit) can access them.
+pub mod test_helpers {
+    use super::*;
+
+    /// Build the bytes of an AGWPE Disconnect frame with the given payload.
+    pub fn disconnect_frame_bytes(payload: &[u8]) -> Vec<u8> {
+        let frame = AgwpeFrame::new(
+            0,
+            FrameType::Disconnect,
+            "N0CALL",
+            "N0CALL-8",
+            payload.to_vec(),
+        );
+        frame.encode()
+    }
+}
+
+#[cfg(test)]
+impl AgwpeTransport {
+    /// Create a loopback TCP pair for tests.
+    /// Returns `(client_side_stream, AgwpeTransport_wrapping_server_side)`.
+    pub async fn for_test_pair() -> (tokio::net::TcpStream, Self) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server_side, _) = listener.accept().await.unwrap();
+        let mut t = AgwpeTransport::new();
+        t.stream = Some(server_side);
+        t.local_callsign = "N0CALL".to_string();
+        t.remote_callsign = "N0CALL-8".to_string();
+        t.agwpe_port = 0;
+        (client, t)
     }
 }
 
@@ -1853,21 +956,5 @@ mod tests {
         assert!(!is_session_dead_payload(b"*** CONNECTED WITH N0CALL"));
         // Substring must include the space; a raw "Returned" alone shouldn't trigger.
         assert!(!is_session_dead_payload(b"Returned"));
-    }
-
-    #[test]
-    fn test_matches_stored_disclaimer() {
-        let text = "All activity is logged including your callsign.\rType AGREE to proceed: ";
-        assert!(matches_stored_disclaimer(text, Some(text)));
-
-        // Different whitespace does NOT match.
-        let differs_by_space = "All activity is logged including your callsign. \rType AGREE to proceed: ";
-        assert!(!matches_stored_disclaimer(differs_by_space, Some(text)));
-
-        // None never matches.
-        assert!(!matches_stored_disclaimer(text, None));
-
-        // Empty strings compare equal.
-        assert!(matches_stored_disclaimer("", Some("")));
     }
 }

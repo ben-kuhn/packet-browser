@@ -1,4 +1,8 @@
 pub mod agwpe;
+pub mod manager;
+pub mod session;
+
+pub use manager::TransportManager;
 
 use async_trait::async_trait;
 use std::str::FromStr;
@@ -23,6 +27,11 @@ pub enum TransportError {
 pub enum TransportEvent {
     Data(Vec<u8>),
     Disconnected { reason: String },
+    /// The link-layer connection came up. Emitted in response to
+    /// `open_ax25_link`. Callers use this to exit their connect-wait loop.
+    LinkOpened,
+    /// The peer rejected the link-open attempt.
+    LinkRejected { reason: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +100,10 @@ pub struct TransportConfig {
     pub kind: TransportKind,
     pub agwpe: AgwpeParams,
     pub vara: VaraParams,
+    /// Local station callsign, used for modem registration.  For AGWPE this
+    /// is sent in the RegisterCallsign frame; for VARA it becomes the
+    /// MYCALL command argument.
+    pub local_callsign: String,
 }
 
 #[derive(Debug, Clone)]
@@ -126,6 +139,29 @@ pub trait Transport: Send {
     ) -> Result<TransportEvent, TransportError>;
 
     fn port_query_supported(&self) -> bool;
+
+    /// Send a link-layer OPEN request (AX.25 `Connect` for AGWPE, a no-op for
+    /// modems that establish a link implicitly when the modem is connected).
+    /// After this call returns, the caller expects to drive the
+    /// application-level handshake by reading data frames via `recv`.
+    async fn open_ax25_link(&mut self) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    /// Tear down the current modem connection and re-establish it using the
+    /// same identity (callsign/host/port) that was used for the last
+    /// `connect_modem` call. Used by the session-level reconnect flow to
+    /// recover from a stalled modem without losing operator context.
+    async fn reopen_modem_connection(&mut self) -> Result<(), TransportError> {
+        Ok(())
+    }
+
+    /// Query the modem for its list of RF ports. AGWPE-style modems override
+    /// this; VARA-style modems that expose exactly one channel leave the
+    /// default no-op.
+    async fn query_ports(&mut self) -> Result<(), TransportError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -145,5 +181,30 @@ mod tests {
     #[test]
     fn transport_kind_rejects_unknown() {
         assert!("carrier-pigeon".parse::<TransportKind>().is_err());
+    }
+
+    #[tokio::test]
+    async fn agwpe_transport_reports_disconnect_payload_as_disconnected_event() {
+        use tokio::io::AsyncWriteExt;
+        use super::agwpe::AgwpeTransport;
+
+        let (mut tx_stream, mut transport) = AgwpeTransport::for_test_pair().await;
+
+        tx_stream
+            .write_all(&super::agwpe::test_helpers::disconnect_frame_bytes(
+                b"*** DISCONNECTED FROM N0CALL-8\r\n",
+            ))
+            .await
+            .unwrap();
+        tx_stream.flush().await.unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let event = transport.recv(deadline).await.unwrap();
+        match event {
+            TransportEvent::Disconnected { reason } => {
+                assert!(reason.contains("DISCONNECTED"), "reason={reason}");
+            }
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
     }
 }

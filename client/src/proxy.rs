@@ -22,14 +22,15 @@ static CALLSIGN_REGEX: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"^[a-zA-Z0-9]{1,3}[0-9][a-zA-Z0-9]{0,3}[a-zA-Z]$").unwrap()
 });
 
-use crate::agwpe::AgwpeManager;
+use crate::transport::agwpe::AgwpeError;
+use crate::transport::manager::TransportManager;
 use crate::config::FileConfig;
 use crate::state::{ConnectionState, DebugLogEntry, LockExt, SharedState};
 use crate::ui;
 
 pub struct AppContext {
     pub state: SharedState,
-    pub agwpe: AgwpeManager,
+    pub agwpe: TransportManager,
     pub log_tx: broadcast::Sender<DebugLogEntry>,
     pub host_allowlist: HostAllowlist,
     pub cache: Option<Arc<Cache>>,
@@ -469,13 +470,13 @@ async fn dispatch_ax25(
                 }
             }
         }
-        Err(crate::agwpe::AgwpeError::NeedsReconsent) => {
+        Err(AgwpeError::NeedsReconsent) => {
             Html(ui::render_session_error_page(
                 "Session dropped and the disclaimer text changed. Please reconnect and re-consent.",
                 true,
             )).into_response()
         }
-        Err(crate::agwpe::AgwpeError::SessionDied { reason }) => {
+        Err(AgwpeError::SessionDied { reason }) => {
             // Auto-reconnect already ran and this is the second failure, OR
             // auto-reconnect was disabled. Either way, surface the error.
             Html(ui::render_session_error_page(
@@ -483,7 +484,7 @@ async fn dispatch_ax25(
                 true,
             )).into_response()
         }
-        Err(crate::agwpe::AgwpeError::DisconnectedByOperator) => {
+        Err(AgwpeError::DisconnectedByOperator) => {
             Html(ui::render_session_error_page(
                 "Request cancelled by operator disconnect.",
                 true,
@@ -604,7 +605,7 @@ async fn api_agwpe_status_post(
 
     match ctx
         .agwpe
-        .connect_to_agwpe(host, port, callsign)
+        .connect_modem(host, port, callsign)
         .await
     {
         Ok(()) => {
@@ -674,7 +675,7 @@ async fn api_connect_handler(
 
     match ctx
         .agwpe
-        .ax25_connect(req.target_callsign, req.port_num)
+        .open_session(req.target_callsign, req.port_num)
         .await
     {
         Ok(()) => {
@@ -699,7 +700,7 @@ async fn api_connect_handler(
 async fn api_disconnect_handler(
     Extension(ctx): Extension<Arc<AppContext>>,
 ) -> Json<ConnectResponse> {
-    match ctx.agwpe.ax25_disconnect().await {
+    match ctx.agwpe.close_session().await {
         Ok(()) => {
             {
                 let mut s = ctx.state.lock_or_poisoned();
