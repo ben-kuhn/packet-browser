@@ -1276,8 +1276,26 @@ async fn send_agwpe_disconnect_and_drain(
     }
 }
 
+/// Detects control-plane text that signals the AX.25 session is dead.
+///
+/// Different node stacks emit different tear-down text:
+///   Direwolf / AGWPE convention: `*** DISCONNECTED FROM Station <call>`
+///   LinBPQ WEB-app exit:         `Returned to Node <alias>:<call>`
+///
+/// The markers may arrive in the first frame OR appear mid-buffer after a
+/// prior in-flight response has already accumulated bytes, so we scan the
+/// whole accumulated buffer, not just its prefix. False positives inside a
+/// legitimate RESP body are impossible because the payload is base64
+/// (`[A-Za-z0-9+/=]`) and can't contain spaces or asterisks.
 fn is_session_dead_payload(data: &[u8]) -> bool {
-    data.starts_with(b"*** DISCONNECTED")
+    contains_slice(data, b"*** DISCONNECTED") || contains_slice(data, b"Returned to Node")
+}
+
+fn contains_slice(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// Returns `true` iff `server_text` is byte-for-byte equal to the stored
@@ -1779,22 +1797,24 @@ mod tests {
 
     #[test]
     fn test_is_session_dead_payload() {
+        // Direwolf-style disconnect notification, at start of buffer.
         assert!(is_session_dead_payload(b"*** DISCONNECTED FROM Station N0CALL\r"));
         assert!(is_session_dead_payload(b"*** DISCONNECTED"));
+
+        // LinBPQ "Returned to Node" message when the WEB app exits.
+        assert!(is_session_dead_payload(b"Returned to Node DEMO:N0CALL-7\r"));
+
+        // Markers embedded mid-buffer (arriving after some already-appended bytes
+        // from a prior frame) must still be detected.
+        assert!(is_session_dead_payload(b"partial response...\r\n*** DISCONNECTED FROM X"));
+        assert!(is_session_dead_payload(b"garbage bytes\rReturned to Node DEMO:X"));
+
+        // Negatives — must not match on happy-path or unrelated control text.
         assert!(!is_session_dead_payload(b"RESP0 300 abc123 3600\r"));
         assert!(!is_session_dead_payload(b""));
         assert!(!is_session_dead_payload(b"*** CONNECTED WITH N0CALL"));
-    }
-
-    #[test]
-    fn test_disconnect_payload_short_circuits_before_resp_framer() {
-        // Simulate accumulated response bytes containing the disconnect marker.
-        let response_bytes: Vec<u8> = b"*** DISCONNECTED FROM Station N0CALL\r".to_vec();
-        // The helper should identify this immediately.
-        assert!(is_session_dead_payload(&response_bytes));
-        // And a normal RESP frame should not trip it.
-        let ok_bytes: Vec<u8> = b"RESP0 5 abcdef 3600\rhello".to_vec();
-        assert!(!is_session_dead_payload(&ok_bytes));
+        // Substring must include the space; a raw "Returned" alone shouldn't trigger.
+        assert!(!is_session_dead_payload(b"Returned"));
     }
 
     #[test]
