@@ -106,7 +106,7 @@ configure_pipewire() {
 import subprocess
 
 settings = {
-    "clock.allowed-rates": "[ 44100, 48000, 192000 ]",
+    "clock.allowed-rates": "[ 44100, 48000 ]",
     "clock.quantum": "1024",
     "clock.min-quantum": "256",
     "clock.max-quantum": "8192",
