@@ -1344,12 +1344,50 @@ async fn handle_reconnect(
         send_agwpe_disconnect_and_drain(bg, state, log_tx).await;
     }
 
+    // Snapshot AGWPE endpoint + our callsign before we drop the socket so
+    // we can reopen with the same identity below.
+    let (agwpe_host, agwpe_tcp_port, callsign) = {
+        let s = state.lock_or_poisoned();
+        (
+            s.config.agwpe_host.clone(),
+            s.config.agwpe_port,
+            bg.local_callsign.clone(),
+        )
+    };
+
+    // Drop and re-establish the AGWPE TCP session.  Direwolf's AX.25 reader
+    // thread can freeze when the PipeWire audio pipeline stalls — observed
+    // as "Received frame queue is out of control. Length=N. Reader thread
+    // is probably frozen" in direwolf.log — after which Direwolf silently
+    // drops all subsequent AGWPE frames from us, including Connect.  A
+    // fresh TCP session forces Direwolf to reset the per-client state on
+    // our side of the pipe; combined with the proper AX.25 Disconnect we
+    // just drained, this is the strongest recovery the client can do
+    // without operator intervention.  If Direwolf's audio-side is still
+    // stuck, the subsequent Connect will time out and surface a clean
+    // Error via the outer catch below.
+    bg.stream = None;
+    bg.read_buf.clear();
+
     // Run the full handshake in an inner block so we can intercept any error
     // and transition to Error state before returning.  The NeedsReconsent path
     // is the only exit that must NOT transition to Error — it sets
     // AwaitingConsent explicitly and is handled via a dedicated early-return
     // above the inner block.
     let result: Result<(), AgwpeError> = async {
+        handle_connect_to_agwpe(bg, state, log_tx, &agwpe_host, agwpe_tcp_port, &callsign).await?;
+        // handle_connect_to_agwpe flips state to AgwpeConnected on success;
+        // put us back in Reconnecting so the UI doesn't flicker while we
+        // drive the rest of the handshake.
+        BackgroundState::set_state(
+            state,
+            log_tx,
+            ConnectionState::Reconnecting { reason: reason.clone() },
+        );
+        if bg.abort_reconnect.load(Ordering::SeqCst) {
+            return Err(AgwpeError::DisconnectedByOperator);
+        }
+
         // Re-run the AX.25 handshake using the same helpers as handle_ax25_connect.
         ax25_open_and_await_connected(bg, state, log_tx).await?;
         if bg.abort_reconnect.load(Ordering::SeqCst) {
