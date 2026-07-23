@@ -1,10 +1,8 @@
-mod agwpe;
-mod cache;
-mod config;
-mod proxy;
-mod rewrite;
-mod state;
-mod ui;
+use packet_browser_client::cache;
+use packet_browser_client::config;
+use packet_browser_client::proxy;
+use packet_browser_client::state;
+use packet_browser_client::transport;
 
 use config::CliArgs;
 use proxy::{AppContext, HostAllowlist};
@@ -17,7 +15,7 @@ use tokio::sync::broadcast;
 #[derive(Error, Debug)]
 pub enum ClientError {
     #[error("AGWPE error: {0}")]
-    Agwpe(#[from] agwpe::AgwpeError),
+    Agwpe(#[from] transport::agwpe::AgwpeError),
     #[error("Configuration error: {0}")]
     Config(#[from] config::ConfigError),
     #[error("IO error: {0}")]
@@ -45,12 +43,33 @@ async fn main() -> Result<(), ClientError> {
     let shared_state = create_shared_state(config.clone());
     let (log_tx, _) = broadcast::channel::<state::DebugLogEntry>(256);
 
-    let agwpe_manager = agwpe::AgwpeManager::new(shared_state.clone(), log_tx.clone(), config.connection.response_timeout_secs);
+    let agwpe_transport: Box<dyn transport::Transport> = {
+        let mut t = transport::agwpe::AgwpeTransport::new();
+        t.attach_state(shared_state.clone(), log_tx.clone());
+        Box::new(t)
+    };
+    let agwpe_manager = transport::TransportManager::spawn(agwpe_transport, shared_state.clone(), log_tx.clone(), config.connection.response_timeout_secs);
 
     // Auto-connect to AGWPE on startup
     if !config.my_callsign.is_empty() {
         tracing::info!("Attempting auto-connect to AGWPE at {}:{}", config.agwpe_host, config.agwpe_port);
-        match agwpe_manager.connect_to_agwpe(config.agwpe_host.clone(), config.agwpe_port, config.my_callsign.clone()).await {
+        let agwpe_cfg = transport::TransportConfig {
+            kind: transport::TransportKind::Ax25,
+            agwpe: transport::AgwpeParams {
+                host: config.agwpe_host.clone(),
+                port: config.agwpe_port,
+            },
+            vara: transport::VaraParams {
+                cmd_host: config.vara.cmd_host.clone(),
+                cmd_port: config.vara.cmd_port,
+                data_host: config.vara.data_host.clone(),
+                data_port: config.vara.data_port,
+                mode: config.vara.mode,
+                bandwidth: config.vara.bandwidth,
+            },
+            local_callsign: config.my_callsign.clone(),
+        };
+        match agwpe_manager.connect_modem(agwpe_cfg).await {
             Ok(_) => {
                 tracing::info!("Successfully connected to AGWPE");
                 // Query ports after successful connection
@@ -100,7 +119,7 @@ async fn main() -> Result<(), ClientError> {
 
     let ctx = Arc::new(AppContext {
         state: shared_state,
-        agwpe: agwpe_manager,
+        agwpe: tokio::sync::Mutex::new(agwpe_manager),
         log_tx,
         host_allowlist,
         cache,

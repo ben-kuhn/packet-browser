@@ -2,6 +2,7 @@ use configparser::ini::Ini;
 use std::fs;
 use std::path::PathBuf;
 use thiserror::Error;
+use crate::transport::{TransportKind, VaraBandwidth, VaraMode};
 
 #[derive(Error, Debug)]
 pub enum ConfigError {
@@ -58,6 +59,59 @@ impl CacheSection {
 }
 
 #[derive(Debug, Clone)]
+pub struct TransportSection {
+    pub default: TransportKind,
+}
+
+impl Default for TransportSection {
+    fn default() -> Self {
+        Self { default: TransportKind::Ax25 }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VaraSection {
+    pub cmd_host: String,
+    pub cmd_port: u16,
+    pub data_host: String,
+    pub data_port: u16,
+    pub mode: VaraMode,
+    pub bandwidth: VaraBandwidth,
+}
+
+impl Default for VaraSection {
+    fn default() -> Self {
+        Self {
+            cmd_host: "127.0.0.1".to_string(),
+            cmd_port: 8300,
+            data_host: "127.0.0.1".to_string(),
+            data_port: 8301,
+            mode: VaraMode::Fm,
+            bandwidth: VaraBandwidth::VWide,
+        }
+    }
+}
+
+fn parse_vara_mode(s: &str) -> VaraMode {
+    match s {
+        "hf" => VaraMode::Hf,
+        _ => VaraMode::Fm,
+    }
+}
+
+fn parse_vara_bandwidth(s: &str) -> VaraBandwidth {
+    match s {
+        "vnarrow" => VaraBandwidth::VNarrow,
+        "vwide" => VaraBandwidth::VWide,
+        "bw250" => VaraBandwidth::Bw250,
+        "bw500" => VaraBandwidth::Bw500,
+        "bw2300" => VaraBandwidth::Bw2300,
+        "bw2750" => VaraBandwidth::Bw2750,
+        _ => VaraBandwidth::VWide,
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct FileConfig {
     pub agwpe_host: String,
     pub agwpe_port: u16,
@@ -67,6 +121,8 @@ pub struct FileConfig {
     pub skip_bpq_app: bool,
     pub cache: CacheSection,
     pub connection: ConnectionConfig,
+    pub transport: TransportSection,
+    pub vara: VaraSection,
 }
 
 impl Default for FileConfig {
@@ -80,6 +136,8 @@ impl Default for FileConfig {
             skip_bpq_app: false,
             cache: CacheSection::default(),
             connection: ConnectionConfig::default(),
+            transport: TransportSection::default(),
+            vara: VaraSection::default(),
         }
     }
 }
@@ -150,6 +208,38 @@ impl FileConfig {
             .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes" | "on"))
             .unwrap_or(true);
 
+        let transport_default = ini
+            .get("transport", "default")
+            .and_then(|v| v.parse::<TransportKind>().ok())
+            .unwrap_or(TransportKind::Ax25);
+
+        let vara = VaraSection {
+            cmd_host: ini
+                .get("vara", "cmd_host")
+                .unwrap_or_else(|| "127.0.0.1".to_string()),
+            cmd_port: ini
+                .get("vara", "cmd_port")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8300),
+            data_host: ini
+                .get("vara", "data_host")
+                .unwrap_or_else(|| "127.0.0.1".to_string()),
+            data_port: ini
+                .get("vara", "data_port")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8301),
+            mode: ini
+                .get("vara", "mode")
+                .map(|v| parse_vara_mode(&v))
+                .unwrap_or(VaraMode::Fm),
+            bandwidth: ini
+                .get("vara", "bandwidth")
+                .map(|v| parse_vara_bandwidth(&v))
+                .unwrap_or(VaraBandwidth::VWide),
+        };
+
+        let transport = TransportSection { default: transport_default };
+
         Ok(Self {
             agwpe_host,
             agwpe_port,
@@ -167,6 +257,8 @@ impl FileConfig {
                 response_timeout_secs,
                 auto_reconnect,
             },
+            transport,
+            vara,
         })
     }
 
@@ -193,6 +285,15 @@ impl FileConfig {
 
         ini.set("connection", "response_timeout_secs", Some(self.connection.response_timeout_secs.to_string()));
         ini.set("connection", "auto_reconnect", Some(self.connection.auto_reconnect.to_string()));
+
+        ini.set("transport", "default", Some(self.transport.default.to_string()));
+
+        ini.set("vara", "cmd_host", Some(self.vara.cmd_host.clone()));
+        ini.set("vara", "cmd_port", Some(self.vara.cmd_port.to_string()));
+        ini.set("vara", "data_host", Some(self.vara.data_host.clone()));
+        ini.set("vara", "data_port", Some(self.vara.data_port.to_string()));
+        ini.set("vara", "mode", Some(self.vara.mode.to_string()));
+        ini.set("vara", "bandwidth", Some(self.vara.bandwidth.to_string()));
 
         ini.write(path).map_err(|e| ConfigError::Parse(e.to_string()))?;
         Ok(())
@@ -319,6 +420,8 @@ mod tests {
             skip_bpq_app: false,
             cache: CacheSection::default(),
             connection: ConnectionConfig::default(),
+            transport: TransportSection::default(),
+            vara: VaraSection::default(),
         };
 
         config.save(&path).unwrap();
@@ -438,5 +541,85 @@ mod tests {
         let loaded = FileConfig::load(&path).unwrap();
         assert_eq!(loaded.connection.response_timeout_secs, 15);
         assert!(!loaded.connection.auto_reconnect);
+    }
+
+    #[test]
+    fn loads_transport_and_vara_sections() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("t.ini");
+        std::fs::write(
+            &p,
+            r#"
+[transport]
+default = vara_fm
+
+[vara]
+cmd_host = 10.0.0.5
+cmd_port = 8300
+data_host = 10.0.0.5
+data_port = 8301
+mode = fm
+bandwidth = vwide
+"#,
+        )
+        .unwrap();
+
+        let cfg = FileConfig::load(&p).unwrap();
+
+        assert_eq!(cfg.transport.default, crate::transport::TransportKind::VaraFm);
+        assert_eq!(cfg.vara.cmd_host, "10.0.0.5");
+        assert_eq!(cfg.vara.cmd_port, 8300);
+        assert_eq!(cfg.vara.data_port, 8301);
+        assert_eq!(cfg.vara.mode, crate::transport::VaraMode::Fm);
+        assert_eq!(cfg.vara.bandwidth, crate::transport::VaraBandwidth::VWide);
+    }
+
+    #[test]
+    fn missing_transport_section_defaults_to_ax25() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("t.ini");
+        std::fs::write(&p, "").unwrap();
+        let cfg = FileConfig::load(&p).unwrap();
+        assert_eq!(cfg.transport.default, crate::transport::TransportKind::Ax25);
+        assert_eq!(cfg.vara.cmd_port, 8300);
+    }
+
+    #[test]
+    fn test_config_save_load_roundtrip_preserves_transport_and_vara() {
+        use crate::transport::{TransportKind, VaraBandwidth, VaraMode};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+
+        let cfg = FileConfig {
+            agwpe_host: "10.0.0.1".to_string(),
+            agwpe_port: 9999,
+            my_callsign: "W1TEST".to_string(),
+            target_callsign: "N0CALL-9".to_string(),
+            bpq_command: "WEB".to_string(),
+            skip_bpq_app: false,
+            cache: CacheSection::default(),
+            connection: ConnectionConfig::default(),
+            transport: TransportSection { default: TransportKind::VaraFm },
+            vara: VaraSection {
+                cmd_host: "10.1.2.3".to_string(),
+                cmd_port: 8305,
+                data_host: "10.1.2.3".to_string(),
+                data_port: 8306,
+                mode: VaraMode::Hf,
+                bandwidth: VaraBandwidth::Bw500,
+            },
+        };
+
+        cfg.save(&path).unwrap();
+        let loaded = FileConfig::load(&path).unwrap();
+
+        assert_eq!(loaded.transport.default, TransportKind::VaraFm, "transport.default not roundtripped");
+        assert_eq!(loaded.vara.cmd_host, "10.1.2.3", "vara.cmd_host not roundtripped");
+        assert_eq!(loaded.vara.cmd_port, 8305, "vara.cmd_port not roundtripped");
+        assert_eq!(loaded.vara.data_host, "10.1.2.3", "vara.data_host not roundtripped");
+        assert_eq!(loaded.vara.data_port, 8306, "vara.data_port not roundtripped");
+        assert_eq!(loaded.vara.mode, VaraMode::Hf, "vara.mode not roundtripped");
+        assert_eq!(loaded.vara.bandwidth, VaraBandwidth::Bw500, "vara.bandwidth not roundtripped");
     }
 }

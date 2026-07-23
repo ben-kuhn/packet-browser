@@ -15,21 +15,25 @@ use std::convert::Infallible;
 use std::net::IpAddr;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex as TokioMutex};
 use crate::cache::Cache;
 
 static CALLSIGN_REGEX: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"^[a-zA-Z0-9]{1,3}[0-9][a-zA-Z0-9]{0,3}[a-zA-Z]$").unwrap()
 });
 
-use crate::agwpe::AgwpeManager;
+use crate::transport::agwpe::AgwpeError;
+use crate::transport::manager::TransportManager;
 use crate::config::FileConfig;
 use crate::state::{ConnectionState, DebugLogEntry, LockExt, SharedState};
 use crate::ui;
 
 pub struct AppContext {
     pub state: SharedState,
-    pub agwpe: AgwpeManager,
+    /// The active transport manager. Wrapped in a Mutex so that
+    /// `POST /api/connect` can swap in a different transport (e.g. VARA) at
+    /// operator request without restarting the whole process.
+    pub agwpe: TokioMutex<TransportManager>,
     pub log_tx: broadcast::Sender<DebugLogEntry>,
     pub host_allowlist: HostAllowlist,
     pub cache: Option<Arc<Cache>>,
@@ -143,6 +147,7 @@ pub fn create_router(ctx: Arc<AppContext>) -> Router {
         .route("/api/consent", post(api_consent_post))
         .route("/api/config", get(api_config_get))
         .route("/api/config", post(api_config_post))
+        .route("/api/state", get(api_state_get))
         .route("/api/cache/clear", post(api_cache_clear))
         .route("/api/cache/delete", post(api_cache_delete))
         .route("/events", get(events_handler))
@@ -226,6 +231,8 @@ async fn root_handler() -> impl IntoResponse {
 async fn connect_page_handler(
     Extension(ctx): Extension<Arc<AppContext>>,
 ) -> impl IntoResponse {
+    use crate::transport::{VaraParams, VaraMode, VaraBandwidth};
+
     let state = ctx.state.lock_or_poisoned();
     let my_callsign = state.config.my_callsign.clone();
     let target_callsign = state.config.target_callsign.clone();
@@ -240,6 +247,25 @@ async fn connect_page_handler(
         ConnectionState::Error(_) => "status-error",
     };
     let ports_json = serde_json::to_string(&state.available_ports).unwrap_or_else(|_| "[]".to_string());
+    let transport_default = state.config.transport.default;
+    let vara_params = VaraParams {
+        cmd_host: state.config.vara.cmd_host.clone(),
+        cmd_port: state.config.vara.cmd_port,
+        data_host: state.config.vara.data_host.clone(),
+        data_port: state.config.vara.data_port,
+        mode: match state.config.vara.mode {
+            VaraMode::Fm => VaraMode::Fm,
+            VaraMode::Hf => VaraMode::Hf,
+        },
+        bandwidth: match state.config.vara.bandwidth {
+            VaraBandwidth::VNarrow => VaraBandwidth::VNarrow,
+            VaraBandwidth::VWide   => VaraBandwidth::VWide,
+            VaraBandwidth::Bw250   => VaraBandwidth::Bw250,
+            VaraBandwidth::Bw500   => VaraBandwidth::Bw500,
+            VaraBandwidth::Bw2300  => VaraBandwidth::Bw2300,
+            VaraBandwidth::Bw2750  => VaraBandwidth::Bw2750,
+        },
+    };
     drop(state);
 
     Html(ui::connect_page(
@@ -248,6 +274,8 @@ async fn connect_page_handler(
         &connection_state,
         connection_state_class,
         &ports_json,
+        transport_default,
+        &vara_params,
     ))
 }
 
@@ -397,10 +425,15 @@ async fn dispatch_ax25(
         _ => None,
     };
 
+    // Clone the manager handle out of the lock before awaiting — holding the
+    // Mutex across an await point blocks operator control (disconnect, transport
+    // swap) for the entire browse round-trip.  TransportManager is Clone (it
+    // is just an mpsc::Sender).
+    let manager = ctx.agwpe.lock().await.clone();
     let send_result = if ctx.config.connection.auto_reconnect {
-        ctx.agwpe.send_request_with_reconnect(encoded).await
+        manager.send_request_with_reconnect(encoded).await
     } else {
-        ctx.agwpe.send_request(encoded).await
+        manager.send_request(encoded).await
     };
     match send_result {
         Ok(response_data) => {
@@ -469,13 +502,13 @@ async fn dispatch_ax25(
                 }
             }
         }
-        Err(crate::agwpe::AgwpeError::NeedsReconsent) => {
+        Err(AgwpeError::NeedsReconsent) => {
             Html(ui::render_session_error_page(
                 "Session dropped and the disclaimer text changed. Please reconnect and re-consent.",
                 true,
             )).into_response()
         }
-        Err(crate::agwpe::AgwpeError::SessionDied { reason }) => {
+        Err(AgwpeError::SessionDied { reason }) => {
             // Auto-reconnect already ran and this is the second failure, OR
             // auto-reconnect was disabled. Either way, surface the error.
             Html(ui::render_session_error_page(
@@ -483,7 +516,7 @@ async fn dispatch_ax25(
                 true,
             )).into_response()
         }
-        Err(crate::agwpe::AgwpeError::DisconnectedByOperator) => {
+        Err(AgwpeError::DisconnectedByOperator) => {
             Html(ui::render_session_error_page(
                 "Request cancelled by operator disconnect.",
                 true,
@@ -602,13 +635,32 @@ async fn api_agwpe_status_post(
         });
     }
 
+    use crate::transport::{AgwpeParams, TransportConfig, TransportKind, VaraParams};
+    let agwpe_cfg = {
+        let s = ctx.state.lock_or_poisoned();
+        TransportConfig {
+            kind: TransportKind::Ax25,
+            agwpe: AgwpeParams { host, port },
+            vara: VaraParams {
+                cmd_host: s.config.vara.cmd_host.clone(),
+                cmd_port: s.config.vara.cmd_port,
+                data_host: s.config.vara.data_host.clone(),
+                data_port: s.config.vara.data_port,
+                mode: s.config.vara.mode,
+                bandwidth: s.config.vara.bandwidth,
+            },
+            local_callsign: callsign,
+        }
+    };
     match ctx
         .agwpe
-        .connect_to_agwpe(host, port, callsign)
+        .lock()
+        .await
+        .connect_modem(agwpe_cfg)
         .await
     {
         Ok(()) => {
-            if let Err(e) = ctx.agwpe.query_ports().await {
+            if let Err(e) = ctx.agwpe.lock().await.query_ports().await {
                 return Json(AgwpeStatusResponse {
                     ok: false,
                     state: "Error".to_string(),
@@ -649,6 +701,22 @@ async fn api_agwpe_status_post(
 struct ConnectRequest {
     target_callsign: String,
     port_num: u8,
+    /// Transport to use: "ax25" | "vara_fm" | "vara_hf".
+    /// Defaults to `state.config.transport.default` when absent.
+    #[serde(default)]
+    transport: Option<String>,
+    #[serde(default)]
+    vara_cmd_host: Option<String>,
+    #[serde(default)]
+    vara_cmd_port: Option<u16>,
+    #[serde(default)]
+    vara_data_host: Option<String>,
+    #[serde(default)]
+    vara_data_port: Option<u16>,
+    #[serde(default)]
+    vara_mode: Option<String>,
+    #[serde(default)]
+    vara_bandwidth: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -662,6 +730,8 @@ async fn api_connect_handler(
     Extension(ctx): Extension<Arc<AppContext>>,
     Json(req): Json<ConnectRequest>,
 ) -> Json<ConnectResponse> {
+    use crate::transport::{TransportKind, VaraBandwidth, VaraMode};
+
     // Validate target callsign format
     let callsign = req.target_callsign.split('-').next().unwrap_or(&req.target_callsign);
     if !CALLSIGN_REGEX.is_match(callsign) {
@@ -672,34 +742,150 @@ async fn api_connect_handler(
         });
     }
 
-    match ctx
-        .agwpe
-        .ax25_connect(req.target_callsign, req.port_num)
-        .await
-    {
-        Ok(()) => {
-            let state = ctx.state.lock_or_poisoned();
-            let state_str = state.connection_state.to_string();
-            drop(state);
+    // Resolve transport kind from the request field, falling back to the
+    // configured default.
+    let transport_kind = match req.transport.as_deref() {
+        Some(s) => match s.parse::<TransportKind>() {
+            Ok(k) => k,
+            Err(e) => {
+                return Json(ConnectResponse {
+                    ok: false,
+                    state: None,
+                    error: Some(format!("Unknown transport: {}", e)),
+                });
+            }
+        },
+        None => ctx.state.lock_or_poisoned().config.transport.default,
+    };
 
-            Json(ConnectResponse {
-                ok: true,
-                state: Some(state_str),
-                error: None,
-            })
+    // When a VARA transport is requested, spawn a new TransportManager backed
+    // by VaraTransport and replace the active one.  The operator must have
+    // already configured (or passed) VARA host/port parameters; if none are
+    // given we fall back to the configured defaults.
+    match transport_kind {
+        TransportKind::VaraFm | TransportKind::VaraHf => {
+            let (vara_cfg, response_timeout_secs) = {
+                let s = ctx.state.lock_or_poisoned();
+                let cmd_host = req.vara_cmd_host.clone()
+                    .unwrap_or_else(|| s.config.vara.cmd_host.clone());
+                let cmd_port = req.vara_cmd_port.unwrap_or(s.config.vara.cmd_port);
+                let data_host = req.vara_data_host.clone()
+                    .unwrap_or_else(|| s.config.vara.data_host.clone());
+                let data_port = req.vara_data_port.unwrap_or(s.config.vara.data_port);
+                let vara_mode_val = match req.vara_mode.as_deref() {
+                    Some("hf") => VaraMode::Hf,
+                    _ => match s.config.vara.mode {
+                        VaraMode::Hf => VaraMode::Hf,
+                        VaraMode::Fm => VaraMode::Fm,
+                    },
+                };
+                let vara_bw_val = match req.vara_bandwidth.as_deref() {
+                    Some("vnarrow") => VaraBandwidth::VNarrow,
+                    Some("bw250")   => VaraBandwidth::Bw250,
+                    Some("bw500")   => VaraBandwidth::Bw500,
+                    Some("bw2300")  => VaraBandwidth::Bw2300,
+                    Some("bw2750")  => VaraBandwidth::Bw2750,
+                    Some("vwide")   => VaraBandwidth::VWide,
+                    _ => s.config.vara.bandwidth,
+                };
+                let cfg = crate::transport::TransportConfig {
+                    kind: transport_kind,
+                    agwpe: crate::transport::AgwpeParams {
+                        host: s.config.agwpe_host.clone(),
+                        port: s.config.agwpe_port,
+                    },
+                    vara: crate::transport::VaraParams {
+                        cmd_host,
+                        cmd_port,
+                        data_host,
+                        data_port,
+                        mode: vara_mode_val,
+                        bandwidth: vara_bw_val,
+                    },
+                    local_callsign: s.config.my_callsign.clone(),
+                };
+                (cfg, s.config.connection.response_timeout_secs)
+            };
+
+            // Build a fresh VaraTransport-backed manager.  We connect the
+            // modem FIRST and only swap the active manager on success so that
+            // a failed connect leaves the existing manager intact and
+            // subsequent /browse clicks keep working.
+            let vara_transport: Box<dyn crate::transport::Transport> =
+                Box::new(crate::transport::vara::VaraTransport::new());
+            let new_manager = TransportManager::spawn(
+                vara_transport,
+                ctx.state.clone(),
+                ctx.log_tx.clone(),
+                response_timeout_secs,
+            );
+
+            // Connect the VARA modem. This will fail if no VARA modem is
+            // listening on the configured ports (expected in tests/CI).
+            if let Err(e) = new_manager.connect_modem(vara_cfg).await {
+                // new_manager is dropped here; the existing manager is untouched.
+                return Json(ConnectResponse {
+                    ok: false,
+                    state: None,
+                    error: Some(format!("VARA modem connect failed: {}", e)),
+                });
+            }
+
+            // connect_modem succeeded — atomically install the new manager so
+            // that disconnect/browse calls use it from this point on.
+            {
+                let mut mgr = ctx.agwpe.lock().await;
+                *mgr = new_manager.clone();
+            }
+
+            // Proceed with opening the AX.25/VARA session.
+            match new_manager.open_session(req.target_callsign, req.port_num).await {
+                Ok(()) => {
+                    let state = ctx.state.lock_or_poisoned();
+                    let state_str = state.connection_state.to_string();
+                    drop(state);
+                    Json(ConnectResponse {
+                        ok: true,
+                        state: Some(state_str),
+                        error: None,
+                    })
+                }
+                Err(e) => Json(ConnectResponse {
+                    ok: false,
+                    state: None,
+                    error: Some(e.to_string()),
+                }),
+            }
         }
-        Err(e) => Json(ConnectResponse {
-            ok: false,
-            state: None,
-            error: Some(e.to_string()),
-        }),
+
+        TransportKind::Ax25 => {
+            // Existing AX.25/AGWPE path — use the current manager as-is.
+            match ctx.agwpe.lock().await.open_session(req.target_callsign, req.port_num).await {
+                Ok(()) => {
+                    let state = ctx.state.lock_or_poisoned();
+                    let state_str = state.connection_state.to_string();
+                    drop(state);
+
+                    Json(ConnectResponse {
+                        ok: true,
+                        state: Some(state_str),
+                        error: None,
+                    })
+                }
+                Err(e) => Json(ConnectResponse {
+                    ok: false,
+                    state: None,
+                    error: Some(e.to_string()),
+                }),
+            }
+        }
     }
 }
 
 async fn api_disconnect_handler(
     Extension(ctx): Extension<Arc<AppContext>>,
 ) -> Json<ConnectResponse> {
-    match ctx.agwpe.ax25_disconnect().await {
+    match ctx.agwpe.lock().await.close_session().await {
         Ok(()) => {
             {
                 let mut s = ctx.state.lock_or_poisoned();
@@ -893,6 +1079,50 @@ async fn api_config_post(
             error: Some(format!("Failed to save config: {}", e)),
         }),
     }
+}
+
+#[derive(Serialize)]
+struct StateResponse {
+    agwpe_host: String,
+    agwpe_port: u16,
+    transport: String,
+    vara_cmd_host: String,
+    vara_cmd_port: u16,
+    vara_data_host: String,
+    vara_data_port: u16,
+    vara_mode: String,
+    vara_bandwidth: String,
+}
+
+async fn api_state_get(
+    Extension(ctx): Extension<Arc<AppContext>>,
+) -> Json<StateResponse> {
+    use crate::transport::{VaraBandwidth, VaraMode};
+
+    let state = ctx.state.lock_or_poisoned();
+    let vara_mode = match state.config.vara.mode {
+        VaraMode::Fm => "fm".to_string(),
+        VaraMode::Hf => "hf".to_string(),
+    };
+    let vara_bandwidth = match state.config.vara.bandwidth {
+        VaraBandwidth::VNarrow => "vnarrow".to_string(),
+        VaraBandwidth::VWide   => "vwide".to_string(),
+        VaraBandwidth::Bw250   => "bw250".to_string(),
+        VaraBandwidth::Bw500   => "bw500".to_string(),
+        VaraBandwidth::Bw2300  => "bw2300".to_string(),
+        VaraBandwidth::Bw2750  => "bw2750".to_string(),
+    };
+    Json(StateResponse {
+        agwpe_host: state.config.agwpe_host.clone(),
+        agwpe_port: state.config.agwpe_port,
+        transport: state.config.transport.default.to_string(),
+        vara_cmd_host: state.config.vara.cmd_host.clone(),
+        vara_cmd_port: state.config.vara.cmd_port,
+        vara_data_host: state.config.vara.data_host.clone(),
+        vara_data_port: state.config.vara.data_port,
+        vara_mode,
+        vara_bandwidth,
+    })
 }
 
 async fn events_handler(

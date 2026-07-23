@@ -186,6 +186,16 @@ If the auto-connect fails, check that:
 - **LinBPQ errors**: Check `linbpq.log` in the demo directory
 - **Permission denied**: Make sure the script is executable (`chmod +x demo.sh`)
 
+### VARA/Mercury Manual Testing
+
+For VARA/Mercury manual testing, see `demo-vara.sh` — it prints the expected topology and required prerequisites.
+
+Mercury/LinBPQ prerequisites:
+  - Start Mercury on both ends
+  - Configure LinBPQ on the server side with a VARA port pointing at Mercury's cmd/data ports
+  - Open the client web UI `/connect` page and select "VARA HF" transport
+  - Use the Mercury ports displayed in the script output
+
 ---
 
 ## Server
