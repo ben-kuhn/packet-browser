@@ -196,17 +196,22 @@ impl Transport for VaraTransport {
                 _ = read_cmd_ready(cmd) => {
                     let line_deadline = Instant::now()
                         + std::time::Duration::from_millis(100);
-                    let line = self.read_cmd_line(line_deadline).await?;
-                    match parse_line(&line) {
-                        VaraResponse::Disconnected => {
-                            return Ok(TransportEvent::Disconnected {
-                                reason: "vara modem reports disconnect".into(),
-                            });
-                        }
-                        other => {
-                            tracing::debug!(?other, "VARA cmd line during recv");
-                            continue;
-                        }
+                    match self.read_cmd_line(line_deadline).await {
+                        Ok(line) => match parse_line(&line) {
+                            VaraResponse::Disconnected => {
+                                return Ok(TransportEvent::Disconnected {
+                                    reason: "vara modem reports disconnect".into(),
+                                });
+                            }
+                            other => {
+                                tracing::debug!(?other, "VARA cmd line during recv");
+                                continue;
+                            }
+                        },
+                        // Spurious readiness wakeups return Timeout — retry the outer loop
+                        // rather than surfacing a bogus error.
+                        Err(TransportError::Timeout) => continue,
+                        Err(e) => return Err(e),
                     }
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
@@ -380,6 +385,8 @@ mod tests {
             w.write_all(b"CONNECTED W1TEST N0CALL-8\r").await.unwrap();
             // Now emit DISCONNECTED to trigger recv().
             w.write_all(b"DISCONNECTED\r").await.unwrap();
+            // Keep both sockets alive long enough for recv to process DISCONNECTED.
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         });
 
         let mut vara = VaraTransport::new();
