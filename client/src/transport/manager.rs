@@ -223,7 +223,6 @@ async fn background_task(
                 let _ = reply.send(result);
             }
             TransportCommand::SendRequest { data, reply } => {
-                session_state.reset_abort();
                 let result = handle_send_request(
                     &mut *transport,
                     &mut session_state,
@@ -235,7 +234,6 @@ async fn background_task(
                 let _ = reply.send(result);
             }
             TransportCommand::SendRequestWithReconnect { data, reply } => {
-                session_state.reset_abort();
                 let result = handle_send_request_with_reconnect(
                     &mut *transport,
                     &mut session_state,

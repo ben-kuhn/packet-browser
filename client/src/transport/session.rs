@@ -373,6 +373,12 @@ pub(crate) async fn handle_send_request(
     log_tx: &broadcast::Sender<DebugLogEntry>,
     data: Vec<u8>,
 ) -> Result<Vec<u8>, AgwpeError> {
+    // Check abort before any wire I/O so a queued SendRequest that was
+    // enqueued before close_session/disconnect_modem ran is silently dropped.
+    if session_state.is_aborted() {
+        return Err(AgwpeError::DisconnectedByOperator);
+    }
+
     let timeout_secs = session_state.response_timeout_secs;
 
     push_log(
@@ -704,6 +710,11 @@ pub(crate) async fn handle_send_request_with_reconnect(
     data: Vec<u8>,
     local_callsign: &str,
 ) -> Result<Vec<u8>, AgwpeError> {
+    // Check abort before any wire I/O — same guard as handle_send_request.
+    if session_state.is_aborted() {
+        return Err(AgwpeError::DisconnectedByOperator);
+    }
+
     match handle_send_request(transport, session_state, state, log_tx, data.clone()).await {
         Ok(bytes) => Ok(bytes),
         Err(AgwpeError::SessionDied { reason }) => {
