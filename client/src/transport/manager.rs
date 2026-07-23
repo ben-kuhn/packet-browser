@@ -1,7 +1,7 @@
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::state::{ConnectionState, DebugLogEntry, LockExt, LogLevel, SharedState};
-use crate::transport::agwpe::{AgwpeError, AgwpeTransport};
+use crate::transport::agwpe::AgwpeError;
 use crate::transport::session::{
     self, ax25_open_and_await_connected, handle_send_request,
     handle_send_request_with_reconnect, perform_bpq_handshake, push_log, set_state, SessionState,
@@ -48,21 +48,21 @@ pub struct TransportManager {
 }
 
 impl TransportManager {
-    pub fn new(
+    /// Spawn the background actor, injecting the concrete transport.  The
+    /// caller builds whichever `Box<dyn Transport>` it needs (e.g.
+    /// `Box::new(AgwpeTransport::new())` for AGWPE, or a future
+    /// `Box::new(VaraTransport::new())` for Task 6's VARA path) and passes it
+    /// here so `TransportManager` itself stays transport-agnostic.
+    pub fn spawn(
+        transport: Box<dyn Transport>,
         state: SharedState,
         log_tx: broadcast::Sender<DebugLogEntry>,
         response_timeout_secs: u64,
     ) -> Self {
         let (command_tx, command_rx) = mpsc::channel(32);
 
-        // For now we only build AgwpeTransport; a future ConfigureTransport
-        // command will let main.rs pick between AGWPE and VARA at runtime.
-        let mut transport = AgwpeTransport::new();
-        transport.attach_state(state.clone(), log_tx.clone());
-        let boxed: Box<dyn Transport> = Box::new(transport);
-
         tokio::spawn(async move {
-            background_task(command_rx, boxed, state, log_tx, response_timeout_secs).await;
+            background_task(command_rx, transport, state, log_tx, response_timeout_secs).await;
         });
 
         Self { command_tx }
@@ -214,7 +214,7 @@ async fn background_task(
                 let _ = reply.send(result);
             }
             TransportCommand::CloseSession { reply } => {
-                let result = handle_close_session(&mut *transport, &state, &log_tx).await;
+                let result = handle_close_session(&mut *transport, &mut session_state, &state, &log_tx).await;
                 let _ = reply.send(result);
             }
             TransportCommand::SendRequest { data, reply } => {
@@ -398,9 +398,18 @@ async fn handle_open_session(
 
 async fn handle_close_session(
     transport: &mut dyn Transport,
+    session_state: &mut SessionState,
     state: &SharedState,
     log_tx: &broadcast::Sender<DebugLogEntry>,
 ) -> Result<(), AgwpeError> {
+    // Signal the abort flag so that any reconnect loop that checks
+    // `session_state.is_aborted()` can exit early.
+    // NOTE: under the current serial actor model a CloseSession cannot
+    // preempt an in-flight SendRequestWithReconnect — the abort flag is
+    // scaffolding preserved for a future select!-based dispatch refactor
+    // where commands could interleave.
+    session_state.abort();
+
     match transport.close_session().await {
         Ok(()) => {
             set_state(state, log_tx, ConnectionState::AgwpeConnected);

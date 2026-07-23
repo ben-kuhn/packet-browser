@@ -46,7 +46,12 @@ async fn main() -> Result<(), ClientError> {
     let shared_state = create_shared_state(config.clone());
     let (log_tx, _) = broadcast::channel::<state::DebugLogEntry>(256);
 
-    let agwpe_manager = transport::TransportManager::new(shared_state.clone(), log_tx.clone(), config.connection.response_timeout_secs);
+    let agwpe_transport: Box<dyn transport::Transport> = {
+        let mut t = transport::agwpe::AgwpeTransport::new();
+        t.attach_state(shared_state.clone(), log_tx.clone());
+        Box::new(t)
+    };
+    let agwpe_manager = transport::TransportManager::spawn(agwpe_transport, shared_state.clone(), log_tx.clone(), config.connection.response_timeout_secs);
 
     // Auto-connect to AGWPE on startup
     if !config.my_callsign.is_empty() {

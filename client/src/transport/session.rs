@@ -17,7 +17,6 @@ const MAX_HANDSHAKE_TEXT: usize = 64 * 1024;
 pub struct SessionState {
     pub response_timeout_secs: u64,
     pub abort_reconnect: Arc<AtomicBool>,
-    pub last_agreed_disclaimer: Option<String>,
 }
 
 impl SessionState {
@@ -25,7 +24,6 @@ impl SessionState {
         Self {
             response_timeout_secs: response_timeout_secs.max(1),
             abort_reconnect: Arc::new(AtomicBool::new(false)),
-            last_agreed_disclaimer: None,
         }
     }
 
