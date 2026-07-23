@@ -425,10 +425,15 @@ async fn dispatch_ax25(
         _ => None,
     };
 
+    // Clone the manager handle out of the lock before awaiting — holding the
+    // Mutex across an await point blocks operator control (disconnect, transport
+    // swap) for the entire browse round-trip.  TransportManager is Clone (it
+    // is just an mpsc::Sender).
+    let manager = ctx.agwpe.lock().await.clone();
     let send_result = if ctx.config.connection.auto_reconnect {
-        ctx.agwpe.lock().await.send_request_with_reconnect(encoded).await
+        manager.send_request_with_reconnect(encoded).await
     } else {
-        ctx.agwpe.lock().await.send_request(encoded).await
+        manager.send_request(encoded).await
     };
     match send_result {
         Ok(response_data) => {
@@ -802,8 +807,10 @@ async fn api_connect_handler(
                 (cfg, s.config.connection.response_timeout_secs)
             };
 
-            // Build a fresh VaraTransport-backed manager and replace the
-            // active manager so subsequent calls (disconnect, browse) use it.
+            // Build a fresh VaraTransport-backed manager.  We connect the
+            // modem FIRST and only swap the active manager on success so that
+            // a failed connect leaves the existing manager intact and
+            // subsequent /browse clicks keep working.
             let vara_transport: Box<dyn crate::transport::Transport> =
                 Box::new(crate::transport::vara::VaraTransport::new());
             let new_manager = TransportManager::spawn(
@@ -812,14 +819,11 @@ async fn api_connect_handler(
                 ctx.log_tx.clone(),
                 response_timeout_secs,
             );
-            {
-                let mut mgr = ctx.agwpe.lock().await;
-                *mgr = new_manager.clone();
-            }
 
             // Connect the VARA modem. This will fail if no VARA modem is
             // listening on the configured ports (expected in tests/CI).
             if let Err(e) = new_manager.connect_modem(vara_cfg).await {
+                // new_manager is dropped here; the existing manager is untouched.
                 return Json(ConnectResponse {
                     ok: false,
                     state: None,
@@ -827,8 +831,14 @@ async fn api_connect_handler(
                 });
             }
 
-            // If connect_modem succeeded (modem is actually running), proceed
-            // with opening the AX.25/VARA session.
+            // connect_modem succeeded — atomically install the new manager so
+            // that disconnect/browse calls use it from this point on.
+            {
+                let mut mgr = ctx.agwpe.lock().await;
+                *mgr = new_manager.clone();
+            }
+
+            // Proceed with opening the AX.25/VARA session.
             match new_manager.open_session(req.target_callsign, req.port_num).await {
                 Ok(()) => {
                     let state = ctx.state.lock_or_poisoned();
