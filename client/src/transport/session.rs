@@ -23,10 +23,10 @@ pub struct SessionState {
 }
 
 impl SessionState {
-    pub fn new(response_timeout_secs: u64) -> Self {
+    pub fn new(response_timeout_secs: u64, abort_reconnect: Arc<AtomicBool>) -> Self {
         Self {
             response_timeout_secs: response_timeout_secs.max(1),
-            abort_reconnect: Arc::new(AtomicBool::new(false)),
+            abort_reconnect,
         }
     }
 
@@ -446,6 +446,10 @@ pub(crate) async fn handle_send_request(
                     return Err(AgwpeError::SessionDied {
                         reason: "remote sent AX.25 disconnect notification".to_string(),
                     });
+                }
+
+                if session_state.is_aborted() {
+                    return Err(AgwpeError::DisconnectedByOperator);
                 }
 
                 push_log(

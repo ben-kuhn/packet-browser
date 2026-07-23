@@ -1,3 +1,6 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::state::{ConnectionState, DebugLogEntry, LockExt, LogLevel, SharedState};
@@ -43,6 +46,11 @@ enum TransportCommand {
 #[derive(Clone)]
 pub struct TransportManager {
     command_tx: mpsc::Sender<TransportCommand>,
+    /// Shared with the background actor's `SessionState`.  Set to `true` by
+    /// `close_session` and `disconnect_modem` before enqueuing the command so
+    /// an in-flight `SendRequestWithReconnect` can detect the preemption and
+    /// bail out of its recv loop immediately.
+    pub(crate) abort_flag: Arc<AtomicBool>,
 }
 
 impl TransportManager {
@@ -58,12 +66,14 @@ impl TransportManager {
         response_timeout_secs: u64,
     ) -> Self {
         let (command_tx, command_rx) = mpsc::channel(32);
+        let abort_flag = Arc::new(AtomicBool::new(false));
+        let abort_flag_clone = abort_flag.clone();
 
         tokio::spawn(async move {
-            background_task(command_rx, transport, state, log_tx, response_timeout_secs).await;
+            background_task(command_rx, transport, state, log_tx, response_timeout_secs, abort_flag_clone).await;
         });
 
-        Self { command_tx }
+        Self { command_tx, abort_flag }
     }
 
     pub async fn connect_modem(
@@ -82,6 +92,7 @@ impl TransportManager {
     }
 
     pub async fn disconnect_modem(&self) -> Result<(), AgwpeError> {
+        self.abort_flag.store(true, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.command_tx
             .send(TransportCommand::DisconnectModem { reply: tx })
@@ -113,6 +124,7 @@ impl TransportManager {
     }
 
     pub async fn close_session(&self) -> Result<(), AgwpeError> {
+        self.abort_flag.store(true, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         self.command_tx
             .send(TransportCommand::CloseSession { reply: tx })
@@ -150,10 +162,11 @@ async fn background_task(
     state: SharedState,
     log_tx: broadcast::Sender<DebugLogEntry>,
     response_timeout_secs: u64,
+    abort_flag: Arc<AtomicBool>,
 ) {
     // Clamp to at least 1s: a zero-second timeout would fire on every read,
     // instantly SessionDied-ing every request and looping through reconnects.
-    let mut session_state = SessionState::new(response_timeout_secs);
+    let mut session_state = SessionState::new(response_timeout_secs, abort_flag);
 
     // Cache the local callsign so session::handle_reconnect and
     // handle_send_request_with_reconnect can pass it through the handshake
@@ -166,6 +179,7 @@ async fn background_task(
                 config,
                 reply,
             } => {
+                session_state.reset_abort();
                 let callsign = config.local_callsign.clone();
                 let result = handle_connect_modem(
                     &mut *transport,
@@ -209,6 +223,7 @@ async fn background_task(
                 let _ = reply.send(result);
             }
             TransportCommand::SendRequest { data, reply } => {
+                session_state.reset_abort();
                 let result = handle_send_request(
                     &mut *transport,
                     &mut session_state,
@@ -220,6 +235,7 @@ async fn background_task(
                 let _ = reply.send(result);
             }
             TransportCommand::SendRequestWithReconnect { data, reply } => {
+                session_state.reset_abort();
                 let result = handle_send_request_with_reconnect(
                     &mut *transport,
                     &mut session_state,
@@ -390,5 +406,85 @@ async fn handle_close_session(
             Ok(())
         }
         Err(e) => Err(transport_err_to_agwpe(e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::create_shared_state;
+    use crate::transport::{
+        SessionConfig, Transport, TransportConfig, TransportError, TransportEvent,
+    };
+    use async_trait::async_trait;
+    use std::time::Instant;
+
+    /// Minimal no-op transport for unit tests.  All methods succeed immediately;
+    /// `recv` returns `Disconnected` so `handle_send_request` doesn't loop.
+    struct NullTransport;
+
+    #[async_trait]
+    impl Transport for NullTransport {
+        async fn connect_modem(&mut self, _cfg: &TransportConfig) -> Result<(), TransportError> {
+            Ok(())
+        }
+        async fn disconnect_modem(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+        async fn open_session(&mut self, _cfg: &SessionConfig) -> Result<(), TransportError> {
+            Ok(())
+        }
+        async fn close_session(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+        async fn send(&mut self, _data: &[u8]) -> Result<(), TransportError> {
+            Ok(())
+        }
+        async fn recv(&mut self, _deadline: Instant) -> Result<TransportEvent, TransportError> {
+            Ok(TransportEvent::Disconnected {
+                reason: "null transport".to_string(),
+            })
+        }
+        fn port_query_supported(&self) -> bool {
+            false
+        }
+    }
+
+    fn make_manager() -> TransportManager {
+        let state = create_shared_state(crate::config::FileConfig::default());
+        let (log_tx, _) = tokio::sync::broadcast::channel(16);
+        TransportManager::spawn(Box::new(NullTransport), state, log_tx, 5)
+    }
+
+    /// Verify that `close_session()` sets the abort flag before enqueuing the
+    /// command.  The flag is set on the manager handle itself (shared Arc), so
+    /// we can observe it even after the command has been processed.  Because
+    /// `CloseSession` intentionally does NOT reset the flag, it remains set
+    /// after the actor finishes handling the command.
+    #[tokio::test]
+    async fn close_session_sets_abort_flag() {
+        let manager = make_manager();
+        // Flag starts clear.
+        assert!(!manager.abort_flag.load(Ordering::SeqCst));
+
+        // close_session sets the flag before sending the command and waits for
+        // the actor to process it.  Since NullTransport::close_session() returns
+        // Ok immediately, the whole thing resolves without error.
+        manager.close_session().await.unwrap();
+
+        // CloseSession does not reset the flag, so it should still be set.
+        assert!(manager.abort_flag.load(Ordering::SeqCst));
+    }
+
+    /// Verify that `disconnect_modem()` also sets the abort flag.
+    #[tokio::test]
+    async fn disconnect_modem_sets_abort_flag() {
+        let manager = make_manager();
+        assert!(!manager.abort_flag.load(Ordering::SeqCst));
+
+        manager.disconnect_modem().await.unwrap();
+
+        // DisconnectModem does not reset the flag either.
+        assert!(manager.abort_flag.load(Ordering::SeqCst));
     }
 }
