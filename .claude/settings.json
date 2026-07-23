@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh run watch *)",
+      "Bash(gh search code *)",
+      "Bash(nix hash *)",
+      "Bash(nix-prefetch-url *)",
+      "mcp__claude-in-chrome__tabs_context_mcp"
+    ]
+  }
+}

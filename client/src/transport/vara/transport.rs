@@ -24,7 +24,7 @@ impl VaraTransport {
     async fn send_cmd(&mut self, line: &str) -> Result<(), TransportError> {
         let stream = self.cmd.as_mut().ok_or(TransportError::NotConnected)?;
         stream.write_all(line.as_bytes()).await?;
-        stream.write_all(b"\r\n").await?;
+        stream.write_all(b"\r").await?;
         stream.flush().await?;
         Ok(())
     }
@@ -133,8 +133,19 @@ mod tests {
     use crate::transport::{
         AgwpeParams, TransportConfig, TransportKind, VaraBandwidth, VaraMode, VaraParams,
     };
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
+
+    async fn read_until_cr(reader: &mut (impl tokio::io::AsyncRead + Unpin), out: &mut String) {
+        use tokio::io::AsyncReadExt;
+        let mut byte = [0u8; 1];
+        loop {
+            let n = reader.read(&mut byte).await.unwrap();
+            if n == 0 { return; }
+            if byte[0] == b'\r' { return; }
+            out.push(byte[0] as char);
+        }
+    }
 
     async fn mock_ports() -> (u16, u16, tokio::task::JoinHandle<Vec<String>>) {
         let cmd_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -146,12 +157,11 @@ mod tests {
             let (mut cmd_sock, _) = cmd_listener.accept().await.unwrap();
             let (_data_sock, _) = data_listener.accept().await.unwrap();
             let mut lines = Vec::new();
-            let (r, mut w) = cmd_sock.split();
-            let mut reader = BufReader::new(r);
+            let (mut r, mut w) = cmd_sock.split();
             for _ in 0..4 {
                 let mut line = String::new();
-                reader.read_line(&mut line).await.unwrap();
-                lines.push(line.trim().to_string());
+                read_until_cr(&mut r, &mut line).await;
+                lines.push(line);
                 w.write_all(b"OK\r").await.unwrap();
             }
             lines
