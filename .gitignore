@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target/
 
+# Claude Code local IDE config
+.claude/
+
 # Nix build result symlink
 /result
 
