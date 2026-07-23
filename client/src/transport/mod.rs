@@ -1,6 +1,7 @@
 pub mod agwpe;
 pub mod manager;
 pub mod session;
+pub mod vara;
 
 pub use manager::TransportManager;
 
