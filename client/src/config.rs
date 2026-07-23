@@ -286,6 +286,15 @@ impl FileConfig {
         ini.set("connection", "response_timeout_secs", Some(self.connection.response_timeout_secs.to_string()));
         ini.set("connection", "auto_reconnect", Some(self.connection.auto_reconnect.to_string()));
 
+        ini.set("transport", "default", Some(self.transport.default.to_string()));
+
+        ini.set("vara", "cmd_host", Some(self.vara.cmd_host.clone()));
+        ini.set("vara", "cmd_port", Some(self.vara.cmd_port.to_string()));
+        ini.set("vara", "data_host", Some(self.vara.data_host.clone()));
+        ini.set("vara", "data_port", Some(self.vara.data_port.to_string()));
+        ini.set("vara", "mode", Some(self.vara.mode.to_string()));
+        ini.set("vara", "bandwidth", Some(self.vara.bandwidth.to_string()));
+
         ini.write(path).map_err(|e| ConfigError::Parse(e.to_string()))?;
         Ok(())
     }
@@ -573,5 +582,44 @@ bandwidth = vwide
         let cfg = FileConfig::load(&p).unwrap();
         assert_eq!(cfg.transport.default, crate::transport::TransportKind::Ax25);
         assert_eq!(cfg.vara.cmd_port, 8300);
+    }
+
+    #[test]
+    fn test_config_save_load_roundtrip_preserves_transport_and_vara() {
+        use crate::transport::{TransportKind, VaraBandwidth, VaraMode};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+
+        let cfg = FileConfig {
+            agwpe_host: "10.0.0.1".to_string(),
+            agwpe_port: 9999,
+            my_callsign: "W1TEST".to_string(),
+            target_callsign: "N0CALL-9".to_string(),
+            bpq_command: "WEB".to_string(),
+            skip_bpq_app: false,
+            cache: CacheSection::default(),
+            connection: ConnectionConfig::default(),
+            transport: TransportSection { default: TransportKind::VaraFm },
+            vara: VaraSection {
+                cmd_host: "10.1.2.3".to_string(),
+                cmd_port: 8305,
+                data_host: "10.1.2.3".to_string(),
+                data_port: 8306,
+                mode: VaraMode::Hf,
+                bandwidth: VaraBandwidth::Bw500,
+            },
+        };
+
+        cfg.save(&path).unwrap();
+        let loaded = FileConfig::load(&path).unwrap();
+
+        assert_eq!(loaded.transport.default, TransportKind::VaraFm, "transport.default not roundtripped");
+        assert_eq!(loaded.vara.cmd_host, "10.1.2.3", "vara.cmd_host not roundtripped");
+        assert_eq!(loaded.vara.cmd_port, 8305, "vara.cmd_port not roundtripped");
+        assert_eq!(loaded.vara.data_host, "10.1.2.3", "vara.data_host not roundtripped");
+        assert_eq!(loaded.vara.data_port, 8306, "vara.data_port not roundtripped");
+        assert_eq!(loaded.vara.mode, VaraMode::Hf, "vara.mode not roundtripped");
+        assert_eq!(loaded.vara.bandwidth, VaraBandwidth::Bw500, "vara.bandwidth not roundtripped");
     }
 }

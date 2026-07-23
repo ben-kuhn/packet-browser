@@ -81,6 +81,15 @@ pub enum VaraMode {
     Hf,
 }
 
+impl std::fmt::Display for VaraMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            VaraMode::Fm => "fm",
+            VaraMode::Hf => "hf",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VaraBandwidth {
     VNarrow,
@@ -89,6 +98,19 @@ pub enum VaraBandwidth {
     Bw500,
     Bw2300,
     Bw2750,
+}
+
+impl std::fmt::Display for VaraBandwidth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            VaraBandwidth::VNarrow => "vnarrow",
+            VaraBandwidth::VWide => "vwide",
+            VaraBandwidth::Bw250 => "bw250",
+            VaraBandwidth::Bw500 => "bw500",
+            VaraBandwidth::Bw2300 => "bw2300",
+            VaraBandwidth::Bw2750 => "bw2750",
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
