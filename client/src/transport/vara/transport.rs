@@ -7,6 +7,10 @@ use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
+async fn read_cmd_ready(stream: &mut TcpStream) -> std::io::Result<()> {
+    stream.readable().await
+}
+
 const PLACEHOLDER_CALL: &str = "N0CALL";
 const OK_TIMEOUT_SECS: u64 = 5;
 
@@ -102,26 +106,114 @@ impl Transport for VaraTransport {
 
     async fn open_session(
         &mut self,
-        _cfg: &SessionConfig,
+        cfg: &SessionConfig,
     ) -> Result<(), TransportError> {
-        // Filled in Task 7.
-        Err(TransportError::ModemError("open_session not yet implemented".into()))
+        // Re-issue MYCALL with the operator's callsign now that we know it.
+        self.send_cmd(&format!("MYCALL {}", cfg.local_callsign)).await?;
+        self.await_ok().await?;
+
+        // Request the connection.
+        self.send_cmd(&format!(
+            "CONNECT {} {}",
+            cfg.local_callsign, cfg.remote_callsign
+        ))
+        .await?;
+
+        // Accept PENDING then CONNECTED, or fail on DISCONNECTED / BUSY DETECTED.
+        let connect_deadline = Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let line = self.read_cmd_line(connect_deadline).await?;
+            match parse_line(&line) {
+                VaraResponse::Pending => continue,
+                VaraResponse::Connected { .. } => return Ok(()),
+                VaraResponse::Disconnected => {
+                    return Err(TransportError::SessionRejected(
+                        "vara: link dropped during CONNECT".into(),
+                    ));
+                }
+                VaraResponse::BusyDetected => {
+                    return Err(TransportError::SessionRejected("channel busy".into()));
+                }
+                VaraResponse::Unknown(s) => {
+                    tracing::debug!(response = %s, "ignoring VARA cmd during CONNECT");
+                    continue;
+                }
+                other => {
+                    return Err(TransportError::ModemError(format!(
+                        "unexpected during CONNECT: {other:?}"
+                    )));
+                }
+            }
+        }
     }
 
     async fn close_session(&mut self) -> Result<(), TransportError> {
-        // Filled in Task 7.
-        Err(TransportError::ModemError("close_session not yet implemented".into()))
+        self.send_cmd("DISCONNECT").await?;
+        // Drain up to 3s waiting for DISCONNECTED confirmation.
+        let deadline = Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            match self.read_cmd_line(deadline).await {
+                Ok(line) if matches!(parse_line(&line), VaraResponse::Disconnected) => {
+                    return Ok(());
+                }
+                Ok(_) => continue,
+                Err(TransportError::Timeout) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
     }
 
-    async fn send(&mut self, _data: &[u8]) -> Result<(), TransportError> {
-        Err(TransportError::ModemError("send not yet implemented".into()))
+    async fn send(&mut self, data: &[u8]) -> Result<(), TransportError> {
+        let stream = self.data.as_mut().ok_or(TransportError::NotConnected)?;
+        stream.write_all(data).await?;
+        stream.flush().await?;
+        Ok(())
     }
 
     async fn recv(
         &mut self,
-        _deadline: Instant,
+        deadline: Instant,
     ) -> Result<TransportEvent, TransportError> {
-        Err(TransportError::ModemError("recv not yet implemented".into()))
+        loop {
+            if Instant::now() >= deadline {
+                return Err(TransportError::Timeout);
+            }
+            let data = self.data.as_mut().ok_or(TransportError::NotConnected)?;
+            let cmd = self.cmd.as_mut().ok_or(TransportError::NotConnected)?;
+            let mut data_chunk = [0u8; 4096];
+            tokio::select! {
+                // Data-port readable → return the bytes.
+                n = tokio::io::AsyncReadExt::read(data, &mut data_chunk) => {
+                    let n = n?;
+                    if n == 0 {
+                        return Ok(TransportEvent::Disconnected {
+                            reason: "data port closed".into(),
+                        });
+                    }
+                    return Ok(TransportEvent::Data(data_chunk[..n].to_vec()));
+                }
+                // Command-port readable → parse a line.
+                _ = read_cmd_ready(cmd) => {
+                    let line_deadline = Instant::now()
+                        + std::time::Duration::from_millis(100);
+                    let line = self.read_cmd_line(line_deadline).await?;
+                    match parse_line(&line) {
+                        VaraResponse::Disconnected => {
+                            return Ok(TransportEvent::Disconnected {
+                                reason: "vara modem reports disconnect".into(),
+                            });
+                        }
+                        other => {
+                            tracing::debug!(?other, "VARA cmd line during recv");
+                            continue;
+                        }
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                    continue;
+                }
+            }
+        }
     }
 
     fn port_query_supported(&self) -> bool { false }
@@ -170,6 +262,16 @@ mod tests {
         (cmd_port, data_port, handle)
     }
 
+    fn session_cfg() -> SessionConfig {
+        SessionConfig {
+            local_callsign: "W1TEST".into(),
+            remote_callsign: "N0CALL-8".into(),
+            bpq_command: String::new(),
+            skip_bpq_app: true,
+            agwpe_port: 0,
+        }
+    }
+
     #[tokio::test]
     async fn connect_modem_sends_expected_setup_commands() {
         let (cmd_port, data_port, mock) = mock_ports().await;
@@ -199,5 +301,218 @@ mod tests {
             "COMPRESSION OFF".to_string(),
             "VWIDE".to_string(),
         ]);
+    }
+
+    #[tokio::test]
+    async fn open_session_sends_connect_and_reports_success_on_connected_line() {
+        let cmd_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cmd_port = cmd_listener.local_addr().unwrap().port();
+        let data_port = data_listener.local_addr().unwrap().port();
+
+        let mock = tokio::spawn(async move {
+            let (mut cmd_sock, _) = cmd_listener.accept().await.unwrap();
+            let (_data_sock, _) = data_listener.accept().await.unwrap();
+            let (mut r, mut w) = cmd_sock.split();
+            // Ack the four setup commands.
+            for _ in 0..4 {
+                let mut line = String::new();
+                read_until_cr(&mut r, &mut line).await;
+                w.write_all(b"OK\r").await.unwrap();
+            }
+            // Ack the MYCALL re-issue in open_session.
+            let mut line = String::new();
+            read_until_cr(&mut r, &mut line).await;
+            assert_eq!(line, "MYCALL W1TEST");
+            w.write_all(b"OK\r").await.unwrap();
+            // Ack CONNECT with PENDING then CONNECTED.
+            let mut line = String::new();
+            read_until_cr(&mut r, &mut line).await;
+            assert_eq!(line, "CONNECT W1TEST N0CALL-8");
+            w.write_all(b"PENDING\r").await.unwrap();
+            w.write_all(b"CONNECTED W1TEST N0CALL-8\r").await.unwrap();
+        });
+
+        let mut vara = VaraTransport::new();
+        let cfg = TransportConfig {
+            kind: TransportKind::VaraFm,
+            agwpe: AgwpeParams { host: "unused".into(), port: 0 },
+            vara: VaraParams {
+                cmd_host: "127.0.0.1".into(),
+                cmd_port,
+                data_host: "127.0.0.1".into(),
+                data_port,
+                mode: VaraMode::Fm,
+                bandwidth: VaraBandwidth::VWide,
+            },
+            local_callsign: "W1TEST".into(),
+        };
+        vara.connect_modem(&cfg).await.unwrap();
+        let session = session_cfg();
+        vara.open_session(&session).await.unwrap();
+        mock.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recv_translates_disconnected_command_line_to_transport_event() {
+        let cmd_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cmd_port = cmd_listener.local_addr().unwrap().port();
+        let data_port = data_listener.local_addr().unwrap().port();
+
+        let mock = tokio::spawn(async move {
+            let (mut cmd_sock, _) = cmd_listener.accept().await.unwrap();
+            let (_data_sock, _) = data_listener.accept().await.unwrap();
+            let (mut r, mut w) = cmd_sock.split();
+            // Ack four setup commands.
+            for _ in 0..4 {
+                let mut line = String::new();
+                read_until_cr(&mut r, &mut line).await;
+                w.write_all(b"OK\r").await.unwrap();
+            }
+            // Ack MYCALL re-issue.
+            let mut line = String::new();
+            read_until_cr(&mut r, &mut line).await;
+            w.write_all(b"OK\r").await.unwrap();
+            // Ack CONNECT with CONNECTED.
+            let mut line = String::new();
+            read_until_cr(&mut r, &mut line).await;
+            w.write_all(b"CONNECTED W1TEST N0CALL-8\r").await.unwrap();
+            // Now emit DISCONNECTED to trigger recv().
+            w.write_all(b"DISCONNECTED\r").await.unwrap();
+        });
+
+        let mut vara = VaraTransport::new();
+        let cfg = TransportConfig {
+            kind: TransportKind::VaraFm,
+            agwpe: AgwpeParams { host: "unused".into(), port: 0 },
+            vara: VaraParams {
+                cmd_host: "127.0.0.1".into(),
+                cmd_port,
+                data_host: "127.0.0.1".into(),
+                data_port,
+                mode: VaraMode::Fm,
+                bandwidth: VaraBandwidth::VWide,
+            },
+            local_callsign: "W1TEST".into(),
+        };
+        vara.connect_modem(&cfg).await.unwrap();
+        vara.open_session(&session_cfg()).await.unwrap();
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let event = vara.recv(deadline).await.unwrap();
+        match event {
+            TransportEvent::Disconnected { reason } => {
+                assert!(reason.contains("disconnect"), "unexpected reason: {reason}");
+            }
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
+        mock.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_writes_bytes_on_data_port() {
+        let cmd_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cmd_port = cmd_listener.local_addr().unwrap().port();
+        let data_port = data_listener.local_addr().unwrap().port();
+
+        let mock = tokio::spawn(async move {
+            let (mut cmd_sock, _) = cmd_listener.accept().await.unwrap();
+            let (mut data_sock, _) = data_listener.accept().await.unwrap();
+            let (mut r, mut w) = cmd_sock.split();
+            // Ack four setup commands.
+            for _ in 0..4 {
+                let mut line = String::new();
+                read_until_cr(&mut r, &mut line).await;
+                w.write_all(b"OK\r").await.unwrap();
+            }
+            // Ack MYCALL re-issue.
+            let mut line = String::new();
+            read_until_cr(&mut r, &mut line).await;
+            w.write_all(b"OK\r").await.unwrap();
+            // Ack CONNECT.
+            let mut line = String::new();
+            read_until_cr(&mut r, &mut line).await;
+            w.write_all(b"CONNECTED W1TEST N0CALL-8\r").await.unwrap();
+
+            // Read exactly the bytes sent via vara.send().
+            let mut buf = vec![0u8; 6];
+            tokio::io::AsyncReadExt::read_exact(&mut data_sock, &mut buf).await.unwrap();
+            buf
+        });
+
+        let mut vara = VaraTransport::new();
+        let cfg = TransportConfig {
+            kind: TransportKind::VaraFm,
+            agwpe: AgwpeParams { host: "unused".into(), port: 0 },
+            vara: VaraParams {
+                cmd_host: "127.0.0.1".into(),
+                cmd_port,
+                data_host: "127.0.0.1".into(),
+                data_port,
+                mode: VaraMode::Fm,
+                bandwidth: VaraBandwidth::VWide,
+            },
+            local_callsign: "W1TEST".into(),
+        };
+        vara.connect_modem(&cfg).await.unwrap();
+        vara.open_session(&session_cfg()).await.unwrap();
+        vara.send(b"GET /\n").await.unwrap();
+
+        let received = mock.await.unwrap();
+        assert_eq!(received, b"GET /\n");
+    }
+
+    #[tokio::test]
+    async fn close_session_sends_disconnect_and_drains_confirmation() {
+        let cmd_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cmd_port = cmd_listener.local_addr().unwrap().port();
+        let data_port = data_listener.local_addr().unwrap().port();
+
+        let mock = tokio::spawn(async move {
+            let (mut cmd_sock, _) = cmd_listener.accept().await.unwrap();
+            let (_data_sock, _) = data_listener.accept().await.unwrap();
+            let (mut r, mut w) = cmd_sock.split();
+            // Ack four setup commands.
+            for _ in 0..4 {
+                let mut line = String::new();
+                read_until_cr(&mut r, &mut line).await;
+                w.write_all(b"OK\r").await.unwrap();
+            }
+            // Ack MYCALL re-issue.
+            let mut line = String::new();
+            read_until_cr(&mut r, &mut line).await;
+            w.write_all(b"OK\r").await.unwrap();
+            // Ack CONNECT.
+            let mut line = String::new();
+            read_until_cr(&mut r, &mut line).await;
+            w.write_all(b"CONNECTED W1TEST N0CALL-8\r").await.unwrap();
+            // Read DISCONNECT and send DISCONNECTED back once.
+            let mut line = String::new();
+            read_until_cr(&mut r, &mut line).await;
+            assert_eq!(line, "DISCONNECT");
+            w.write_all(b"DISCONNECTED\r").await.unwrap();
+        });
+
+        let mut vara = VaraTransport::new();
+        let cfg = TransportConfig {
+            kind: TransportKind::VaraFm,
+            agwpe: AgwpeParams { host: "unused".into(), port: 0 },
+            vara: VaraParams {
+                cmd_host: "127.0.0.1".into(),
+                cmd_port,
+                data_host: "127.0.0.1".into(),
+                data_port,
+                mode: VaraMode::Fm,
+                bandwidth: VaraBandwidth::VWide,
+            },
+            local_callsign: "W1TEST".into(),
+        };
+        vara.connect_modem(&cfg).await.unwrap();
+        vara.open_session(&session_cfg()).await.unwrap();
+        vara.close_session().await.unwrap();
+        mock.await.unwrap();
     }
 }
