@@ -652,13 +652,8 @@ async fn api_agwpe_status_post(
             local_callsign: callsign,
         }
     };
-    match ctx
-        .agwpe
-        .lock()
-        .await
-        .connect_modem(agwpe_cfg)
-        .await
-    {
+    let cm_manager = ctx.agwpe.lock().await.clone();
+    match cm_manager.connect_modem(agwpe_cfg).await {
         Ok(()) => {
             let qp_manager = ctx.agwpe.lock().await.clone();
             if let Err(e) = qp_manager.query_ports().await {
