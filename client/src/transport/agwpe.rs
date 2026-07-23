@@ -871,8 +871,11 @@ fn agwpe_to_transport_err(e: AgwpeError) -> crate::transport::TransportError {
     }
 }
 
-/// Test helpers – not gated by `#[cfg(test)]` so that `mod.rs` integration
-/// tests (which live in a different compilation unit) can access them.
+/// Test helpers for unit tests that need to construct raw AGWPE frames.
+/// Gated by `#[cfg(test)]` — no production code or integration test consumes
+/// this module; it existed as public API only to support the `mod.rs` unit
+/// test which already lives under `#[cfg(test)]`.
+#[cfg(test)]
 pub mod test_helpers {
     use super::*;
 
