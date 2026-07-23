@@ -28,11 +28,6 @@ pub enum TransportError {
 pub enum TransportEvent {
     Data(Vec<u8>),
     Disconnected { reason: String },
-    /// The link-layer connection came up. Emitted in response to
-    /// `open_ax25_link`. Callers use this to exit their connect-wait loop.
-    LinkOpened,
-    /// The peer rejected the link-open attempt.
-    LinkRejected { reason: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -9,6 +9,9 @@ use crate::state::{
 };
 use crate::transport::agwpe::{is_session_dead_payload, AgwpeError};
 use crate::transport::{Transport, TransportError, TransportEvent};
+// Note: TransportEvent no longer carries LinkOpened / LinkRejected variants —
+// those have been collapsed into Transport::open_ax25_link which now blocks
+// until the link is confirmed.  See agwpe.rs::open_ax25_link.
 
 // Defensive caps against a hostile or buggy peer.
 const MAX_RESPONSE_SIZE: usize = 10 * 1024 * 1024;
@@ -92,9 +95,16 @@ pub(crate) fn matches_stored_disclaimer(server_text: &str, stored: Option<&str>)
 // Session-level driver code. Speaks Transport, not AgwpeFrame.
 // ---------------------------------------------------------------------------
 
-/// Send an AX.25 Connect frame (via `Transport::open_ax25_link`) and loop
-/// waiting for the link-open confirmation.  The transport already knows the
-/// target from the preceding `open_session` call.
+/// Send an AX.25 Connect frame and wait for the link-open confirmation.
+///
+/// `Transport::open_ax25_link` is now responsible for both sending the Connect
+/// frame AND blocking until the peer confirms the link (or rejects it).  For
+/// AGWPE this means reading frames until `Connected` (0x63) or a LinBPQ
+/// `*** CONNECTED` payload arrives; for VARA the link is already established
+/// by the time `open_session` returns, so `open_ax25_link` is a no-op.
+///
+/// The result is that this function reduces to a single `await` — the recv
+/// loop and `LinkOpened`/`LinkRejected` matching have been removed.
 pub(crate) async fn ax25_open_and_await_connected(
     transport: &mut dyn Transport,
     _session_state: &mut SessionState,
@@ -102,57 +112,13 @@ pub(crate) async fn ax25_open_and_await_connected(
     log_tx: &broadcast::Sender<DebugLogEntry>,
 ) -> Result<(), AgwpeError> {
     transport.open_ax25_link().await.map_err(transport_err_to_agwpe)?;
-
-    loop {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let event = transport
-            .recv(deadline)
-            .await
-            .map_err(transport_err_to_agwpe)?;
-        match event {
-            TransportEvent::LinkOpened => {
-                push_log(
-                    state,
-                    log_tx,
-                    DebugLogEntry::new(LogLevel::Info, "PROTOCOL", "AX.25 connected")
-                        .with_direction(Direction::Rx),
-                );
-                return Ok(());
-            }
-            TransportEvent::LinkRejected { reason } => {
-                let msg = format!("AX.25 connection rejected: {}", reason);
-                push_log(
-                    state,
-                    log_tx,
-                    DebugLogEntry::new(LogLevel::Info, "ERROR", &msg)
-                        .with_direction(Direction::Rx),
-                );
-                return Err(AgwpeError::ConnectionFailed(msg));
-            }
-            TransportEvent::Disconnected { reason } => {
-                let msg = format!("AX.25 connect: peer disconnected: {}", reason);
-                push_log(
-                    state,
-                    log_tx,
-                    DebugLogEntry::new(LogLevel::Info, "ERROR", &msg)
-                        .with_direction(Direction::Rx),
-                );
-                return Err(AgwpeError::ConnectionFailed(msg));
-            }
-            TransportEvent::Data(_) => {
-                // Ignore any in-flight banner text before the confirmation.
-                push_log(
-                    state,
-                    log_tx,
-                    DebugLogEntry::new(
-                        LogLevel::Debug,
-                        "PROTOCOL",
-                        "Ignoring data frame while awaiting AX.25 connect",
-                    ),
-                );
-            }
-        }
-    }
+    push_log(
+        state,
+        log_tx,
+        DebugLogEntry::new(LogLevel::Info, "PROTOCOL", "AX.25 link open confirmed")
+            .with_direction(Direction::Rx),
+    );
+    Ok(())
 }
 
 /// Send the BPQ application command (e.g. "WEB\n") over the current session.
@@ -229,24 +195,11 @@ pub(crate) async fn bpq_await_callsign_prompt_and_send_callsign(
                     break;
                 }
             }
-            TransportEvent::LinkRejected { reason } => {
-                return Err(AgwpeError::ConnectionFailed(format!(
-                    "Connection rejected during BPQ handshake: {}",
-                    reason
-                )));
-            }
             TransportEvent::Disconnected { reason } => {
                 return Err(AgwpeError::ConnectionFailed(format!(
                     "Peer disconnected during BPQ handshake: {}",
                     reason
                 )));
-            }
-            TransportEvent::LinkOpened => {
-                push_log(
-                    state,
-                    log_tx,
-                    DebugLogEntry::new(LogLevel::Debug, "BPQ", "Ignoring LinkOpened during handshake"),
-                );
             }
         }
     }
@@ -310,24 +263,11 @@ pub(crate) async fn bpq_await_disclaimer(
                     break;
                 }
             }
-            TransportEvent::LinkRejected { reason } => {
-                return Err(AgwpeError::ConnectionFailed(format!(
-                    "Connection rejected during BPQ handshake: {}",
-                    reason
-                )));
-            }
             TransportEvent::Disconnected { reason } => {
                 return Err(AgwpeError::ConnectionFailed(format!(
                     "Peer disconnected during BPQ handshake: {}",
                     reason
                 )));
-            }
-            TransportEvent::LinkOpened => {
-                push_log(
-                    state,
-                    log_tx,
-                    DebugLogEntry::new(LogLevel::Debug, "BPQ", "Ignoring LinkOpened during handshake"),
-                );
             }
         }
     }
@@ -600,23 +540,6 @@ pub(crate) async fn handle_send_request(
                     .with_direction(Direction::Rx),
                 );
                 return Err(AgwpeError::SessionDied { reason });
-            }
-            TransportEvent::LinkRejected { reason } => {
-                return Err(AgwpeError::ConnectionFailed(format!(
-                    "Connection rejected during request: {}",
-                    reason
-                )));
-            }
-            TransportEvent::LinkOpened => {
-                push_log(
-                    state,
-                    log_tx,
-                    DebugLogEntry::new(
-                        LogLevel::Debug,
-                        "PROTOCOL",
-                        "Ignoring stray LinkOpened during request",
-                    ),
-                );
             }
         }
     }

@@ -691,27 +691,25 @@ impl crate::transport::Transport for AgwpeTransport {
                     Ok(crate::transport::TransportEvent::Data(frame.data))
                 }
             }
-            // AGWPE-standard 'c' 0x63 is the connected notification.
-            FrameType::Connected => Ok(crate::transport::TransportEvent::LinkOpened),
-            // LinBPQ sends 0x43 ('C') for both connect request AND connected
-            // notification.  If the payload starts with "***" and contains
-            // "CONNECTED", treat it as a link-open signal; otherwise it's
-            // in-band data.
-            FrameType::Connect => {
-                if frame.data.starts_with(b"***")
-                    && frame.data.windows(b"CONNECTED".len()).any(|w| w == b"CONNECTED")
-                {
-                    Ok(crate::transport::TransportEvent::LinkOpened)
-                } else {
-                    Ok(crate::transport::TransportEvent::Data(frame.data))
-                }
-            }
+            // AGWPE-standard 'c' (0x63) — should have been consumed by
+            // `open_ax25_link`, but may arrive stale mid-session (e.g. if the
+            // modem echoes a re-connect confirmation).  Treat as empty data so
+            // callers skip it gracefully rather than blocking.
+            FrameType::Connected => Ok(crate::transport::TransportEvent::Data(vec![])),
+            // LinBPQ sends 'C' (0x43) for both connect-request and connected
+            // notification.  `open_ax25_link` already consumed the first one.
+            // Any stray Connect frame that arrives during a session is
+            // in-band data unless it carries a `*** CONNECTED` payload (which
+            // we also treat as empty data — the link is already open).
+            FrameType::Connect => Ok(crate::transport::TransportEvent::Data(frame.data)),
+            // ConnectionRejected during a live session signals the peer tore
+            // down the link — surface as a Disconnected event.
             FrameType::ConnectionRejected => {
                 let reason = format!(
                     "connection rejected by peer: {}",
                     String::from_utf8_lossy(&frame.data)
                 );
-                Ok(crate::transport::TransportEvent::LinkRejected { reason })
+                Ok(crate::transport::TransportEvent::Disconnected { reason })
             }
             _ => Ok(crate::transport::TransportEvent::Data(vec![])),
         }
@@ -746,7 +744,80 @@ impl crate::transport::Transport for AgwpeTransport {
         self.send_frame_internal(&connect_frame)
             .await
             .map_err(agwpe_to_transport_err)?;
-        Ok(())
+
+        // Block until the peer sends a Connected (0x63) or LinBPQ-style
+        // Connect (0x43) with `*** CONNECTED` payload, or a rejection.  This
+        // makes the trait method self-contained: callers no longer need a
+        // post-call recv loop to discover whether the link came up.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let frame = self
+                .read_frame_with_timeout_deadline(deadline)
+                .await
+                .map_err(|e| match e {
+                    AgwpeError::Timeout => crate::transport::TransportError::Timeout,
+                    AgwpeError::NotConnected => crate::transport::TransportError::NotConnected,
+                    AgwpeError::Io(io) => crate::transport::TransportError::Io(io),
+                    other => crate::transport::TransportError::ModemError(other.to_string()),
+                })?;
+
+            match frame.frame_type {
+                // Standard AGWPE-P 'c' (0x63) — connected.
+                FrameType::Connected => {
+                    self.push_log(
+                        DebugLogEntry::new(
+                            LogLevel::Info,
+                            "PROTOCOL",
+                            "AX.25 connected (AGWPE 'c')",
+                        )
+                        .with_direction(Direction::Rx),
+                    );
+                    return Ok(());
+                }
+                // LinBPQ sends 'C' (0x43) for both outgoing connect-request
+                // AND the connected notification.  Distinguish by payload.
+                FrameType::Connect
+                    if frame.data.starts_with(b"***")
+                        && frame
+                            .data
+                            .windows(b"CONNECTED".len())
+                            .any(|w| w == b"CONNECTED") =>
+                {
+                    self.push_log(
+                        DebugLogEntry::new(
+                            LogLevel::Info,
+                            "PROTOCOL",
+                            "AX.25 connected (LinBPQ '*** CONNECTED')",
+                        )
+                        .with_direction(Direction::Rx),
+                    );
+                    return Ok(());
+                }
+                FrameType::ConnectionRejected => {
+                    let reason = format!(
+                        "connection rejected by peer: {}",
+                        String::from_utf8_lossy(&frame.data)
+                    );
+                    self.push_log(
+                        DebugLogEntry::new(LogLevel::Info, "ERROR", &reason)
+                            .with_direction(Direction::Rx),
+                    );
+                    return Err(crate::transport::TransportError::SessionRejected(reason));
+                }
+                // Any other frame (data, stale notifications) — discard and
+                // keep waiting for the connection confirmation.
+                _ => {
+                    self.push_log(DebugLogEntry::new(
+                        LogLevel::Debug,
+                        "PROTOCOL",
+                        &format!(
+                            "Ignoring {:?} frame while awaiting AX.25 connect confirmation",
+                            frame.frame_type
+                        ),
+                    ));
+                }
+            }
+        }
     }
 
     async fn reopen_modem_connection(&mut self) -> Result<(), crate::transport::TransportError> {
