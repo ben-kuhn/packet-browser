@@ -1,6 +1,6 @@
 [package]
 name = "packet-browser-server"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "Packet radio web browser server - fetches and sanitizes web pages"
 license = "GPL-3.0"
