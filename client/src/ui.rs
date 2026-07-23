@@ -203,7 +203,30 @@ pub fn connect_page(
     connection_state: &str,
     connection_state_class: &str,
     ports_json: &str,
+    transport_default: crate::transport::TransportKind,
+    vara_params: &crate::transport::VaraParams,
 ) -> String {
+    use crate::transport::TransportKind;
+
+    let ax25_hidden = if transport_default == TransportKind::Ax25 { "" } else { " hidden" };
+    let vara_hidden = if transport_default != TransportKind::Ax25 { "" } else { " hidden" };
+
+    let ax25_selected    = if transport_default == TransportKind::Ax25    { " selected" } else { "" };
+    let vara_fm_selected = if transport_default == TransportKind::VaraFm  { " selected" } else { "" };
+    let vara_hf_selected = if transport_default == TransportKind::VaraHf  { " selected" } else { "" };
+
+    let vara_cmd_host  = h(&vara_params.cmd_host);
+    let vara_cmd_port  = vara_params.cmd_port;
+    let vara_data_host = h(&vara_params.data_host);
+    let vara_data_port = vara_params.data_port;
+
+    let vara_bw_vnarrow_sel = if vara_params.bandwidth == crate::transport::VaraBandwidth::VNarrow { " selected" } else { "" };
+    let vara_bw_vwide_sel   = if vara_params.bandwidth == crate::transport::VaraBandwidth::VWide   { " selected" } else { "" };
+    let vara_bw_250_sel     = if vara_params.bandwidth == crate::transport::VaraBandwidth::Bw250   { " selected" } else { "" };
+    let vara_bw_500_sel     = if vara_params.bandwidth == crate::transport::VaraBandwidth::Bw500   { " selected" } else { "" };
+    let vara_bw_2300_sel    = if vara_params.bandwidth == crate::transport::VaraBandwidth::Bw2300  { " selected" } else { "" };
+    let vara_bw_2750_sel    = if vara_params.bandwidth == crate::transport::VaraBandwidth::Bw2750  { " selected" } else { "" };
+
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -238,10 +261,51 @@ pub fn connect_page(
         </div>
 
         <div class="form-group">
-            <label for="port-select">AGWPE Port</label>
-            <select id="port-select">
-                <option value="">-- query AGWPE for ports --</option>
+            <label for="transport">Transport</label>
+            <select id="transport" onchange="onTransportChange()">
+                <option value="ax25"{ax25_selected}>AX.25 (AGWPE)</option>
+                <option value="vara_fm"{vara_fm_selected}>VARA FM</option>
+                <option value="vara_hf"{vara_hf_selected}>VARA HF</option>
             </select>
+        </div>
+
+        <div id="ax25-fields"{ax25_hidden}>
+            <div class="form-group">
+                <label for="port-select">AGWPE Port</label>
+                <select id="port-select">
+                    <option value="">-- query AGWPE for ports --</option>
+                </select>
+            </div>
+        </div>
+
+        <div id="vara-fields"{vara_hidden}>
+            <div class="form-group">
+                <label for="vara-cmd-host">VARA Command Host</label>
+                <input type="text" id="vara-cmd-host" value="{vara_cmd_host}" placeholder="127.0.0.1" autocomplete="off">
+            </div>
+            <div class="form-group">
+                <label for="vara-cmd-port">VARA Command Port</label>
+                <input type="number" id="vara-cmd-port" value="{vara_cmd_port}" min="1" max="65535">
+            </div>
+            <div class="form-group">
+                <label for="vara-data-host">VARA Data Host</label>
+                <input type="text" id="vara-data-host" value="{vara_data_host}" placeholder="127.0.0.1" autocomplete="off">
+            </div>
+            <div class="form-group">
+                <label for="vara-data-port">VARA Data Port</label>
+                <input type="number" id="vara-data-port" value="{vara_data_port}" min="1" max="65535">
+            </div>
+            <div class="form-group">
+                <label for="vara-bandwidth">Bandwidth</label>
+                <select id="vara-bandwidth">
+                    <option value="vnarrow"{vara_bw_vnarrow_sel}>VNarrow</option>
+                    <option value="vwide"{vara_bw_vwide_sel}>VWide</option>
+                    <option value="bw250"{vara_bw_250_sel}>BW250</option>
+                    <option value="bw500"{vara_bw_500_sel}>BW500</option>
+                    <option value="bw2300"{vara_bw_2300_sel}>BW2300</option>
+                    <option value="bw2750"{vara_bw_2750_sel}>BW2750</option>
+                </select>
+            </div>
         </div>
 
         <div class="btn-row">
@@ -482,6 +546,19 @@ pub fn connect_page(
             return d.innerHTML;
         }}
 
+        function onTransportChange() {{
+            const t = document.getElementById('transport').value;
+            const ax25Fields = document.getElementById('ax25-fields');
+            const varaFields = document.getElementById('vara-fields');
+            if (t === 'ax25') {{
+                ax25Fields.removeAttribute('hidden');
+                varaFields.setAttribute('hidden', '');
+            }} else {{
+                ax25Fields.setAttribute('hidden', '');
+                varaFields.removeAttribute('hidden');
+            }}
+        }}
+
         function connectSSE() {{
             if (eventSource) eventSource.close();
             eventSource = new EventSource('/events');
@@ -524,6 +601,21 @@ pub fn connect_page(
         my_call = h(my_callsign),
         target_call = h(target_callsign),
         ports_json = json_for_script(ports_json),
+        ax25_selected = ax25_selected,
+        vara_fm_selected = vara_fm_selected,
+        vara_hf_selected = vara_hf_selected,
+        ax25_hidden = ax25_hidden,
+        vara_hidden = vara_hidden,
+        vara_cmd_host = vara_cmd_host,
+        vara_cmd_port = vara_cmd_port,
+        vara_data_host = vara_data_host,
+        vara_data_port = vara_data_port,
+        vara_bw_vnarrow_sel = vara_bw_vnarrow_sel,
+        vara_bw_vwide_sel = vara_bw_vwide_sel,
+        vara_bw_250_sel = vara_bw_250_sel,
+        vara_bw_500_sel = vara_bw_500_sel,
+        vara_bw_2300_sel = vara_bw_2300_sel,
+        vara_bw_2750_sel = vara_bw_2750_sel,
     )
 }
 
@@ -894,6 +986,35 @@ pub fn cache_page(rows: &[CachePageRow], total_bytes: u64, cap_bytes: u64) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connect_page_renders_transport_dropdown_with_defaults() {
+        use crate::transport::{TransportKind, VaraParams, VaraMode, VaraBandwidth};
+
+        let html = connect_page(
+            "W1TEST",
+            "N0CALL-8",
+            "AGWPE Connected",
+            "status-connected",
+            "[]",
+            TransportKind::VaraFm,
+            &VaraParams {
+                cmd_host: "10.0.0.5".into(),
+                cmd_port: 8300,
+                data_host: "10.0.0.5".into(),
+                data_port: 8301,
+                mode: VaraMode::Fm,
+                bandwidth: VaraBandwidth::VWide,
+            },
+        );
+
+        assert!(html.contains("<select id=\"transport\""));
+        assert!(html.contains("value=\"ax25\""));
+        assert!(html.contains("value=\"vara_fm\" selected"));
+        assert!(html.contains("value=\"vara_hf\""));
+        assert!(html.contains("id=\"vara-cmd-host\""));
+        assert!(html.contains("value=\"10.0.0.5\""));
+    }
 
     #[test]
     fn test_session_error_page_shows_message_and_link() {

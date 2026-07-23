@@ -144,6 +144,7 @@ pub fn create_router(ctx: Arc<AppContext>) -> Router {
         .route("/api/consent", post(api_consent_post))
         .route("/api/config", get(api_config_get))
         .route("/api/config", post(api_config_post))
+        .route("/api/state", get(api_state_get))
         .route("/api/cache/clear", post(api_cache_clear))
         .route("/api/cache/delete", post(api_cache_delete))
         .route("/events", get(events_handler))
@@ -227,6 +228,8 @@ async fn root_handler() -> impl IntoResponse {
 async fn connect_page_handler(
     Extension(ctx): Extension<Arc<AppContext>>,
 ) -> impl IntoResponse {
+    use crate::transport::{VaraParams, VaraMode, VaraBandwidth};
+
     let state = ctx.state.lock_or_poisoned();
     let my_callsign = state.config.my_callsign.clone();
     let target_callsign = state.config.target_callsign.clone();
@@ -241,6 +244,25 @@ async fn connect_page_handler(
         ConnectionState::Error(_) => "status-error",
     };
     let ports_json = serde_json::to_string(&state.available_ports).unwrap_or_else(|_| "[]".to_string());
+    let transport_default = state.config.transport.default;
+    let vara_params = VaraParams {
+        cmd_host: state.config.vara.cmd_host.clone(),
+        cmd_port: state.config.vara.cmd_port,
+        data_host: state.config.vara.data_host.clone(),
+        data_port: state.config.vara.data_port,
+        mode: match state.config.vara.mode {
+            VaraMode::Fm => VaraMode::Fm,
+            VaraMode::Hf => VaraMode::Hf,
+        },
+        bandwidth: match state.config.vara.bandwidth {
+            VaraBandwidth::VNarrow => VaraBandwidth::VNarrow,
+            VaraBandwidth::VWide   => VaraBandwidth::VWide,
+            VaraBandwidth::Bw250   => VaraBandwidth::Bw250,
+            VaraBandwidth::Bw500   => VaraBandwidth::Bw500,
+            VaraBandwidth::Bw2300  => VaraBandwidth::Bw2300,
+            VaraBandwidth::Bw2750  => VaraBandwidth::Bw2750,
+        },
+    };
     drop(state);
 
     Html(ui::connect_page(
@@ -249,6 +271,8 @@ async fn connect_page_handler(
         &connection_state,
         connection_state_class,
         &ports_json,
+        transport_default,
+        &vara_params,
     ))
 }
 
@@ -894,6 +918,50 @@ async fn api_config_post(
             error: Some(format!("Failed to save config: {}", e)),
         }),
     }
+}
+
+#[derive(Serialize)]
+struct StateResponse {
+    agwpe_host: String,
+    agwpe_port: u16,
+    transport: String,
+    vara_cmd_host: String,
+    vara_cmd_port: u16,
+    vara_data_host: String,
+    vara_data_port: u16,
+    vara_mode: String,
+    vara_bandwidth: String,
+}
+
+async fn api_state_get(
+    Extension(ctx): Extension<Arc<AppContext>>,
+) -> Json<StateResponse> {
+    use crate::transport::{VaraBandwidth, VaraMode};
+
+    let state = ctx.state.lock_or_poisoned();
+    let vara_mode = match state.config.vara.mode {
+        VaraMode::Fm => "fm".to_string(),
+        VaraMode::Hf => "hf".to_string(),
+    };
+    let vara_bandwidth = match state.config.vara.bandwidth {
+        VaraBandwidth::VNarrow => "vnarrow".to_string(),
+        VaraBandwidth::VWide   => "vwide".to_string(),
+        VaraBandwidth::Bw250   => "bw250".to_string(),
+        VaraBandwidth::Bw500   => "bw500".to_string(),
+        VaraBandwidth::Bw2300  => "bw2300".to_string(),
+        VaraBandwidth::Bw2750  => "bw2750".to_string(),
+    };
+    Json(StateResponse {
+        agwpe_host: state.config.agwpe_host.clone(),
+        agwpe_port: state.config.agwpe_port,
+        transport: state.config.transport.default.to_string(),
+        vara_cmd_host: state.config.vara.cmd_host.clone(),
+        vara_cmd_port: state.config.vara.cmd_port,
+        vara_data_host: state.config.vara.data_host.clone(),
+        vara_data_port: state.config.vara.data_port,
+        vara_mode,
+        vara_bandwidth,
+    })
 }
 
 async fn events_handler(
