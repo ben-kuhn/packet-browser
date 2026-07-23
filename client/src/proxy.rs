@@ -660,7 +660,8 @@ async fn api_agwpe_status_post(
         .await
     {
         Ok(()) => {
-            if let Err(e) = ctx.agwpe.lock().await.query_ports().await {
+            let qp_manager = ctx.agwpe.lock().await.clone();
+            if let Err(e) = qp_manager.query_ports().await {
                 return Json(AgwpeStatusResponse {
                     ok: false,
                     state: "Error".to_string(),
@@ -860,7 +861,8 @@ async fn api_connect_handler(
 
         TransportKind::Ax25 => {
             // Existing AX.25/AGWPE path — use the current manager as-is.
-            match ctx.agwpe.lock().await.open_session(req.target_callsign, req.port_num).await {
+            let ax25_manager = ctx.agwpe.lock().await.clone();
+            match ax25_manager.open_session(req.target_callsign, req.port_num).await {
                 Ok(()) => {
                     let state = ctx.state.lock_or_poisoned();
                     let state_str = state.connection_state.to_string();
@@ -885,7 +887,8 @@ async fn api_connect_handler(
 async fn api_disconnect_handler(
     Extension(ctx): Extension<Arc<AppContext>>,
 ) -> Json<ConnectResponse> {
-    match ctx.agwpe.lock().await.close_session().await {
+    let disc_manager = ctx.agwpe.lock().await.clone();
+    match disc_manager.close_session().await {
         Ok(()) => {
             {
                 let mut s = ctx.state.lock_or_poisoned();
