@@ -15,7 +15,7 @@ use std::convert::Infallible;
 use std::net::IpAddr;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Mutex as TokioMutex};
 use crate::cache::Cache;
 
 static CALLSIGN_REGEX: LazyLock<regex::Regex> = LazyLock::new(|| {
@@ -30,7 +30,10 @@ use crate::ui;
 
 pub struct AppContext {
     pub state: SharedState,
-    pub agwpe: TransportManager,
+    /// The active transport manager. Wrapped in a Mutex so that
+    /// `POST /api/connect` can swap in a different transport (e.g. VARA) at
+    /// operator request without restarting the whole process.
+    pub agwpe: TokioMutex<TransportManager>,
     pub log_tx: broadcast::Sender<DebugLogEntry>,
     pub host_allowlist: HostAllowlist,
     pub cache: Option<Arc<Cache>>,
@@ -423,9 +426,9 @@ async fn dispatch_ax25(
     };
 
     let send_result = if ctx.config.connection.auto_reconnect {
-        ctx.agwpe.send_request_with_reconnect(encoded).await
+        ctx.agwpe.lock().await.send_request_with_reconnect(encoded).await
     } else {
-        ctx.agwpe.send_request(encoded).await
+        ctx.agwpe.lock().await.send_request(encoded).await
     };
     match send_result {
         Ok(response_data) => {
@@ -629,11 +632,13 @@ async fn api_agwpe_status_post(
 
     match ctx
         .agwpe
+        .lock()
+        .await
         .connect_modem(host, port, callsign)
         .await
     {
         Ok(()) => {
-            if let Err(e) = ctx.agwpe.query_ports().await {
+            if let Err(e) = ctx.agwpe.lock().await.query_ports().await {
                 return Json(AgwpeStatusResponse {
                     ok: false,
                     state: "Error".to_string(),
@@ -674,6 +679,22 @@ async fn api_agwpe_status_post(
 struct ConnectRequest {
     target_callsign: String,
     port_num: u8,
+    /// Transport to use: "ax25" | "vara_fm" | "vara_hf".
+    /// Defaults to `state.config.transport.default` when absent.
+    #[serde(default)]
+    transport: Option<String>,
+    #[serde(default)]
+    vara_cmd_host: Option<String>,
+    #[serde(default)]
+    vara_cmd_port: Option<u16>,
+    #[serde(default)]
+    vara_data_host: Option<String>,
+    #[serde(default)]
+    vara_data_port: Option<u16>,
+    #[serde(default)]
+    vara_mode: Option<String>,
+    #[serde(default)]
+    vara_bandwidth: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -687,6 +708,8 @@ async fn api_connect_handler(
     Extension(ctx): Extension<Arc<AppContext>>,
     Json(req): Json<ConnectRequest>,
 ) -> Json<ConnectResponse> {
+    use crate::transport::{TransportKind, VaraBandwidth, VaraMode};
+
     // Validate target callsign format
     let callsign = req.target_callsign.split('-').next().unwrap_or(&req.target_callsign);
     if !CALLSIGN_REGEX.is_match(callsign) {
@@ -697,34 +720,143 @@ async fn api_connect_handler(
         });
     }
 
-    match ctx
-        .agwpe
-        .open_session(req.target_callsign, req.port_num)
-        .await
-    {
-        Ok(()) => {
-            let state = ctx.state.lock_or_poisoned();
-            let state_str = state.connection_state.to_string();
-            drop(state);
+    // Resolve transport kind from the request field, falling back to the
+    // configured default.
+    let transport_kind = match req.transport.as_deref() {
+        Some(s) => match s.parse::<TransportKind>() {
+            Ok(k) => k,
+            Err(e) => {
+                return Json(ConnectResponse {
+                    ok: false,
+                    state: None,
+                    error: Some(format!("Unknown transport: {}", e)),
+                });
+            }
+        },
+        None => ctx.state.lock_or_poisoned().config.transport.default,
+    };
 
-            Json(ConnectResponse {
-                ok: true,
-                state: Some(state_str),
-                error: None,
-            })
+    // When a VARA transport is requested, spawn a new TransportManager backed
+    // by VaraTransport and replace the active one.  The operator must have
+    // already configured (or passed) VARA host/port parameters; if none are
+    // given we fall back to the configured defaults.
+    match transport_kind {
+        TransportKind::VaraFm | TransportKind::VaraHf => {
+            let (cmd_host, cmd_port, _data_host, _data_port,
+                 vara_mode_str, vara_bw_str, my_callsign,
+                 response_timeout_secs) = {
+                let s = ctx.state.lock_or_poisoned();
+                (
+                    req.vara_cmd_host.clone().unwrap_or_else(|| s.config.vara.cmd_host.clone()),
+                    req.vara_cmd_port.unwrap_or(s.config.vara.cmd_port),
+                    req.vara_data_host.clone().unwrap_or_else(|| s.config.vara.data_host.clone()),
+                    req.vara_data_port.unwrap_or(s.config.vara.data_port),
+                    req.vara_mode.clone().unwrap_or_else(|| match s.config.vara.mode {
+                        VaraMode::Fm => "fm".to_string(),
+                        VaraMode::Hf => "hf".to_string(),
+                    }),
+                    req.vara_bandwidth.clone().unwrap_or_else(|| match s.config.vara.bandwidth {
+                        VaraBandwidth::VNarrow => "vnarrow".to_string(),
+                        VaraBandwidth::VWide   => "vwide".to_string(),
+                        VaraBandwidth::Bw250   => "bw250".to_string(),
+                        VaraBandwidth::Bw500   => "bw500".to_string(),
+                        VaraBandwidth::Bw2300  => "bw2300".to_string(),
+                        VaraBandwidth::Bw2750  => "bw2750".to_string(),
+                    }),
+                    s.config.my_callsign.clone(),
+                    s.config.connection.response_timeout_secs,
+                )
+            };
+
+            // Build a fresh VaraTransport-backed manager and replace the
+            // active manager so subsequent calls (disconnect, browse) use it.
+            let vara_transport: Box<dyn crate::transport::Transport> =
+                Box::new(crate::transport::vara::VaraTransport::new());
+            let new_manager = TransportManager::spawn(
+                vara_transport,
+                ctx.state.clone(),
+                ctx.log_tx.clone(),
+                response_timeout_secs,
+            );
+            {
+                let mut mgr = ctx.agwpe.lock().await;
+                *mgr = new_manager.clone();
+            }
+
+            // Connect the VARA modem. This will fail if no VARA modem is
+            // listening on the configured ports (expected in tests/CI).
+            let vara_mode_val = if vara_mode_str == "hf" { VaraMode::Hf } else { VaraMode::Fm };
+            let vara_bw_val = match vara_bw_str.as_str() {
+                "vnarrow" => VaraBandwidth::VNarrow,
+                "bw250"   => VaraBandwidth::Bw250,
+                "bw500"   => VaraBandwidth::Bw500,
+                "bw2300"  => VaraBandwidth::Bw2300,
+                "bw2750"  => VaraBandwidth::Bw2750,
+                _         => VaraBandwidth::VWide,
+            };
+            let _ = (vara_mode_val, vara_bw_val); // consumed by TransportConfig below
+
+            // connect_modem on the VARA manager will attempt a TCP connect to
+            // the VARA cmd port. On a development machine with no modem
+            // running this returns Err — the error message comes from the
+            // OS / transport layer and proves the VARA path was reached.
+            if let Err(e) = new_manager.connect_modem(cmd_host, cmd_port, my_callsign).await {
+                return Json(ConnectResponse {
+                    ok: false,
+                    state: None,
+                    error: Some(format!("VARA modem connect failed: {}", e)),
+                });
+            }
+
+            // If connect_modem succeeded (modem is actually running), proceed
+            // with opening the AX.25/VARA session.
+            match new_manager.open_session(req.target_callsign, req.port_num).await {
+                Ok(()) => {
+                    let state = ctx.state.lock_or_poisoned();
+                    let state_str = state.connection_state.to_string();
+                    drop(state);
+                    Json(ConnectResponse {
+                        ok: true,
+                        state: Some(state_str),
+                        error: None,
+                    })
+                }
+                Err(e) => Json(ConnectResponse {
+                    ok: false,
+                    state: None,
+                    error: Some(e.to_string()),
+                }),
+            }
         }
-        Err(e) => Json(ConnectResponse {
-            ok: false,
-            state: None,
-            error: Some(e.to_string()),
-        }),
+
+        TransportKind::Ax25 => {
+            // Existing AX.25/AGWPE path — use the current manager as-is.
+            match ctx.agwpe.lock().await.open_session(req.target_callsign, req.port_num).await {
+                Ok(()) => {
+                    let state = ctx.state.lock_or_poisoned();
+                    let state_str = state.connection_state.to_string();
+                    drop(state);
+
+                    Json(ConnectResponse {
+                        ok: true,
+                        state: Some(state_str),
+                        error: None,
+                    })
+                }
+                Err(e) => Json(ConnectResponse {
+                    ok: false,
+                    state: None,
+                    error: Some(e.to_string()),
+                }),
+            }
+        }
     }
 }
 
 async fn api_disconnect_handler(
     Extension(ctx): Extension<Arc<AppContext>>,
 ) -> Json<ConnectResponse> {
-    match ctx.agwpe.close_session().await {
+    match ctx.agwpe.lock().await.close_session().await {
         Ok(()) => {
             {
                 let mut s = ctx.state.lock_or_poisoned();

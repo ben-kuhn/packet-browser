@@ -103,7 +103,7 @@ async fn main() -> Result<(), ClientError> {
 
     let ctx = Arc::new(AppContext {
         state: shared_state,
-        agwpe: agwpe_manager,
+        agwpe: tokio::sync::Mutex::new(agwpe_manager),
         log_tx,
         host_allowlist,
         cache,
