@@ -5,6 +5,14 @@ edition = "2021"
 description = "Packet radio web browser client - AGWPE interface and local web proxy"
 license = "GPL-3.0"
 
+[lib]
+name = "packet_browser_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "packet-browser-client"
+path = "src/main.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"

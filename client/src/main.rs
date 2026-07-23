@@ -1,11 +1,8 @@
-pub mod transport;
-
-mod cache;
-mod config;
-mod proxy;
-mod rewrite;
-mod state;
-mod ui;
+use packet_browser_client::cache;
+use packet_browser_client::config;
+use packet_browser_client::proxy;
+use packet_browser_client::state;
+use packet_browser_client::transport;
 
 use config::CliArgs;
 use proxy::{AppContext, HostAllowlist};
