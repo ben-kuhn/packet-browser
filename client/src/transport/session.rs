@@ -719,6 +719,11 @@ pub(crate) async fn handle_send_request_with_reconnect(
         Ok(bytes) => Ok(bytes),
         Err(AgwpeError::SessionDied { reason }) => {
             handle_reconnect(transport, session_state, state, log_tx, reason, local_callsign).await?;
+            // Guard the retry: operator may have clicked Disconnect during the
+            // reconnect handshake (which can take several seconds).
+            if session_state.is_aborted() {
+                return Err(AgwpeError::DisconnectedByOperator);
+            }
             handle_send_request(transport, session_state, state, log_tx, data).await
         }
         Err(e) => Err(e),
