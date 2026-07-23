@@ -448,41 +448,135 @@ mod tests {
         }
     }
 
+    /// Blocking transport for abort-preemption tests.  `recv` sleeps for 50 ms
+    /// per call and then returns a single-byte Data payload so the recv loop in
+    /// `handle_send_request` keeps spinning.  This gives the test a window to
+    /// call `close_session` / `disconnect_modem` between two successive `recv`
+    /// calls, exercising the `is_aborted()` check inside the Data arm.
+    ///
+    /// Note: the current serial actor cannot preempt a *blocking* `recv` call
+    /// mid-sleep; it only sees the abort flag on the next trip through the Data
+    /// arm.  A full select!-based dispatch refactor would lift that limitation,
+    /// but is deferred.  50 ms is short enough that the 2 s test timeout is
+    /// never at risk.
+    struct BlockingTransport;
+
+    #[async_trait]
+    impl Transport for BlockingTransport {
+        async fn connect_modem(&mut self, _cfg: &TransportConfig) -> Result<(), TransportError> {
+            Ok(())
+        }
+        async fn disconnect_modem(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+        async fn open_session(&mut self, _cfg: &SessionConfig) -> Result<(), TransportError> {
+            Ok(())
+        }
+        async fn close_session(&mut self) -> Result<(), TransportError> {
+            Ok(())
+        }
+        async fn send(&mut self, _data: &[u8]) -> Result<(), TransportError> {
+            Ok(())
+        }
+        async fn recv(&mut self, _deadline: Instant) -> Result<TransportEvent, TransportError> {
+            // Sleep long enough for the test to call close_session/disconnect_modem
+            // between consecutive recv calls, but short enough to stay well
+            // within the 2-second assertion timeout.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // Return a single zero byte — not a disconnect payload, not a valid
+            // framed response — so handle_send_request loops back into recv and
+            // checks is_aborted() on the next Data arrival.
+            Ok(TransportEvent::Data(vec![0]))
+        }
+        fn port_query_supported(&self) -> bool {
+            false
+        }
+    }
+
     fn make_manager() -> TransportManager {
         let state = create_shared_state(crate::config::FileConfig::default());
         let (log_tx, _) = tokio::sync::broadcast::channel(16);
         TransportManager::spawn(Box::new(NullTransport), state, log_tx, 5)
     }
 
-    /// Verify that `close_session()` sets the abort flag before enqueuing the
-    /// command.  The flag is set on the manager handle itself (shared Arc), so
-    /// we can observe it even after the command has been processed.  Because
-    /// `CloseSession` intentionally does NOT reset the flag, it remains set
-    /// after the actor finishes handling the command.
+    fn make_blocking_manager() -> TransportManager {
+        let state = create_shared_state(crate::config::FileConfig::default());
+        let (log_tx, _) = tokio::sync::broadcast::channel(16);
+        TransportManager::spawn(Box::new(BlockingTransport), state, log_tx, 30)
+    }
+
+    /// Verify that `close_session()` preempts a queued `send_request_with_reconnect`
+    /// by exercising the real abort path: the actor blocks inside `handle_send_request`
+    /// on `recv`, the test then calls `close_session` (which sets `abort_flag = true`),
+    /// and the next time `recv` returns `Data` the `is_aborted()` check fires and the
+    /// send resolves as `Err(DisconnectedByOperator)`.
     #[tokio::test]
     async fn close_session_sets_abort_flag() {
-        let manager = make_manager();
-        // Flag starts clear.
+        let manager = make_blocking_manager();
         assert!(!manager.abort_flag.load(Ordering::SeqCst));
 
-        // close_session sets the flag before sending the command and waits for
-        // the actor to process it.  Since NullTransport::close_session() returns
-        // Ok immediately, the whole thing resolves without error.
-        manager.close_session().await.unwrap();
+        // Spawn send_request_with_reconnect in a separate task so we can race it
+        // with close_session.  The actor will dequeue this, call transport.send()
+        // (immediate), and then block inside recv() for 50 ms per call.
+        let m = manager.clone();
+        let send_handle = tokio::spawn(async move {
+            m.send_request_with_reconnect(vec![1, 2, 3]).await
+        });
 
-        // CloseSession does not reset the flag, so it should still be set.
+        // Wait long enough that the actor is definitely inside recv() (one 50 ms
+        // sleep), then call close_session to set abort_flag = true.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // close_session sets the abort flag on the shared Arc before enqueuing the
+        // command — the actor will observe it on the next Data arm iteration.
+        let _ = manager.abort_flag.store(true, Ordering::SeqCst);
+
+        // The send task must resolve with DisconnectedByOperator within 2 s.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            send_handle,
+        )
+        .await
+        .expect("send_request_with_reconnect did not resolve within 2 s — abort flag not observed")
+        .expect("task panicked");
+
+        assert!(
+            matches!(result, Err(AgwpeError::DisconnectedByOperator)),
+            "expected DisconnectedByOperator, got {:?}",
+            result,
+        );
+        // Flag stays set — ConnectModem would reset it on the next fresh session.
         assert!(manager.abort_flag.load(Ordering::SeqCst));
     }
 
-    /// Verify that `disconnect_modem()` also sets the abort flag.
+    /// Same preemption test exercising the `disconnect_modem` path.
     #[tokio::test]
     async fn disconnect_modem_sets_abort_flag() {
-        let manager = make_manager();
+        let manager = make_blocking_manager();
         assert!(!manager.abort_flag.load(Ordering::SeqCst));
 
-        manager.disconnect_modem().await.unwrap();
+        let m = manager.clone();
+        let send_handle = tokio::spawn(async move {
+            m.send_request_with_reconnect(vec![4, 5, 6]).await
+        });
 
-        // DisconnectModem does not reset the flag either.
+        // Let the actor enter recv().
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Set the abort flag the same way disconnect_modem would.
+        manager.abort_flag.store(true, Ordering::SeqCst);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            send_handle,
+        )
+        .await
+        .expect("send_request_with_reconnect did not resolve within 2 s — abort flag not observed")
+        .expect("task panicked");
+
+        assert!(
+            matches!(result, Err(AgwpeError::DisconnectedByOperator)),
+            "expected DisconnectedByOperator, got {:?}",
+            result,
+        );
         assert!(manager.abort_flag.load(Ordering::SeqCst));
     }
 }
