@@ -11,7 +11,6 @@ async fn read_cmd_ready(stream: &mut TcpStream) -> std::io::Result<()> {
     stream.readable().await
 }
 
-const PLACEHOLDER_CALL: &str = "N0CALL";
 const OK_TIMEOUT_SECS: u64 = 5;
 
 pub struct VaraTransport {
@@ -90,7 +89,9 @@ impl Transport for VaraTransport {
         self.cmd = Some(cmd);
         self.data = Some(data);
 
-        for cmd_line in setup_commands(PLACEHOLDER_CALL, cfg.vara.mode, cfg.vara.bandwidth) {
+        // Use the configured local callsign for the initial MYCALL setup.
+        // open_session will re-issue MYCALL idempotently if needed.
+        for cmd_line in setup_commands(&cfg.local_callsign, cfg.vara.mode, cfg.vara.bandwidth) {
             self.send_cmd(&cmd_line).await?;
             self.await_ok().await?;
         }
@@ -149,9 +150,16 @@ impl Transport for VaraTransport {
 
     async fn close_session(&mut self) -> Result<(), TransportError> {
         self.send_cmd("DISCONNECT").await?;
-        // Drain up to 3s waiting for DISCONNECTED confirmation.
+        // Drain up to 3s waiting for DISCONNECTED confirmation.  The
+        // iteration cap (64) guards against a modem that floods the command
+        // port faster than the deadline advances — best-effort close.
         let deadline = Instant::now() + std::time::Duration::from_secs(3);
+        let mut remaining = 64usize;
         loop {
+            if remaining == 0 {
+                return Ok(());
+            }
+            remaining -= 1;
             match self.read_cmd_line(deadline).await {
                 Ok(line) if matches!(parse_line(&line), VaraResponse::Disconnected) => {
                     return Ok(());
@@ -298,10 +306,7 @@ mod tests {
 
         let lines = mock.await.unwrap();
         assert_eq!(lines, vec![
-            "MYCALL ".to_string() + "N0CALL",
-            // The line above intentionally uses the placeholder local
-            // callsign for this task; open_session (Task 7) will re-issue
-            // MYCALL when the operator's callsign is known.
+            "MYCALL W1TEST".to_string(),
             "LISTEN OFF".to_string(),
             "COMPRESSION OFF".to_string(),
             "VWIDE".to_string(),
