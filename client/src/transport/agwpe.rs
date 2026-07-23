@@ -699,8 +699,9 @@ impl crate::transport::Transport for AgwpeTransport {
             // LinBPQ sends 'C' (0x43) for both connect-request and connected
             // notification.  `open_ax25_link` already consumed the first one.
             // Any stray Connect frame that arrives during a session is
-            // in-band data unless it carries a `*** CONNECTED` payload (which
-            // we also treat as empty data — the link is already open).
+            // in-band data (LinBPQ occasionally echoes control text into the
+            // stream), so surface the payload as-is and let the upper layers
+            // scan for RESP headers or the session-death markers.
             FrameType::Connect => Ok(crate::transport::TransportEvent::Data(frame.data)),
             // ConnectionRejected during a live session signals the peer tore
             // down the link — surface as a Disconnected event.
