@@ -630,11 +630,28 @@ async fn api_agwpe_status_post(
         });
     }
 
+    use crate::transport::{AgwpeParams, TransportConfig, TransportKind, VaraParams};
+    let agwpe_cfg = {
+        let s = ctx.state.lock_or_poisoned();
+        TransportConfig {
+            kind: TransportKind::Ax25,
+            agwpe: AgwpeParams { host, port },
+            vara: VaraParams {
+                cmd_host: s.config.vara.cmd_host.clone(),
+                cmd_port: s.config.vara.cmd_port,
+                data_host: s.config.vara.data_host.clone(),
+                data_port: s.config.vara.data_port,
+                mode: s.config.vara.mode,
+                bandwidth: s.config.vara.bandwidth,
+            },
+            local_callsign: callsign,
+        }
+    };
     match ctx
         .agwpe
         .lock()
         .await
-        .connect_modem(host, port, callsign)
+        .connect_modem(agwpe_cfg)
         .await
     {
         Ok(()) => {
@@ -742,30 +759,47 @@ async fn api_connect_handler(
     // given we fall back to the configured defaults.
     match transport_kind {
         TransportKind::VaraFm | TransportKind::VaraHf => {
-            let (cmd_host, cmd_port, _data_host, _data_port,
-                 vara_mode_str, vara_bw_str, my_callsign,
-                 response_timeout_secs) = {
+            let (vara_cfg, response_timeout_secs) = {
                 let s = ctx.state.lock_or_poisoned();
-                (
-                    req.vara_cmd_host.clone().unwrap_or_else(|| s.config.vara.cmd_host.clone()),
-                    req.vara_cmd_port.unwrap_or(s.config.vara.cmd_port),
-                    req.vara_data_host.clone().unwrap_or_else(|| s.config.vara.data_host.clone()),
-                    req.vara_data_port.unwrap_or(s.config.vara.data_port),
-                    req.vara_mode.clone().unwrap_or_else(|| match s.config.vara.mode {
-                        VaraMode::Fm => "fm".to_string(),
-                        VaraMode::Hf => "hf".to_string(),
-                    }),
-                    req.vara_bandwidth.clone().unwrap_or_else(|| match s.config.vara.bandwidth {
-                        VaraBandwidth::VNarrow => "vnarrow".to_string(),
-                        VaraBandwidth::VWide   => "vwide".to_string(),
-                        VaraBandwidth::Bw250   => "bw250".to_string(),
-                        VaraBandwidth::Bw500   => "bw500".to_string(),
-                        VaraBandwidth::Bw2300  => "bw2300".to_string(),
-                        VaraBandwidth::Bw2750  => "bw2750".to_string(),
-                    }),
-                    s.config.my_callsign.clone(),
-                    s.config.connection.response_timeout_secs,
-                )
+                let cmd_host = req.vara_cmd_host.clone()
+                    .unwrap_or_else(|| s.config.vara.cmd_host.clone());
+                let cmd_port = req.vara_cmd_port.unwrap_or(s.config.vara.cmd_port);
+                let data_host = req.vara_data_host.clone()
+                    .unwrap_or_else(|| s.config.vara.data_host.clone());
+                let data_port = req.vara_data_port.unwrap_or(s.config.vara.data_port);
+                let vara_mode_val = match req.vara_mode.as_deref() {
+                    Some("hf") => VaraMode::Hf,
+                    _ => match s.config.vara.mode {
+                        VaraMode::Hf => VaraMode::Hf,
+                        VaraMode::Fm => VaraMode::Fm,
+                    },
+                };
+                let vara_bw_val = match req.vara_bandwidth.as_deref() {
+                    Some("vnarrow") => VaraBandwidth::VNarrow,
+                    Some("bw250")   => VaraBandwidth::Bw250,
+                    Some("bw500")   => VaraBandwidth::Bw500,
+                    Some("bw2300")  => VaraBandwidth::Bw2300,
+                    Some("bw2750")  => VaraBandwidth::Bw2750,
+                    Some("vwide")   => VaraBandwidth::VWide,
+                    _ => s.config.vara.bandwidth,
+                };
+                let cfg = crate::transport::TransportConfig {
+                    kind: transport_kind,
+                    agwpe: crate::transport::AgwpeParams {
+                        host: s.config.agwpe_host.clone(),
+                        port: s.config.agwpe_port,
+                    },
+                    vara: crate::transport::VaraParams {
+                        cmd_host,
+                        cmd_port,
+                        data_host,
+                        data_port,
+                        mode: vara_mode_val,
+                        bandwidth: vara_bw_val,
+                    },
+                    local_callsign: s.config.my_callsign.clone(),
+                };
+                (cfg, s.config.connection.response_timeout_secs)
             };
 
             // Build a fresh VaraTransport-backed manager and replace the
@@ -785,22 +819,7 @@ async fn api_connect_handler(
 
             // Connect the VARA modem. This will fail if no VARA modem is
             // listening on the configured ports (expected in tests/CI).
-            let vara_mode_val = if vara_mode_str == "hf" { VaraMode::Hf } else { VaraMode::Fm };
-            let vara_bw_val = match vara_bw_str.as_str() {
-                "vnarrow" => VaraBandwidth::VNarrow,
-                "bw250"   => VaraBandwidth::Bw250,
-                "bw500"   => VaraBandwidth::Bw500,
-                "bw2300"  => VaraBandwidth::Bw2300,
-                "bw2750"  => VaraBandwidth::Bw2750,
-                _         => VaraBandwidth::VWide,
-            };
-            let _ = (vara_mode_val, vara_bw_val); // consumed by TransportConfig below
-
-            // connect_modem on the VARA manager will attempt a TCP connect to
-            // the VARA cmd port. On a development machine with no modem
-            // running this returns Err — the error message comes from the
-            // OS / transport layer and proves the VARA path was reached.
-            if let Err(e) = new_manager.connect_modem(cmd_host, cmd_port, my_callsign).await {
+            if let Err(e) = new_manager.connect_modem(vara_cfg).await {
                 return Json(ConnectResponse {
                     ok: false,
                     state: None,

@@ -53,7 +53,23 @@ async fn main() -> Result<(), ClientError> {
     // Auto-connect to AGWPE on startup
     if !config.my_callsign.is_empty() {
         tracing::info!("Attempting auto-connect to AGWPE at {}:{}", config.agwpe_host, config.agwpe_port);
-        match agwpe_manager.connect_modem(config.agwpe_host.clone(), config.agwpe_port, config.my_callsign.clone()).await {
+        let agwpe_cfg = transport::TransportConfig {
+            kind: transport::TransportKind::Ax25,
+            agwpe: transport::AgwpeParams {
+                host: config.agwpe_host.clone(),
+                port: config.agwpe_port,
+            },
+            vara: transport::VaraParams {
+                cmd_host: config.vara.cmd_host.clone(),
+                cmd_port: config.vara.cmd_port,
+                data_host: config.vara.data_host.clone(),
+                data_port: config.vara.data_port,
+                mode: config.vara.mode,
+                bandwidth: config.vara.bandwidth,
+            },
+            local_callsign: config.my_callsign.clone(),
+        };
+        match agwpe_manager.connect_modem(agwpe_cfg).await {
             Ok(_) => {
                 tracing::info!("Successfully connected to AGWPE");
                 // Query ports after successful connection

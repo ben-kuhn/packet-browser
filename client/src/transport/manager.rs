@@ -10,9 +10,7 @@ use crate::transport::Transport;
 
 enum TransportCommand {
     ConnectModem {
-        host: String,
-        port: u16,
-        callsign: String,
+        config: crate::transport::TransportConfig,
         reply: oneshot::Sender<Result<(), AgwpeError>>,
     },
     DisconnectModem {
@@ -70,16 +68,12 @@ impl TransportManager {
 
     pub async fn connect_modem(
         &self,
-        host: String,
-        port: u16,
-        callsign: String,
+        config: crate::transport::TransportConfig,
     ) -> Result<(), AgwpeError> {
         let (tx, rx) = oneshot::channel();
         self.command_tx
             .send(TransportCommand::ConnectModem {
-                host,
-                port,
-                callsign,
+                config,
                 reply: tx,
             })
             .await
@@ -169,18 +163,15 @@ async fn background_task(
     while let Some(cmd) = command_rx.recv().await {
         match cmd {
             TransportCommand::ConnectModem {
-                host,
-                port,
-                callsign,
+                config,
                 reply,
             } => {
+                let callsign = config.local_callsign.clone();
                 let result = handle_connect_modem(
                     &mut *transport,
                     &state,
                     &log_tx,
-                    &host,
-                    port,
-                    &callsign,
+                    config,
                 )
                 .await;
                 if result.is_ok() {
@@ -254,29 +245,12 @@ async fn handle_connect_modem(
     transport: &mut dyn Transport,
     state: &SharedState,
     log_tx: &broadcast::Sender<DebugLogEntry>,
-    host: &str,
-    port: u16,
-    callsign: &str,
+    config: crate::transport::TransportConfig,
 ) -> Result<(), AgwpeError> {
-    let cfg = crate::transport::TransportConfig {
-        kind: crate::transport::TransportKind::Ax25,
-        agwpe: crate::transport::AgwpeParams {
-            host: host.to_string(),
-            port,
-        },
-        vara: crate::transport::VaraParams {
-            cmd_host: String::new(),
-            cmd_port: 0,
-            data_host: String::new(),
-            data_port: 0,
-            mode: crate::transport::VaraMode::Fm,
-            bandwidth: crate::transport::VaraBandwidth::VNarrow,
-        },
-        local_callsign: callsign.to_string(),
-    };
+    let callsign = config.local_callsign.clone();
 
     transport
-        .connect_modem(&cfg)
+        .connect_modem(&config)
         .await
         .map_err(transport_err_to_agwpe)?;
 
