@@ -528,7 +528,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         // close_session sets the abort flag on the shared Arc before enqueuing the
         // command — the actor will observe it on the next Data arm iteration.
-        let _ = manager.abort_flag.store(true, Ordering::SeqCst);
+        manager.close_session().await.unwrap();
 
         // The send task must resolve with DisconnectedByOperator within 2 s.
         let result = tokio::time::timeout(
@@ -561,8 +561,8 @@ mod tests {
 
         // Let the actor enter recv().
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        // Set the abort flag the same way disconnect_modem would.
-        manager.abort_flag.store(true, Ordering::SeqCst);
+        // Set the abort flag by calling the public API.
+        manager.disconnect_modem().await.unwrap();
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
